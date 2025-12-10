@@ -857,7 +857,8 @@ label1 = cell(numel(simu.thickness),1);
 
 Yseg(:,:,:,1:3) = 0;
 
-% vary range of PVE from -0.15..0.15 in 15 steps
+% vary range of PVE from -0.15..0.15 in 15 steps to get more realistic PVE
+% effects
 pve_range = linspace(-0.15,0.15,15);
 
 for pve_step = 1:numel(pve_range)
@@ -903,6 +904,12 @@ label = zeros(d, 'single');
 for k = 1:3
     label = label + k*Yseg(:,:,:,order(k));
 end
+
+% close remaining holes in CSF
+mask = label > 0.5;
+label(mask ~= cat_vol_morph(mask,'dc',4)) = 1;
+
+
 
 %==========================================================================
 % function Yseg = simulate_atrophy(simu, Yseg, dims, template_dir, idef_name)
