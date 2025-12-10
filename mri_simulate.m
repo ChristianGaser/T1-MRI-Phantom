@@ -684,8 +684,8 @@ if rf.save
   rf_name = fullfile(out_pth, [new_name_bias '.nii']);
   fprintf('Save %s\n', rf_name);
   Vres.fname = rf_name;
-  Vres.pinfo = [1/max(rf_field(:)) 0 352]';
-  Vres.dt    = [2 0];
+  Vres.pinfo = [1 0 352]';
+  Vres.dt    = [16 0];
   spm_write_vol(Vres, rf_field);
   if is_gz
     gzip(rf_name);
