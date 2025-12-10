@@ -137,8 +137,8 @@ function mri_simulate(simu, rf)
 %       rf = struct('percent', 20, 'type', 'A','save',0);
 %       mri_simulate(simu, rf);
 %
-%   Example 2 - Advanced simulation with atrophy (2% in left middle frontal gyrus 
-%               and 3% in right middle frontal gyrus based on Hammers atlas), 
+%   Example 2 - Advanced simulation with atrophy (10% in left middle frontal gyrus 
+%               and 15% in right middle frontal gyrus based on Hammers atlas), 
 %               custom RF field and thicker slices: 
 %       simu = struct('name', 'custom_t1.nii', 'snrWM', 20,...
 %                     'resolution', [0.5, 0.5, 1.5]);
@@ -148,14 +148,14 @@ function mri_simulate(simu, rf)
 %
 %   Example 3 - Thickness simulation with 3 different thickness values using 
 %   original voxel size:
-%       simu = struct('name', 'colin27_t1_tal_hires.nii', 'pn', 3,...
+%       simu = struct('name', 'colin27_t1_tal_hires.nii', 'snrWM', 30,...
 %                     'resolution', NaN,...
 %                     'thickness', [1.5 2.0 2.5]);
 %       rf = struct('percent', 20, 'type', 'A');
 %       mri_simulate(simu, rf);
 %
 %   Example 4 - Simulation with custom RF field and added WMHs (medium strength)
-%       simu = struct('name', 'custom_t1.nii', 'pn', 3,...
+%       simu = struct('name', 'custom_t1.nii', 'snrWM', 30,...
 %                     'resolution', NaN, 'WMH', 2);
 %       rf = struct('percent', 15, 'type', [3, 42]);
 %       mri_simulate(simu, rf);
@@ -211,10 +211,6 @@ if n_images > 1
   return
 end
 
-% iterations for correction for regions with too large thickness values
-% not working properly!!!
-n_thickness_corrections = 0;
-
 [pth, name, ext, ~] = spm_fileparts(simu.name);
 if ~exist(fullfile(pth, [name ext]), 'file')
   fprintf("File %s not found.\n", simu.name);
@@ -247,12 +243,20 @@ if isfield(simu,'derivative') && simu.derivative
       % Derivatives at dataset root
       root_dir = fullfile(parts{1:idx_sub-1});
       rel_parts = parts(idx_sub:end); % sub-..[/ses-..]/anat/...
-      pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate-' version]);
+      if simu.thickness(1) > 0
+        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate_thickness-' version]);
+      else
+        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate-' version]);
+      end
       out_pth = fullfile(pipeline_dir, rel_parts{:});
     else
       % Fallback: place outputs under derivatives without mirroring
       root_dir = fileparts(pth);
-      pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate-' version]);
+      if simu.thickness(1) > 0
+        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate_thickness-' version]);
+      else
+        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate-' version]);
+      end
       out_pth = pipeline_dir;
     end
     if ~exist(out_pth,'dir'), mkdir(out_pth); end
@@ -419,7 +423,7 @@ end
 
 if any(simu.thickness)
   [label_pve, Yseg] = simulate_thickness(label_pve, simu, Yseg, dim, ...
-        template_dir, idef_name, vx, order, n_thickness_corrections);
+        template_dir, idef_name, vx, order);
 end
 
 Ysimu = synthesize_from_segmentation(Yseg, name, res, mn, dim, WMH);
@@ -764,7 +768,7 @@ return
 
 
 %==========================================================================
-% function [label, Yseg] = simulate_thickness(label, simu, Yseg, d, template_dir, idef_name, vx, order, n_thickness_corrections)
+% function [label, Yseg] = simulate_thickness(label, simu, Yseg, d, template_dir, idef_name, vx, order)
 %
 % Purpose
 %   Synthesize a constant cortical thickness by growing GM outward from the
@@ -788,9 +792,6 @@ return
 %                        into subject/native space with categorical interpolation.
 %   vx       - [vx vy vz]: Voxel sizes in mm.
 %   order    - [3x1] int: Mapping from class index (CSF/GM/WM) to Yseg order.
-%   n_thickness_corrections - int: Optional iterations for correcting regions
-%                        where the requested thickness is too large for sulci;
-%                        set to 0 for default behavior.
 %
 % Outputs
 %   label    - single(dims): New PVE-like label map in [1..3] after averaging
@@ -811,10 +812,7 @@ return
 %        b. Compute Euclidean distance transform from WM (compensated by 0.5*voxel).
 %        c. Set CSF everywhere, then assign GM to voxels where D_WM <= thickness
 %           (per region), preserving WM where present.
-%        d. Optionally correct gyri too thin for the requested thickness by
-%           widening sulci (n_thickness_corrections>0).
-%        e. Convert the hard labels (1..3) to one-hot class volumes and add to
-%           an accumulator.
+%        d. Convert the hard labels (1..3)
 %   3) Average the 20 accumulated volumes to form a smooth PVE-like segmentation
 %      and rebuild the final label image in [1..3] by weighted sum with class IDs.
 %
@@ -826,7 +824,7 @@ return
 %   - This function modifies Yseg directly to reflect the new PVE-like tissue
 %     maps, which are later used by the synthesis step to generate a T1 image.
 %==========================================================================
-function [label, Yseg] = simulate_thickness(label, simu, Yseg, d, template_dir, idef_name, vx, order, n_thickness_corrections)
+function [label, Yseg] = simulate_thickness(label, simu, Yseg, d, template_dir, idef_name, vx, order)
 
 Yp0toC = @(Yp0,c) 1-min(1,abs(Yp0-c));
 csf_val = 1; gm_val = 2; wm_val = 3;
@@ -838,8 +836,8 @@ hammers = cat_vol_defs(struct('field1',{{idef_name}},'images',{{hammers_name}},'
 hammers = single(hammers{1}{1});
 
 % create mask for basal ganglia and cerebellum
-mask_orig = (hammers>0 & hammers<5) | hammers==9 | hammers==10 | ...
-            (hammers>16 & hammers<20) | (hammers>33 & hammers<50) | ...
+mask_orig = (hammers>0   & hammers<5)  | hammers==9  | hammers==10 | ...
+            (hammers>16  & hammers<20) | (hammers>33 & hammers<50) | ...
              hammers==74 | hammers==75;
 mask_orig = cat_vol_morph(mask_orig,'dd',2);
 
@@ -859,12 +857,11 @@ label1 = cell(numel(simu.thickness),1);
 
 Yseg(:,:,:,1:3) = 0;
 
-% vary range of PVE from -0.25..0.25 in 20 steps
-pve_range = linspace(-0.25,0.25,20);
+% vary range of PVE from -0.15..0.15 in 15 steps
+pve_range = linspace(-0.15,0.15,15);
 
 for pve_step = 1:numel(pve_range)
-
-  % define wm, remove disconnected regions and dilate it to thickne thin gyri
+  % define wm, remove disconnected regions and dilate it
   wm  = round(label+pve_range(pve_step)) == wm_val;
   wm = cat_vol_morph(wm,'l',1);
   wm = cat_vol_morph(wm,'dc',1);
@@ -873,41 +870,17 @@ for pve_step = 1:numel(pve_range)
   Dwm = (bwdist(wm) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
 
   for k=1:numel(simu.thickness)
-  
     label1{k} = round(label+pve_range(pve_step));
 
     label1{k}(~wm) = csf_val;
     label1{k}(~mask) = 0;
     
     % limit dilated gm to defined thickness
-    label1{k}(label1{k} == csf_val & Dwm <= simu.thickness(k)) = gm_val;  
-
-    for i=1:n_thickness_corrections
-      % check distance inside gm
-      D = (bwdist(label1{k}==csf_val) + bwdist(label1{k}==wm_val) - 1)*mean(vx);
-      D(label1{k}~=gm_val) = 0;
-          
-      % dilate gm where distance in gm is too large to make more space
-      gm1 = cat_vol_morph(D > 0.97*simu.thickness(k),'o',1);
-      gm1 = cat_vol_morph(gm1,'dd',1);
-      gm1(~mask) = 0;
-      
-      % widen sulci is thickness was too large for that area
-      label1{k}(gm1 > 0 | label1{k} == gm_val) = csf_val;
-      
-      % euclidean distance to wm
-      wm  = label1{k}==wm_val;
-      Dwm = (bwdist(wm) - 0.5) * mean(vx);
-      
-      % limit dilated gm to defined thickness
-      label1{k}(label1{k} == csf_val & Dwm <= simu.thickness(k)) = gm_val;  
-    end
-    
+    label1{k}(label1{k} == csf_val & Dwm <= simu.thickness(k)) = gm_val; 
   end
     
   % replace tissue maps with modified label
   for j = 1:3
-  
     if isscalar(simu.thickness)
       % only simulate 2mm thickness
       tmp_seg = single(round(label1{1}) == (j));
@@ -996,7 +969,7 @@ end
 %   res     - struct from SPM segmentation (mg, mn, vr, Tbias, etc.).
 %   mn      - 3x1 means for CSF/GM/WM replacing the corresponding mixture means.
 %   d       - [nx ny nz] dimensions.
-%   WMH     - optionally added white matter hyperintensities (WMHs)
+%   WMH     - optionally add white matter hyperintensities (WMHs)
 %
 % Output
 %   Ysimu   - synthesized T1-weighted image volume (single).
@@ -1046,7 +1019,7 @@ for z = 1:length(x3)
 
   % add WMHs as last class
   if ~isempty(WMH)
-    q1(:,:,K) = 5*WMH(:,:,z);
+    q1(:,:,K) = WMH(:,:,z);
   end
   
   s   = sum(q1,3);
