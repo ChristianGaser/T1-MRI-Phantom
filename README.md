@@ -36,8 +36,8 @@ To validate cortical thickness pipelines, the label image can be edited directly
 Parameter | Description (Default)
 ----------|------------------------
 name | Input image(s). A single T1w filename. (Default: `''`)
-pn | Gaussian noise level as percent of the WM peak. (Default: `3`)
-snrWM | If `>0`, add Rician magnitude noise with target SNR for white matter. Uses WM mean to derive complex noise sigma; when set, `pn` is ignored. (Default: `0`)
+snrWM | add Rician magnitude noise with target SNR for white matter. Uses WM mean to derive complex noise sigma; when set, `pn` is ignored. (Default: `30`)
+pn | If `>0`,add Gaussian noise as percent of the WM peak. (Default: `0`)
 rng | RNG seed for reproducible noise; set `[]` for MATLAB default behavior. (Default: `0`)
 contrast | Power-law exponent for contrast change. Image is normalized to [0,1], transformed as Y.^contrast, then rescaled to original min/max. Meaningful values to simulate contrast are 0.5 (low contrast) and 1.5 (high contrast). (Default: `1`)
 derivative | If `1`, save outputs into BIDS derivatives at the dataset root: `derivatives/mri_simulate-1.0/sub-*/ses-*/...`, mirroring the subject/session path. (Default: `0`)
@@ -58,21 +58,21 @@ save | Save the simulated bias field only when `type` is numeric; ignored for `'
 If `simu` and/or `rf` are omitted or partially specified, missing fields are filled with defaults. If `simu.name` is empty, a file selection dialog opens.
 
 ```matlab
-simu = struct('name', '', 'pn', 3, 'snrWM', 0, 'contrast', 1, ...
+simu = struct('name', '', 'snrWM', 10, 'snrWM', 0, 'contrast', 1, ...
               'resolution', NaN, 'WMH', 0, 'atrophy', [], 'thickness', 0, 'rng', 0);
 rf   = struct('percent', 20, 'type', [2 0], 'save', 0);
 ```
 
 ## Outputs
 The function saves:
-- Simulated image: `pn{pn}_{meanRes}mm_{name}{opts}.nii`
-- Simulated masked image: `pn{pn}_{meanRes}mm_m{name}{opts}.nii`
+- Simulated image: `snr{snrWM}_{meanRes}mm_{name}{opts}.nii`
+- Simulated masked image: `snr{snrWM}_{meanRes}mm_m{name}{opts}.nii`
 - Ground-truth PVE label: `label_pve_{meanRes}mm_{name}{opts}.nii`
 - If requested, RF field (simulated only): `{opts}_{meanRes}mm_{name}.nii`
 - JSON sidecars (main and masked images): `{simuFile}.json` including tool metadata and SimulationParameters (voxel size, pn or snrWM, RF settings, thickness tag)
 
 Notes:
-- When `snrWM>0`, filenames use `snr{snrWM}` instead of `pn{pn}`.
+- When `pn>0`, filenames use `pn{pn}` instead of `snr{snrWM}`.
 - `{opts}` aggregates options, e.g., `_rf20_A`, `_WMH2`, `_hammers_28_2`, `_thickness1.5mm-2.5mm`.
 - When thickness is used, the label is PVE-like from the boundary jittering averaging.
 - When WMH is used, a 4th label contribution is added (WMH).
@@ -85,7 +85,7 @@ mri_simulate(simu, rf);
 ### 1b) Rician noise at target WM SNR
 ```matlab
 simu = struct('name', 'colin27_t1_tal_hires.nii', 'snrWM', 30, ...
-              'pn', 0, 'resolution', NaN, 'rng', 0);
+              'resolution', NaN, 'rng', 0);
 rf = struct('percent', 20, 'type', 'A', 'save', 0);
 mri_simulate(simu, rf);
 ```
@@ -94,7 +94,7 @@ mri_simulate(simu, rf);
 
 ### 1) Basic simulation with specific noise and 0.5 mm voxels
 ```matlab
-simu = struct('name', 'colin27_t1_tal_hires.nii', 'pn', 3, ...
+simu = struct('name', 'colin27_t1_tal_hires.nii', 'snrWM', 10, ...
               'resolution', 0.5, 'atrophy', [], 'rng', 42);
 rf = struct('percent', 20, 'type', 'A', 'save', 0);
 mri_simulate(simu, rf);
@@ -102,7 +102,7 @@ mri_simulate(simu, rf);
 
 ### 2) Advanced simulation with atrophy (2% in left middle frontal gyrus and 3% in right middle frontal gyrus based on Hammers atlas), custom RF field and thicker slices
 ```matlab
-simu = struct('name', 'custom_t1.nii', 'pn', 3, ...
+simu = struct('name', 'custom_t1.nii', 'snrWM', 30, ...
               'resolution', [0.5, 0.5, 1.5], 'rng', []);
 simu.atrophy = {'hammers', [28, 29], [2, 3]};
 rf = struct('percent', 15, 'type', [3, 42], 'save', 0);
@@ -111,7 +111,7 @@ mri_simulate(simu, rf);
 
 ### 3) Thickness simulation (region-wise values, original resolution)
 ```matlab
-simu = struct('name', 'colin27_t1_tal_hires.nii', 'pn', 3, ...
+simu = struct('name', 'colin27_t1_tal_hires.nii', 'snrWM', 10, ...
               'resolution', NaN, 'atrophy', [], 'rng', [], ...
               'thickness', [1.5 2.0 2.5]);
 rf = struct('percent', 20, 'type', 'A', 'save', 0);
@@ -120,7 +120,7 @@ mri_simulate(simu, rf);
 
 ### 4) WMH simulation (medium strength) with simulated RF field
 ```matlab
-simu = struct('name', 'custom_t1.nii', 'pn', 3, 'resolution', NaN, ...
+simu = struct('name', 'custom_t1.nii', 'snrWM', 30, 'resolution', NaN, ...
               'WMH', 2, 'rng', []);
 rf = struct('percent', 15, 'type', [3, 42], 'save', 0);
 mri_simulate(simu, rf);
@@ -128,7 +128,7 @@ mri_simulate(simu, rf);
 
 ### 5) Interactive mode for example 4:
 ```matlab
-simu = struct('pn', 3, 'resolution', NaN, ...
+simu = struct('snrWM', 30, 'resolution', NaN, ...
               'WMH', 2, 'rng', []);
 rf = struct('percent', 15, 'type', [3, 42], 'save', 0);
 mri_simulate(simu, rf);
@@ -136,7 +136,7 @@ mri_simulate(simu, rf);
 
 ### 6) Apply contrast change (power-law)
 ```matlab
-simu = struct('name', 'colin27_t1_tal_hires.nii', 'pn', 3, ...
+simu = struct('name', 'colin27_t1_tal_hires.nii', 'snrWM', 30, ...
               'contrast', 1.3, 'resolution', NaN, 'rng', 0);
 rf = struct('percent', 20, 'type', 'A', 'save', 0);
 mri_simulate(simu, rf);
@@ -147,5 +147,5 @@ mri_simulate(simu, rf);
 ```
 pn3_1.0mm_input_rf20_A.nii                     % Gaussian noise at 3%
 snr30_1.0mm_input_rf20_A.nii                   % Rician noise at SNR=30 in WM
-pn3_res-10mm_input_thickness2.5mm.nii          % With thickness tag
+snr30_res-10mm_input_thickness2.5mm.nii          % With thickness tag
 ```
