@@ -1,22 +1,30 @@
 # mri_simulate
-Simulates T1-weighted MR images with optional atrophy, cortical thickness, WMHs, RF B1 inhomogeneities, and noise (Gaussian or Rician at a target WM SNR). Writes JSON sidecars with simulation metadata.
+Simulates T1-weighted MR images with optional atrophy, cortical thickness control, WMHs, RF B1 inhomogeneities, and noise (Gaussian or Rician at a target WM SNR). Writes JSON sidecars with simulation metadata.
+
+![Pipeline overview](docs/T1-MRI-Phantom-Scheme.png)
 
 ## Overview
-`mri_simulate` generates simulated T1-weighted (T1w) images from a high-quality input (e.g., 0.5 mm Colin27 or a custom T1w). It can:
+`mri_simulate` generates a realistic T1-weighted (T1w) image and its explicit ground truth from a high-quality input (e.g., 0.5 mm Colin27 or a custom T1w). Key steps:
 
-- Add noise: Gaussian (% of WM mean) or Rician at target WM SNR
-- Apply RF B1 inhomogeneity (predefined A/B/C or simulated fields)
-- Apply contrast change (power-law Y^x)
-- Simulate white matter hyperintensities (WMHs)
-- Simulate regional atrophy (atlas-based)
-- Enforce a constant cortical thickness and produce a PVE-like segmentation used for synthesis
+- Start from a segmented T1w volume (GM, WM, CSF, and background) using SPM unified segmentation; this is only an initialization.
+- Locally normalize tissue intensities with CAT12 Local Adaptive Segmentation (LAS), scaling CSF/GM/WM to canonical values (1/2/3) to obtain a PVE-like label image.
+- Denoise the scaled labels with SANLM; optionally close WM holes to remove native WMHs before adding synthetic lesions.
+- Insert user-defined anatomical changes: atlas-based atrophy (e.g., Hammers) and probabilistic WMHs.
+- Synthesize a new T1w by reusing the SPM forward model (Gaussian mixture params) but replacing the tissue posteriors with the modified PVE labels (and optional WMH class); optionally modulate with RF bias fields and add Rician or Gaussian noise.
+- Outputs follow BIDS-like naming with JSON sidecars capturing all simulation parameters.
 
-Thickness/PVE pipeline:
-- GM is grown outward from WM using an Euclidean distance map to reach a specified thickness (global or 3-region, based on the Hammer atlas).
-- To emulate partial volume effects, the label boundary is shifted over 20 offsets in [-0.25, 0.25] intensity range of the PVE label. Each offset yields a hard label (CSF=1, GM=2, WM=3); averaging across offsets produces a PVE-like label map.
-- The resulting tissue maps replace SPM’s GM/WM/CSF posteriors in synthesis, using SPM’s Gaussian mixture parameters.
+This label-driven synthesis minimizes dependence on the initial segmentation while preserving realistic tissue topology. RF fields can be predefined (MNI A/B/C) or simulated, and contrast-to-noise ratio plus voxel size are user-controlled.
 
-The function runs SPM12 segmentation automatically if needed and relies on CAT12 utilities. Ensure SPM12 and CAT12 are on your MATLAB path.
+![Example outputs](docs/T1-MRI-Phantom-Examples.png)
+
+## Cortical thickness and PVE simulation
+To validate cortical thickness pipelines, the label image can be edited directly:
+
+- Cortical thickness is defined geometrically: WM is morphologically closed, then GM is grown via Euclidean distance maps to reach target thickness (global or 3-region using the Hammers atlas).
+- Thickness values can vary across regions (e.g., frontal, occipital, remaining cortex) to produce known ground truth.
+- Partial volume is approximated by jittering tissue boundaries across multiple subvoxel offsets and averaging hard labels (CSF=1, GM=2, WM=3), replacing the original SPM labels in synthesis.
+
+![Thickness control](docs/T1-MRI-Phantom-Thickness.png)
 
 ## Requirements
 - MATLAB with SPM12 and CAT12 toolboxes in the path
