@@ -170,7 +170,7 @@ function mri_simulate(simu, rf)
 %
 % TODO: simulation of motion artefacts using FFT and shift of phase information
 
-version = '0.9.4';
+version = '0.9.5';
 
 % Default simulation parameters
 def.name       = '';
