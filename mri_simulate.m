@@ -12,8 +12,9 @@ function mri_simulate(simu, rf)
 %     • Rician magnitude noise at a target WM SNR (simu.snrWM>0)
 %   It supports simulations of atrophy or cortical thickness modifications. 
 %   Preprocessing with SPM12 segmentation is required for custom images.
+%   Requirements: SPM12 or SPM25 with CAT12 >= 12.10 installed.
 %
-%   The function also writes JSON sidecars next to the main and masked images
+%   The function also writes JSON sidecars next to the main image
 %   containing key simulation metadata (tool/version, voxel size, noise/SNR,
 %   RF field parameters, thickness tags), using SPM's spm_jsonwrite.
 %
@@ -123,7 +124,7 @@ function mri_simulate(simu, rf)
 %     - Masked simulated image (brain only)
 %     - Ground-truth PVE label image
 %     - Optional: RF bias field (for simulated fields)
-%     - JSON sidecars for main and masked images with simulation metadata
+%     - JSON sidecars for main images with simulation metadata
 %
 % Usage:
 %   To simulate an MRI, specify the simulation (`simu`) and RF bias field
@@ -170,7 +171,11 @@ function mri_simulate(simu, rf)
 %
 % TODO: simulation of motion artefacts using FFT and shift of phase information
 
-version = '0.9.5';
+version = '0.9.6';
+
+if ~exist('cat_main_LASsimple')
+  error('Please update to a newer version >=CAT12.10 to use mri_simulate')
+end
 
 % Default simulation parameters
 def.name       = '';
@@ -224,6 +229,9 @@ if strcmp(ext,'.gz')
 else
   is_gz = 0;
 end
+
+% keep output names clean if a temporary resample suffix is present
+name_out = regexprep(name,'_thicknessRes05$','');
 
 % if simu.rng is not defined we use the filename to create a seed
 if isempty(simu.rng) | isnan(simu.rng)
@@ -349,10 +357,47 @@ end
 
 [~, bname, ext] = spm_fileparts(res.image(1).fname);
 res.image(1) = spm_vol(fullfile(pth,[bname ext]));
-idef_name = fullfile(pth, ['iy_' name ext]);
 V = res.image(1);
 dim   = V.dim(1:3);
 vx = sqrt(sum(V.mat(1:3,1:3).^2));
+
+% For thickness simulation, resample to 0.5mm before CAT preproc write
+thickness_resampled = false;
+resampled_name = '';
+if any(simu.thickness)
+  target_res = [0.5 0.5 0.5];
+  if any(abs(vx - target_res) > 1e-6)
+    Vres_tmp = V;
+    Vres_tmp.dim = round(V.dim.*vx./target_res);
+    Ptmp = spm_imatrix(V.mat);
+    Ptmp(7:9) = Ptmp(7:9)./vx.*target_res;
+    Ptmp(1:3) = Ptmp(1:3) + vx - target_res;
+    Vres_tmp.mat = spm_matrix(Ptmp);
+
+    volres_tmp = zeros(Vres_tmp.dim, 'single');
+    for sl = 1:Vres_tmp.dim(3)
+      M = spm_matrix([0 0 sl 0 0 0 1 1 1]);
+      M1 = Vres_tmp.mat\V.mat\M;
+      volres_tmp(:,:,sl) = spm_slice_vol(V, M1, Vres_tmp.dim(1:2), -5);
+    end
+
+    resampled_name = fullfile(pth, [name '_thicknessRes05.nii']);
+    Vres_tmp.fname = resampled_name;
+    Vres_tmp.dt    = [16 0];
+    Vres_tmp.pinfo = [1 0 352]';
+    spm_write_vol(Vres_tmp, volres_tmp);
+
+    res.image(1) = spm_vol(resampled_name);
+    V = res.image(1);
+    dim   = V.dim(1:3);
+    vx = sqrt(sum(V.mat(1:3,1:3).^2));
+    thickness_resampled = true;
+  end
+end
+
+% inverse deformation field name must follow the actual image filename
+[idef_pth, idef_bname, idef_ext] = spm_fileparts(res.image(1).fname);
+idef_name = fullfile(idef_pth, ['iy_' idef_bname idef_ext]);
 
 % obtain SPM segmentations and write inverse deformation field
 [Ysrc, Ycls, Yy] = cat_spm_preproc_write8(res,zeros(max(res.lkp),4),zeros(2,2),[1 0],0,2);
@@ -566,16 +611,14 @@ if ~isempty(str2) & strcmp(str2(1),'_')
 end
 str = strrep([str1 '_' str2 '_'],'__','_');
 if strcmp(str(1),'_'), str = str(2:end); end
-if contains(name, '_T1w')
-  new_name = strrep(name,'_T1w',['_desc-' str 'T1w']);
-  new_name_masked = strrep(name,'_T1w',['_desc-' str 'masked_T1w']);
-  new_name_label = strrep(name,'_T1w',['_desc-' str2  '_label-seg']);
-  new_name_bias = strrep(name,'_T1w',['_desc-' str2  '_RFfield']);
+if contains(name_out, '_T1w')
+  new_name = strrep(name_out,'_T1w',['_desc-' str 'T1w']);
+  new_name_label = strrep(name_out,'_T1w',['_desc-' str2  '_label-seg']);
+  new_name_bias = strrep(name_out,'_T1w',['_desc-' str2  '_RFfield']);
 else
-  new_name = [name '_desc-' str];
-  new_name_masked = [name '_desc-' str 'masked'];
-  new_name_label = [name '_desc-' str2 '_label-seg'];
-  new_name_bias = [name '_desc-' str2 '_RFfield'];
+  new_name = [name_out '_desc-' str];
+  new_name_label = [name_out '_desc-' str2 '_label-seg'];
+  new_name_bias = [name_out '_desc-' str2 '_RFfield'];
 end
 
 % Remove remaining string issues
@@ -594,22 +637,11 @@ if is_gz
   spm_unlink(simu_name);
 end
 
-% write simulated masked image
-simu_name = fullfile(out_pth, [new_name_masked '.nii']); simu_name_masked = simu_name;
-fprintf('Save simulated skull-stripped image %s\n', simu_name);
-Vres.fname = simu_name;
-mind = labelres_pve(:,:,:) > 0.5;
-spm_write_vol(Vres, volres.*mind);
-if is_gz
-  gzip(simu_name);
-  spm_unlink(simu_name);
-end
-
 % write JSON sidecar with simulation parameters for both images
 try
   gen.Name = 'mri_simulate';
   gen.Version = 'unknown';
-  gen.SourceDatasets = {sprintf('%s%s', name, ext)};
+  gen.SourceDatasets = {sprintf('%s%s', name_out, ext)};
 
   if simu.snrWM > 0
     SNRval = simu.snrWM;
@@ -660,9 +692,6 @@ try
   % write JSON next to main image using SPM's writer (handles NaN/null nicely)
   jsonMain = regexprep(simu_name_main,'\.nii(\.gz)?$','.json');
   spm_jsonwrite(jsonMain, meta);
-  % write JSON next to masked image
-  jsonMasked = regexprep(simu_name_masked,'\.nii(\.gz)?$','.json');
-  spm_jsonwrite(jsonMasked, meta);
 catch ME
   fprintf('Warning: Failed to write JSON sidecar(s): %s\n', ME.message);
 end
@@ -697,6 +726,9 @@ end
 spm_unlink(idef_name);
 if is_gz
   spm_unlink(simu.name);
+end
+if thickness_resampled && exist(resampled_name,'file')
+  spm_unlink(resampled_name);
 end
 
 fprintf('================================================================================\n');
@@ -864,7 +896,7 @@ pve_range = linspace(-0.15,0.15,15);
 for pve_step = 1:numel(pve_range)
   % define wm, remove disconnected regions and dilate it
   wm  = round(label+pve_range(pve_step)) == wm_val;
-  wm = cat_vol_morph(wm,'l',1);
+  wm = cat_vol_morph(wm,'l',1, vx);
   wm = cat_vol_morph(wm,'dc',1);
   
   % euclidean distance to wm
