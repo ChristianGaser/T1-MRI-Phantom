@@ -537,19 +537,21 @@ if simu.snrWM > 0
   % Compute complex noise std using absolute WM mean, then convert to normalized units
   sigma_abs = mn(2) / simu.snrWM;    % absolute-domain sigma (same units as Ysimu)
   sigma = sigma_abs / mx_vol;        % normalized-domain sigma
+  % Complex noise components (n1,n2) are Gaussian. Magnitude combination yields
+  % Rician noise (approx. Gaussian at high SNR).
   n1 = sigma * randn(size(volres));
+  rng(simu.rng+1,'twister');
   n2 = sigma * randn(size(volres));
   volres = sqrt( (volres + n1).^2 + (n2).^2 );
-  % Clamp and rescale back
-  volres = mx_vol * max(min(volres, 1), 0);
 else
   % Gaussian noise using percentage of WM mean intensity
   sigma_abs = (simu.pn/100) * mn(2); % absolute-domain std dev
   sigma = sigma_abs / mx_vol;        % normalized-domain std dev
   noise = sigma * randn(size(volres));
   volres = volres + noise;
-  volres = mx_vol * max(min(volres, 1), 0);
 end
+% Clamp and rescale back
+volres = mx_vol * max(min(volres, 1), 0);
 
 mean_resolution = round(10*mean(simu.resolution));
 
@@ -889,15 +891,17 @@ label1 = cell(numel(simu.thickness),1);
 
 Yseg(:,:,:,1:3) = 0;
 
-% vary range of PVE from -0.15..0.15 in 15 steps to get more realistic PVE
+% vary range of PVE from -0.25..0.25 in 15 steps to get more realistic PVE
 % effects
-pve_range = linspace(-0.15,0.15,15);
+pve_range = linspace(-0.25,0.25,15);
+
+% apply gray closing to strengthen thin WM structures
+label = cat_vol_morph(label,'gc',2);
 
 for pve_step = 1:numel(pve_range)
-  % define wm, remove disconnected regions and dilate it
+  % define wm and remove disconnected regions
   wm  = round(label+pve_range(pve_step)) == wm_val;
   wm = cat_vol_morph(wm,'l',1, vx);
-  wm = cat_vol_morph(wm,'dc',1);
   
   % euclidean distance to wm
   Dwm = (bwdist(wm) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
@@ -1400,7 +1404,7 @@ res.image0 = res.image; res.ppe.affreg.skullstripped = 0; res.ppe.affreg.highBG 
 stime  = cat_io_cmd('');
 stime2 = cat_io_cmd('');
 
-[Ysrc,Ycls,Yb] = cat_main_updateSPM1639(Ysrc,P,Yy,tpm,job,res,stime,stime2);
+[~,Ycls,Yb] = cat_main_updateSPM1639(Ysrc,P,Yy,tpm,job,res,stime,stime2);
 [Yl1,Ycls] = cat_vol_partvol(Ycorr,Ycls,Yb,Yy,vx_vol,job.extopts,tpm.V,noise,job,false(size(Yb)));
 
 NS = @(Ys,s) Ys==s | Ys==s+1; 
