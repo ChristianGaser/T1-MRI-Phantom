@@ -632,8 +632,8 @@ simu_name = fullfile(out_pth, [new_name '.nii']); simu_name_main = simu_name;
 fprintf('Save simulated image %s\n', simu_name);
 Vres.fname = simu_name;
 Vres.pinfo = [1 0 352]';
-Vres.dt    = [16 0];
-spm_write_vol(Vres, volres);
+Vres.dt    = [spm_type('float32') 0];
+spm_write_vol(Vres, single(volres));
 if is_gz
   gzip(simu_name);
   spm_unlink(simu_name);
@@ -891,9 +891,9 @@ label1 = cell(numel(simu.thickness),1);
 
 Yseg(:,:,:,1:3) = 0;
 
-% vary range of PVE from -0.25..0.25 in 15 steps to get more realistic PVE
+% vary range of PVE from -0.25..0.25 in 20 steps to get more realistic PVE
 % effects
-pve_range = linspace(-0.25,0.25,15);
+pve_range = linspace(-0.25,0.25,20);
 
 % apply gray closing to strengthen thin WM structures
 label = cat_vol_morph(label,'gc',2);
