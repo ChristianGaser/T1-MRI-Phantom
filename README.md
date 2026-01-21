@@ -27,7 +27,8 @@ To validate cortical thickness pipelines, the label image can be edited directly
 ![Thickness control](docs/T1-MRI-Phantom-Thickness.png)
 
 ## Requirements
-- MATLAB with SPM12 and CAT12 toolboxes in the path
+- MATLAB with SPM12 (or SPM25) and CAT12 >= 12.10 in the path
+- Image Processing Toolbox (only required when using cortical thickness simulation; uses `bwdist`)
 - A T1-weighted NIfTI image (default examples use `colin27_t1_tal_hires.nii`)
 
 ## Inputs

@@ -4,6 +4,12 @@
 
 `mri_simulate` is a MATLAB tool that generates realistic simulated T1-weighted MRI brain images with controllable artifacts and anatomical variations. Current behavior writes BIDS-like derivatives by default and emits JSON sidecars with simulation metadata. Default noise is Rician at a target WM SNR.
 
+## Requirements
+
+- MATLAB with SPM12 (or SPM25) and CAT12 >= 12.10 on the MATLAB path
+- Image Processing Toolbox (only required when using cortical thickness simulation; uses `bwdist`)
+- A T1-weighted NIfTI image (example: `colin27_t1_tal_hires.nii`)
+
 ---
 
 ## Basic Workflow
