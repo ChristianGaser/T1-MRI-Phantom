@@ -451,32 +451,16 @@ end
 % extend target voxel size if needed
 if isscalar(simu.resolution)
   if isnan(simu.resolution)
-    % for thickness simulation use 0.8mm as default if not otherwise defined
-    if any(simu.thickness)
-      simu.resolution = [0.8 0.8 0.8];
-      if any(abs(vx - simu.resolution) > 1e-6)
-        change_resolution = 1;
-      end
-    else
-      simu.resolution = vx;
-      change_resolution = 0;
-    end
+    simu.resolution = vx;
+    change_resolution = 0;
   else
     simu.resolution = simu.resolution * ones(1,3);
     change_resolution = 1;
   end
 else
   if isnan(simu.resolution(1))
-    % for thickness simulation use 0.8mm as default if not otherwise defined
-    if any(simu.thickness)
-      simu.resolution = [0.8 0.8 0.8];
-      if any(abs(vx - simu.resolution) > 1e-6)
-        change_resolution = 1;
-      end
-    else
-      simu.resolution = vx;
-      change_resolution = 0;
-    end
+    simu.resolution = vx;
+    change_resolution = 0;
   else
     change_resolution = 1;
   end
