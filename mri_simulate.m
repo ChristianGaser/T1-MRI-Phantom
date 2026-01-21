@@ -209,9 +209,10 @@ end
 n_images = size(simu.name,1);
 if n_images > 1
   P = simu.name;
-  for i=1:n_images
-    simu.name = deblank(P(i,:));
-    mri_simulate(simu, rf);
+  parfor i=1:n_images
+    simu_i = simu;
+    simu_i.name = deblank(P(i,:));
+    mri_simulate(simu_i, rf);
   end
   return
 end
@@ -361,43 +362,12 @@ V = res.image(1);
 dim   = V.dim(1:3);
 vx = sqrt(sum(V.mat(1:3,1:3).^2));
 
-% For thickness simulation, resample to 0.5mm before CAT preproc write
+% inverse deformation field name must follow the original image filename
+[idef_pth, idef_bname, idef_ext] = spm_fileparts(res.image(1).fname);
+idef_name_orig = fullfile(idef_pth, ['iy_' idef_bname idef_ext]);
+idef_name = idef_name_orig;
 thickness_resampled = false;
 resampled_name = '';
-if any(simu.thickness)
-  target_res = [0.5 0.5 0.5];
-  if any(abs(vx - target_res) > 1e-6)
-    Vres_tmp = V;
-    Vres_tmp.dim = round(V.dim.*vx./target_res);
-    Ptmp = spm_imatrix(V.mat);
-    Ptmp(7:9) = Ptmp(7:9)./vx.*target_res;
-    Ptmp(1:3) = Ptmp(1:3) + vx - target_res;
-    Vres_tmp.mat = spm_matrix(Ptmp);
-
-    volres_tmp = zeros(Vres_tmp.dim, 'single');
-    for sl = 1:Vres_tmp.dim(3)
-      M = spm_matrix([0 0 sl 0 0 0 1 1 1]);
-      M1 = Vres_tmp.mat\V.mat\M;
-      volres_tmp(:,:,sl) = spm_slice_vol(V, M1, Vres_tmp.dim(1:2), -5);
-    end
-
-    resampled_name = fullfile(pth, [name '_thicknessRes05.nii']);
-    Vres_tmp.fname = resampled_name;
-    Vres_tmp.dt    = [16 0];
-    Vres_tmp.pinfo = [1 0 352]';
-    spm_write_vol(Vres_tmp, volres_tmp);
-
-    res.image(1) = spm_vol(resampled_name);
-    V = res.image(1);
-    dim   = V.dim(1:3);
-    vx = sqrt(sum(V.mat(1:3,1:3).^2));
-    thickness_resampled = true;
-  end
-end
-
-% inverse deformation field name must follow the actual image filename
-[idef_pth, idef_bname, idef_ext] = spm_fileparts(res.image(1).fname);
-idef_name = fullfile(idef_pth, ['iy_' idef_bname idef_ext]);
 
 % obtain SPM segmentations and write inverse deformation field
 [Ysrc, Ycls, Yy] = cat_spm_preproc_write8(res,zeros(max(res.lkp),4),zeros(2,2),[1 0],0,2);
@@ -427,7 +397,53 @@ end
 if isfield(simu,'closeWMHholes') && simu.closeWMHholes
   Yseg = close_WM_GM_holes(Yseg, Ysrc, Ycorr, Ycls, Yy, res, vx);
 end
-clear Ycls
+clear Ycls Ycorr
+
+% For thickness simulation, resample to 0.5mm before atrophy/thickness
+if any(simu.thickness)
+  target_res = [0.5 0.5 0.5];
+  if any(abs(vx - target_res) > 1e-6)
+    V0 = V;
+    Vres_tmp = V;
+    Vres_tmp.dim = round(V.dim.*vx./target_res);
+    Ptmp = spm_imatrix(V.mat);
+    Ptmp(7:9) = Ptmp(7:9)./vx.*target_res;
+    Ptmp(1:3) = Ptmp(1:3) + vx - target_res;
+    Vres_tmp.mat = spm_matrix(Ptmp);
+
+    % resample source image
+    volres_tmp = zeros(Vres_tmp.dim, 'single');
+    for sl = 1:Vres_tmp.dim(3)
+      M = spm_matrix([0 0 sl 0 0 0 1 1 1]);
+      M1 = Vres_tmp.mat\V0.mat\M;
+      volres_tmp(:,:,sl) = spm_slice_vol(V0, M1, Vres_tmp.dim(1:2), -5);
+    end
+
+    resampled_name = fullfile(pth, [name '_thicknessRes05.nii']);
+    Vres_tmp.fname = resampled_name;
+    Vres_tmp.dt    = [16 0];
+    Vres_tmp.pinfo = [1 0 352]';
+    spm_write_vol(Vres_tmp, volres_tmp);
+
+    res.image(1) = spm_vol(resampled_name);
+    V = res.image(1);
+    dim   = V.dim(1:3);
+    vx = sqrt(sum(V.mat(1:3,1:3).^2));
+
+    % resample Yseg
+    Yseg_res = zeros([Vres_tmp.dim 3], 'single');
+    for sl = 1:Vres_tmp.dim(3)
+      M = spm_matrix([0 0 sl 0 0 0 1 1 1]);
+      M1 = Vres_tmp.mat\V0.mat\M;
+      for j = 1:3
+        Yseg_res(:,:,sl,j) = spm_slice_vol(Yseg(:,:,:,j), M1, Vres_tmp.dim(1:2), 1);
+      end
+    end
+    Yseg = Yseg_res;
+
+    thickness_resampled = true;
+  end
+end
 
 % add atrophy to GM by decreasing GM value in ROI and increasing CSF value
 if simu_atrophy
@@ -468,7 +484,7 @@ end
 
 if any(simu.thickness)
   [label_pve, Yseg] = simulate_thickness(label_pve, simu, Yseg, dim, ...
-        template_dir, idef_name, vx, order);
+        template_dir, idef_name, vx, V, order);
 end
 
 Ysimu = synthesize_from_segmentation(Yseg, name, res, mn, dim, WMH);
@@ -725,7 +741,9 @@ if rf.save
 end
 
 % remove temporary files
-spm_unlink(idef_name);
+if ~isempty(idef_name_orig) && exist(idef_name_orig,'file')
+  spm_unlink(idef_name_orig);
+end
 if is_gz
   spm_unlink(simu.name);
 end
@@ -802,7 +820,7 @@ return
 
 
 %==========================================================================
-% function [label, Yseg] = simulate_thickness(label, simu, Yseg, d, template_dir, idef_name, vx, order)
+% function [label, Yseg] = simulate_thickness(label, simu, Yseg, d, template_dir, idef_name, vx, Vref, order)
 %
 % Purpose
 %   Synthesize a constant cortical thickness by growing GM outward from the
@@ -825,6 +843,7 @@ return
 %   idef_name    - char: Filename of inverse deformation field to warp atlas
 %                        into subject/native space with categorical interpolation.
 %   vx       - [vx vy vz]: Voxel sizes in mm.
+%   Vref     - struct: Target volume definition for resampling (same space as label).
 %   order    - [3x1] int: Mapping from class index (CSF/GM/WM) to Yseg order.
 %
 % Outputs
@@ -858,7 +877,7 @@ return
 %   - This function modifies Yseg directly to reflect the new PVE-like tissue
 %     maps, which are later used by the synthesis step to generate a T1 image.
 %==========================================================================
-function [label, Yseg] = simulate_thickness(label, simu, Yseg, d, template_dir, idef_name, vx, order)
+function [label, Yseg] = simulate_thickness(label, simu, Yseg, d, template_dir, idef_name, vx, Vref, order)
 
 Yp0toC = @(Yp0,c) 1-min(1,abs(Yp0-c));
 csf_val = 1; gm_val = 2; wm_val = 3;
@@ -868,6 +887,19 @@ fprintf('Transform atlas to native space. This may take a while...\n');
 hammers_name = fullfile(template_dir,'hammers.nii');
 hammers = cat_vol_defs(struct('field1',{{idef_name}},'images',{{hammers_name}},'interp',-1,'modulate',0));
 hammers = single(hammers{1}{1});
+
+% resample atlas to current grid if needed
+if any(size(hammers) ~= d)
+  Vdef = spm_vol(idef_name);
+  Vdef = Vdef(1);
+  hammers_res = zeros(Vref.dim, 'single');
+  for sl = 1:Vref.dim(3)
+    M = spm_matrix([0 0 sl 0 0 0 1 1 1]);
+    M1 = Vref.mat\Vdef.mat\M;
+    hammers_res(:,:,sl) = spm_slice_vol(hammers, M1, Vref.dim(1:2), 0);
+  end
+  hammers = hammers_res;
+end
 
 % create mask for basal ganglia and cerebellum
 mask_orig = (hammers>0   & hammers<5)  | hammers==9  | hammers==10 | ...
@@ -905,7 +937,7 @@ for pve_step = 1:numel(pve_range)
   
   % euclidean distance to wm
   Dwm = (bwdist(wm) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
-
+% cat_vbdist
   for k=1:numel(simu.thickness)
     label1{k} = round(label+pve_range(pve_step));
 
