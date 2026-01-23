@@ -923,9 +923,9 @@ label1 = cell(numel(simu.thickness),1);
 
 Yseg(:,:,:,1:3) = 0;
 
-% vary range of PVE from -0.25..0.25 in 20 steps to get more realistic PVE
+% vary range of PVE from -0.25..0.25 in 15 steps to get more realistic PVE
 % effects
-pve_range = linspace(-0.25,0.25,20);
+pve_range = linspace(-0.25,0.25,15);
 
 % apply gray closing to strengthen thin WM structures
 label = cat_vol_morph(label,'gc',2);
@@ -935,9 +935,13 @@ for pve_step = 1:numel(pve_range)
   wm  = round(label+pve_range(pve_step)) == wm_val;
   wm = cat_vol_morph(wm,'l',1, vx);
   
-  % euclidean distance to wm
-  Dwm = (bwdist(wm) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
-% cat_vbdist
+  % euclidean distance to wm (CAT12 function if Image Toolbox is not available)
+  if exist('bwdist')
+    Dwm = (bwdist(wm) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
+  else
+    Dwm = (cat_vbdist(single(wm)) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
+  end
+  
   for k=1:numel(simu.thickness)
     label1{k} = round(label+pve_range(pve_step));
 
