@@ -171,7 +171,7 @@ function mri_simulate(simu, rf)
 %
 % TODO: simulation of motion artefacts using FFT and shift of phase information
 
-version = '0.9.6';
+version = '0.9.7';
 
 if ~exist('cat_main_LASsimple')
   error('Please update to a newer version >=CAT12.10 to use mri_simulate')
@@ -189,8 +189,6 @@ def.snrWM      = 30;
 def.contrast   = 1;  % power-law contrast change exponent (1 = unchanged)
 def.derivative = 1;  % save outputs into BIDS derivatives
 def.closeWMHholes = 1; % close WMHs inside deep WM
-def.pveWeighting = 'uniform'; % thickness PVE weighting: 'uniform' or 'gaussian'
-def.pveSigma = 0.15; % sigma (vox) for gaussian PVE weighting
 
 if nargin < 1, simu = def;
 else, simu = cat_io_checkinopt(simu, def); end
@@ -910,7 +908,7 @@ end
 mask_orig = (hammers>0   & hammers<5)  | hammers==9  | hammers==10 | ...
             (hammers>16  & hammers<20) | (hammers>33 & hammers<50) | ...
              hammers==74 | hammers==75;
-mask_orig = cat_vol_morph(mask_orig,'dd',2);
+mask_orig = cat_vol_morph(mask_orig,'dd',1);
 
 % soften mask borders to avoid hard transitions when reusing original labels
 mask_soft = single(mask_orig);
@@ -920,6 +918,8 @@ mask_soft = min(max(mask_soft,0),1);
 % create mask for occipital and frontal areas and remaining parts
 mask_thickness{1} = (hammers > 63.5 & hammers < 67.5) | (hammers > 21.5 & hammers < 23.5); % occipital
 mask_thickness{3} = (hammers > 55.5 & hammers < 59.5) | (hammers > 27.5 & hammers < 29.5) | (hammers > 68.5 & hammers < 71.5); % frontal
+
+mask_thickness{3} = (hammers > 55.5 & hammers < 59.5) | (hammers > 12.5 & hammers < 14.5); % inferior/superior frontal + inferior/middle temporal
 mask_thickness{2} = ~mask_thickness{1} & ~mask_thickness{3}; % remaining parts
 
 mask = round(label) > 0;
@@ -929,24 +929,14 @@ spm_smooth(label,label,2.5*vx);
 
 label1 = cell(numel(simu.thickness),1);
 
+% save original segmentation to later include original cerebellum and basal
+% ganglia
+Yseg0 = Yseg(:,:,:,1:3);
 Yseg(:,:,:,1:3) = 0;
 
 % vary range of PVE from -0.25..0.25 in 15 steps to get more realistic PVE
 % effects (optionally weighted)
 pve_range = linspace(-0.25,0.25,15);
-if ~isfield(simu,'pveWeighting') || isempty(simu.pveWeighting)
-  simu.pveWeighting = 'uniform';
-end
-switch lower(simu.pveWeighting)
-  case 'gaussian'
-    if ~isfield(simu,'pveSigma') || isempty(simu.pveSigma)
-      simu.pveSigma = 0.15;
-    end
-    pve_w = exp(-0.5*(pve_range./simu.pveSigma).^2);
-  otherwise
-    pve_w = ones(size(pve_range));
-end
-pve_w = pve_w ./ sum(pve_w);
 
 % apply gray closing to strengthen thin WM structures
 label = cat_vol_morph(label,'gc',2);
@@ -955,7 +945,10 @@ for pve_step = 1:numel(pve_range)
   % define wm and remove disconnected regions
   wm  = round(label+pve_range(pve_step)) == wm_val;
   wm = cat_vol_morph(wm,'l',1, vx);
-  
+
+  % remove basal ganglia and cerebellum with soft blending
+  wm(mask_orig) = 0;
+
   % euclidean distance to wm (CAT12 function if Image Toolbox is not available)
   if exist('bwdist')
     Dwm = (bwdist(wm) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
@@ -984,10 +977,8 @@ for pve_step = 1:numel(pve_range)
         tmp_seg(mask_thickness{k}) = single(round(label1{k}(mask_thickness{k})) == (j));
       end
     end
-    % get original label for basal ganglia and cerebellum with soft blending
-    tmp_seg = tmp_seg.*(1-mask_soft) + Yp0toC(label0, j).*mask_soft;
 
-    Yseg(:,:,:,order(j)) = Yseg(:,:,:,order(j)) + tmp_seg * pve_w(pve_step);
+    Yseg(:,:,:,order(j)) = Yseg(:,:,:,order(j)) + tmp_seg/numel(pve_range);
   end
 end
 
@@ -995,8 +986,10 @@ end
 label = zeros(d, 'single');
 
 for k = 1:3
-    label = label + k*Yseg(:,:,:,order(k));
+  Yseg(:,:,:,order(k)) = Yseg(:,:,:,order(k)).*(1-mask_soft) + Yseg0(:,:,:,order(k)).*mask_soft;
+  label = label + k*Yseg(:,:,:,order(k));
 end
+
 
 % close remaining holes in CSF
 mask = label > 0.5;
