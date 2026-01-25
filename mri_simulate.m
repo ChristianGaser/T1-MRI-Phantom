@@ -189,6 +189,8 @@ def.snrWM      = 30;
 def.contrast   = 1;  % power-law contrast change exponent (1 = unchanged)
 def.derivative = 1;  % save outputs into BIDS derivatives
 def.closeWMHholes = 1; % close WMHs inside deep WM
+def.pveWeighting = 'uniform'; % thickness PVE weighting: 'uniform' or 'gaussian'
+def.pveSigma = 0.15; % sigma (vox) for gaussian PVE weighting
 
 if nargin < 1, simu = def;
 else, simu = cat_io_checkinopt(simu, def); end
@@ -882,6 +884,9 @@ function [label, Yseg] = simulate_thickness(label, simu, Yseg, d, template_dir, 
 Yp0toC = @(Yp0,c) 1-min(1,abs(Yp0-c));
 csf_val = 1; gm_val = 2; wm_val = 3;
 
+% rescue original label for cerebellum/basal ganglia
+label0 = label;
+
 % warp atlas to native space using categorical interpolation
 fprintf('Transform atlas to native space. This may take a while...\n');
 hammers_name = fullfile(template_dir,'hammers.nii');
@@ -907,6 +912,11 @@ mask_orig = (hammers>0   & hammers<5)  | hammers==9  | hammers==10 | ...
              hammers==74 | hammers==75;
 mask_orig = cat_vol_morph(mask_orig,'dd',2);
 
+% soften mask borders to avoid hard transitions when reusing original labels
+mask_soft = single(mask_orig);
+spm_smooth(mask_soft, mask_soft, 1.5*vx);
+mask_soft = min(max(mask_soft,0),1);
+
 % create mask for occipital and frontal areas and remaining parts
 mask_thickness{1} = (hammers > 63.5 & hammers < 67.5) | (hammers > 21.5 & hammers < 23.5); % occipital
 mask_thickness{3} = (hammers > 55.5 & hammers < 59.5) | (hammers > 27.5 & hammers < 29.5) | (hammers > 68.5 & hammers < 71.5); % frontal
@@ -917,15 +927,26 @@ mask = round(label) > 0;
 % force stronger PVE effects by smoothing
 spm_smooth(label,label,2.5*vx);
 
-label0 = label;
-
 label1 = cell(numel(simu.thickness),1);
 
 Yseg(:,:,:,1:3) = 0;
 
 % vary range of PVE from -0.25..0.25 in 15 steps to get more realistic PVE
-% effects
+% effects (optionally weighted)
 pve_range = linspace(-0.25,0.25,15);
+if ~isfield(simu,'pveWeighting') || isempty(simu.pveWeighting)
+  simu.pveWeighting = 'uniform';
+end
+switch lower(simu.pveWeighting)
+  case 'gaussian'
+    if ~isfield(simu,'pveSigma') || isempty(simu.pveSigma)
+      simu.pveSigma = 0.15;
+    end
+    pve_w = exp(-0.5*(pve_range./simu.pveSigma).^2);
+  otherwise
+    pve_w = ones(size(pve_range));
+end
+pve_w = pve_w ./ sum(pve_w);
 
 % apply gray closing to strengthen thin WM structures
 label = cat_vol_morph(label,'gc',2);
@@ -963,10 +984,10 @@ for pve_step = 1:numel(pve_range)
         tmp_seg(mask_thickness{k}) = single(round(label1{k}(mask_thickness{k})) == (j));
       end
     end
-    % get original label for basal ganglia and cerebellum
-    tmp_seg(mask_orig) = Yp0toC(label0(mask_orig), j);
+    % get original label for basal ganglia and cerebellum with soft blending
+    tmp_seg = tmp_seg.*(1-mask_soft) + Yp0toC(label0, j).*mask_soft;
 
-    Yseg(:,:,:,order(j)) = Yseg(:,:,:,order(j)) + tmp_seg/numel(pve_range);
+    Yseg(:,:,:,order(j)) = Yseg(:,:,:,order(j)) + tmp_seg * pve_w(pve_step);
   end
 end
 
@@ -980,7 +1001,6 @@ end
 % close remaining holes in CSF
 mask = label > 0.5;
 label(mask ~= cat_vol_morph(mask,'dc',4)) = 1;
-
 
 
 %==========================================================================
