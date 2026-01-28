@@ -193,6 +193,9 @@ def.closeWMHholes = 1; % close WMHs inside deep WM
 if nargin < 1, simu = def;
 else, simu = cat_io_checkinopt(simu, def); end
 
+% keep requested output resolution separate from internal thickness resampling
+requested_resolution = simu.resolution;
+
 % Default bias field parameters
 def.percent    = 30;
 def.type       = [2 0];
@@ -362,6 +365,11 @@ V = res.image(1);
 dim   = V.dim(1:3);
 vx = sqrt(sum(V.mat(1:3,1:3).^2));
 
+% keep native geometry for final output if needed
+V_native = V;
+dim_native = dim;
+vx_native = vx;
+
 % inverse deformation field name must follow the original image filename
 [idef_pth, idef_bname, idef_ext] = spm_fileparts(res.image(1).fname);
 idef_name_orig = fullfile(idef_pth, ['iy_' idef_bname idef_ext]);
@@ -465,21 +473,27 @@ else
 end
 
 % extend target voxel size if needed
-if isscalar(simu.resolution)
-  if isnan(simu.resolution)
+if isscalar(requested_resolution)
+  resolution_is_nan = isnan(requested_resolution);
+else
+  resolution_is_nan = isnan(requested_resolution(1));
+end
+
+if resolution_is_nan
+  if thickness_resampled
+    simu.resolution = vx_native;
+    change_resolution = 1;
+  else
     simu.resolution = vx;
     change_resolution = 0;
-  else
-    simu.resolution = simu.resolution * ones(1,3);
-    change_resolution = 1;
   end
 else
-  if isnan(simu.resolution(1))
-    simu.resolution = vx;
-    change_resolution = 0;
+  if isscalar(requested_resolution)
+    simu.resolution = requested_resolution * ones(1,3);
   else
-    change_resolution = 1;
+    simu.resolution = requested_resolution;
   end
+  change_resolution = 1;
 end
 
 if any(simu.thickness)
@@ -502,10 +516,18 @@ end
 mx_vol = max(Ysimu(:));
 
 % output matrix
-Vres.dim = round(V.dim.*vx./simu.resolution);
-P = spm_imatrix(V.mat);
-P(7:9) = P(7:9)./vx.*simu.resolution;
-P(1:3) = P(1:3) + vx - simu.resolution;
+if resolution_is_nan && thickness_resampled
+  Vout = V_native;
+  vx_out = vx_native;
+else
+  Vout = V;
+  vx_out = vx;
+end
+
+Vres.dim = round(Vout.dim.*vx_out./simu.resolution);
+P = spm_imatrix(Vout.mat);
+P(7:9) = P(7:9)./vx_out.*simu.resolution;
+P(1:3) = P(1:3) + vx_out - simu.resolution;
 Vres.mat = spm_matrix(P);
 
 % output in defined resolution
@@ -818,6 +840,22 @@ for k=1:K
 end
 return
 
+%==========================================================================
+% function mask = is_in_atlas(atlas, regions)
+% Purpose
+%   Create mask of defined regions 
+%
+% Inputs
+%   atlas - single(dims): atlas with integer values for defined regions.
+%   regions - vector of integers that define regions to choose.
+%
+% Output
+%   mask - logic(dim): mask of selected regions.
+%==========================================================================
+function mask = is_in_atlas(atlas, regions)
+
+atlas = round(atlas);
+mask = ismember(atlas, regions);
 
 %==========================================================================
 % function [label, Yseg] = simulate_thickness(label, simu, Yseg, d, template_dir, idef_name, vx, Vref, order)
@@ -878,6 +916,127 @@ return
 %     maps, which are later used by the synthesis step to generate a T1 image.
 %==========================================================================
 function [label, Yseg] = simulate_thickness(label, simu, Yseg, d, template_dir, idef_name, vx, Vref, order)
+
+Yp0toC = @(Yp0,c) 1-min(1,abs(Yp0-c));
+csf_val = 1; gm_val = 2; wm_val = 3;
+
+% rescue original label for cerebellum/basal ganglia
+label0 = label;
+
+% warp atlas to native space using categorical interpolation
+fprintf('Transform atlas to native space. This may take a while...\n');
+atlas_name = fullfile(template_dir,'neuromorphometrics.nii');
+atlas = cat_vol_defs(struct('field1',{{idef_name}},'images',{{atlas_name}},'interp',-1,'modulate',0));
+atlas = single(atlas{1}{1});
+
+% resample atlas to current grid if needed
+if any(size(atlas) ~= d)
+  Vdef = spm_vol(idef_name);
+  Vdef = Vdef(1);
+  atlas_res = zeros(Vref.dim, 'single');
+  for sl = 1:Vref.dim(3)
+    M = spm_matrix([0 0 sl 0 0 0 1 1 1]);
+    M1 = Vref.mat\Vdef.mat\M;
+    atlas_res(:,:,sl) = spm_slice_vol(atlas, M1, Vref.dim(1:2), 0);
+  end
+  atlas = atlas_res;
+end
+
+% create mask for non-cortical structures (i.e. basal ganglia, cerebellum, 
+% hippocampus, amygdala
+basal_ganglia = [31:32 36:37 47:48 55:62];
+cerebellum = [11 35 38:41 71:73];
+mask_orig = is_in_atlas(atlas, [basal_ganglia cerebellum]);
+mask_orig = cat_vol_morph(mask_orig,'dd',1);
+
+% soften mask borders to avoid hard transitions when reusing original labels
+mask_soft = single(mask_orig);
+spm_smooth(mask_soft, mask_soft, 1.5*vx);
+mask_soft = min(max(mask_soft,0),1);
+
+% create mask for mainly occipital and frontal areas
+region1 = [108:109 114:115 128:129 134:135 144:145 156:161 170:171 176:177 182:183 196:197];
+region3 = [31:32 102:105 120:121 132:133 136:137 146:147 152:155 162:165 172:173 178:179 190:191 202:205];
+
+mask_thickness{1} = is_in_atlas(atlas, region1); % mainly occipital
+mask_thickness{3} = is_in_atlas(atlas, region3); % mainly frontal
+mask_thickness{2} = ~mask_thickness{1} & ~mask_thickness{3}; % remaining parts
+
+mask = round(label) > 0;
+
+% force stronger PVE effects by smoothing
+spm_smooth(label,label,2.5*vx);
+
+label1 = cell(numel(simu.thickness),1);
+
+% save original segmentation to later include original cerebellum and basal
+% ganglia
+Yseg0 = Yseg(:,:,:,1:3);
+Yseg(:,:,:,1:3) = 0;
+
+% vary range of PVE from -0.25..0.25 in 15 steps to get more realistic PVE
+% effects (optionally weighted)
+pve_range = linspace(-0.25,0.25,15);
+
+% apply gray closing to strengthen thin WM structures
+label = cat_vol_morph(label,'gc',2);
+
+for pve_step = 1:numel(pve_range)
+  % define wm and remove disconnected regions
+  wm  = round(label+pve_range(pve_step)) == wm_val;
+  wm = cat_vol_morph(wm,'l',1, vx);
+
+  % remove basal ganglia and cerebellum with soft blending
+  wm(mask_orig) = 0;
+
+  % euclidean distance to wm (CAT12 function if Image Toolbox is not available)
+  if exist('bwdist')
+    Dwm = (bwdist(wm) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
+  else
+    Dwm = (cat_vbdist(single(wm)) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
+  end
+  
+  for k=1:numel(simu.thickness)
+    label1{k} = round(label+pve_range(pve_step));
+
+    label1{k}(~wm) = csf_val;
+    label1{k}(~mask) = 0;
+    
+    % limit dilated gm to defined thickness
+    label1{k}(label1{k} == csf_val & Dwm <= simu.thickness(k)) = gm_val; 
+  end
+    
+  % replace tissue maps with modified label
+  for j = 1:3
+    if isscalar(simu.thickness)
+      % only simulate 2mm thickness
+      tmp_seg = single(round(label1{1}) == (j));
+    else
+      tmp_seg = Yseg(:,:,:,order(j));
+      for k = 1:3
+        tmp_seg(mask_thickness{k}) = single(round(label1{k}(mask_thickness{k})) == (j));
+      end
+    end
+
+    Yseg(:,:,:,order(j)) = Yseg(:,:,:,order(j)) + tmp_seg/numel(pve_range);
+  end
+end
+
+% update ground truth label
+label = zeros(d, 'single');
+
+for k = 1:3
+  Yseg(:,:,:,order(k)) = Yseg(:,:,:,order(k)).*(1-mask_soft) + Yseg0(:,:,:,order(k)).*mask_soft;
+  label = label + k*Yseg(:,:,:,order(k));
+end
+
+
+% close remaining holes in CSF
+mask = label > 0.5;
+label(mask ~= cat_vol_morph(mask,'dc',4)) = 1;
+
+
+function [label, Yseg] = simulate_thickness_hammers(label, simu, Yseg, d, template_dir, idef_name, vx, Vref, order)
 
 Yp0toC = @(Yp0,c) 1-min(1,abs(Yp0-c));
 csf_val = 1; gm_val = 2; wm_val = 3;
