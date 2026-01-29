@@ -98,6 +98,8 @@ function mri_simulate(simu, rf)
 %         and the cerebellum, which are excluded from the thickness simulation to 
 %         obtain a more realistic MRI. Either thickness or atrophy can be simulated.
 %         Default: 0 (disabled).
+%       - 'parpool' (integer): Specifies the number of workers (processors) for
+%.        the parpool command if the Parallel Computing Toolbox is available 
 %   rf (struct): RF bias field parameters.
 %       - 'percent' (double): Amplitude of the bias field in percentage.
 %         Negative values invert the field. Default: 30.
@@ -171,7 +173,7 @@ function mri_simulate(simu, rf)
 %
 % TODO: simulation of motion artefacts using FFT and shift of phase information
 
-version = '0.9.7';
+version = '0.9.8';
 
 if ~exist('cat_main_LASsimple')
   error('Please update to a newer version >=CAT12.10 to use mri_simulate')
@@ -189,10 +191,11 @@ def.snrWM      = 30;
 def.contrast   = 1;  % power-law contrast change exponent (1 = unchanged)
 def.derivative = 1;  % save outputs into BIDS derivatives
 def.closeWMHholes = 1; % close WMHs inside deep WM
+def.parpool = feature('numcores')/2; % use half of the available processors
 
 if nargin < 1, simu = def;
 else, simu = cat_io_checkinopt(simu, def); end
-
+  
 % keep requested output resolution separate from internal thickness resampling
 requested_resolution = simu.resolution;
 
@@ -210,7 +213,12 @@ if isempty(simu.name)
 end
 
 n_images = size(simu.name,1);
+
 if n_images > 1
+  % set number of workers/processors if Parallel Computing Toolbox is available
+  if exist('parpool')
+    parpool(min(simu.parpool, n_images));
+  end
   P = simu.name;
   parfor i=1:n_images
     simu_i = simu;
@@ -955,7 +963,7 @@ spm_smooth(mask_soft, mask_soft, 1.5*vx);
 mask_soft = min(max(mask_soft,0),1);
 
 % create mask for mainly occipital and frontal areas
-region1 = [108:109 114:115 128:129 134:135 144:145 156:161 170:171 176:177 182:183 196:197];
+region1 = [108:109 114:115 128:129 134:135 144:145 148:149 156:161 170:171 176:177 196:197];
 region3 = [31:32 102:105 120:121 132:133 136:137 146:147 152:155 162:165 172:173 178:179 190:191 202:205];
 
 mask_thickness{1} = is_in_atlas(atlas, region1); % mainly occipital
