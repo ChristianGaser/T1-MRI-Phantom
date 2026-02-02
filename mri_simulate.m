@@ -225,6 +225,9 @@ if n_images > 1
     simu_i.name = deblank(P(i,:));
     mri_simulate(simu_i, rf);
   end
+  if exist('parpool')
+    delete(gcp('nocreate'))
+  end
   return
 end
 
