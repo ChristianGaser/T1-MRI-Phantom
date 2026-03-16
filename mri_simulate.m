@@ -173,10 +173,10 @@ function mri_simulate(simu, rf)
 %
 % TODO: simulation of motion artefacts using FFT and shift of phase information
 
-version = '0.9.8';
+version = '0.9.9';
 
 if ~exist('cat_main_LASsimple')
-  error('Please update to a newer version >=CAT12.10 to use mri_simulate')
+  error('Please update to a newer version >=CAT26 to use mri_simulate')
 end
 
 % Default simulation parameters
@@ -293,7 +293,7 @@ end
 mat_name = fullfile(pth, [name '_seg8.mat']);
 
 % CAT12 template dir is later used for defining atrophy atlas
-template_dir = fullfile(spm('dir'),'toolbox','cat12','templates_MNI152NLin2009cAsym');
+template_dir = fullfile(spm('dir'),'toolbox','CAT','templates_MNI152NLin2009cAsym');
 
 % call SPM segmentation if necessary and only save the seg8.mat file
 if ~exist(mat_name,'file')
@@ -952,6 +952,11 @@ if any(size(atlas) ~= d)
   end
   atlas = atlas_res;
 end
+
+% Remove wm and extend GM areas using vbdist
+atlas(round(label) == wm_val) = 0;
+[~, Yind] = cat_vbdist( single(atlas>0) );
+atlas = atlas(Yind);
 
 % create mask for non-cortical structures (i.e. basal ganglia, cerebellum, 
 % hippocampus, amygdala
