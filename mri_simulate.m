@@ -1216,6 +1216,11 @@ for i = 1:numel(simu.atrophy{2})
 
   % increase CSF by factor defined in atrophy mask
   Yseg(:,:,:,3) = mod_atlas.*Yseg(:,:,:,3);
+  % renormalize tissue posteriors so GM+WM+CSF = 1 per voxel, keeping the
+  % weighted-sum label bounded in [0,3] (argmax and % reduction unchanged)
+  Ysum = Yseg(:,:,:,1) + Yseg(:,:,:,2) + Yseg(:,:,:,3);
+  Ysum(Ysum==0) = 1;                       % guard background
+  for c = 1:3, Yseg(:,:,:,c) = Yseg(:,:,:,c)./Ysum; end
   
   [~, maxind] = max(Yseg,[],4);
   GM_atlas_simu = sum(maxind(ind_atlas) == 1);
