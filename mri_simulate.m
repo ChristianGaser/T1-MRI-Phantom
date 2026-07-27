@@ -979,8 +979,10 @@ mask_orig = is_in_atlas(atlas, [basal_ganglia cerebellum]);
 mask_orig = cat_vol_morph(mask_orig,'dd',1);
 
 % soften mask borders to avoid hard transitions when reusing original labels
+% (spm_smooth expects the FWHM in voxels for array input, thus the size in mm
+% has to be divided by the voxel size)
 mask_soft = single(mask_orig);
-spm_smooth(mask_soft, mask_soft, 1.5*vx);
+spm_smooth(mask_soft, mask_soft, 0.75./vx);
 mask_soft = min(max(mask_soft,0),1);
 
 % create mask for mainly occipital and frontal areas
@@ -993,8 +995,8 @@ mask_thickness{2} = ~mask_thickness{1} & ~mask_thickness{3}; % remaining parts
 
 mask = round(label) > 0;
 
-% force stronger PVE effects by smoothing
-spm_smooth(label,label,2.5*vx);
+% force stronger PVE effects by smoothing (FWHM in mm, converted to voxels)
+spm_smooth(label,label,1.25./vx);
 
 label1 = cell(numel(simu.thickness),1);
 
@@ -1024,24 +1026,26 @@ for pve_step = 1:numel(pve_range)
   else
     Dwm = (cat_vbdist(single(wm)) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
   end
-  
+
   for k=1:numel(simu.thickness)
     label1{k} = round(label+pve_range(pve_step));
 
     label1{k}(~wm) = csf_val;
     label1{k}(~mask) = 0;
-    
+
     % limit dilated gm to defined thickness
-    label1{k}(label1{k} == csf_val & Dwm <= simu.thickness(k)) = gm_val; 
+    label1{k}(label1{k} == csf_val & Dwm <= simu.thickness(k)) = gm_val;
   end
-    
+
   % replace tissue maps with modified label
   for j = 1:3
     if isscalar(simu.thickness)
       % only simulate 2mm thickness
       tmp_seg = single(round(label1{1}) == (j));
     else
-      tmp_seg = Yseg(:,:,:,order(j));
+      % the three region masks tile the whole volume, thus every voxel is
+      % overwritten below and the map only has to be preallocated here
+      tmp_seg = zeros(d, 'single');
       for k = 1:3
         tmp_seg(mask_thickness{k}) = single(round(label1{k}(mask_thickness{k})) == (j));
       end
@@ -1100,7 +1104,7 @@ mask_orig = cat_vol_morph(mask_orig,'dd',1);
 
 % soften mask borders to avoid hard transitions when reusing original labels
 mask_soft = single(mask_orig);
-spm_smooth(mask_soft, mask_soft, 1.5*vx);
+spm_smooth(mask_soft, mask_soft, 1.5./vx);
 mask_soft = min(max(mask_soft,0),1);
 
 % create mask for occipital and frontal areas and remaining parts
@@ -1112,8 +1116,8 @@ mask_thickness{2} = ~mask_thickness{1} & ~mask_thickness{3}; % remaining parts
 
 mask = round(label) > 0;
 
-% force stronger PVE effects by smoothing
-spm_smooth(label,label,2.5*vx);
+% force stronger PVE effects by smoothing (FWHM in mm, converted to voxels)
+spm_smooth(label,label,2.5./vx);
 
 label1 = cell(numel(simu.thickness),1);
 
@@ -1330,6 +1334,15 @@ for z = 1:length(x3)
     tmp = tmp + res.mn(1,k)*q1(:,:,k)./s;
   end
 
+  % The WMH class is not part of res.lkp and is therefore added separately.
+  % Its intensity is stored as last entry of res.mn by simulate_WMHs. Without
+  % this term the WMH map would only appear in the normalization sum s and
+  % would just dilute (i.e. darken) the WM intensity instead of contributing
+  % the intended WMH intensity.
+  if ~isempty(WMH)
+    tmp = tmp + res.mn(1,K)*q1(:,:,K)./s;
+  end
+
   % add remaining 3 BG classes from bias corrected image
   ind = tmp == 0;
   tmp(ind) = cr{1}(ind);
@@ -1507,15 +1520,16 @@ Ysimu = rf_field.*Ysimu;
 %                  synthesis.
 %
 % Algorithm
-%   1) Warp the MICCAI2017 WMH prior map to native space and lightly smooth it.
+%   1) Warp the MICCAI2017 WMH prior map to native space, resample it to the
+%      current grid if necessary, and lightly smooth it.
 %   2) Create a random 3D field, resample it to image dimensions, threshold to
 %      form spatial support for patchy WMH distribution.
 %   3) Erode WM to ensure spacing from GM and constrain WMHs to deep WM.
 %   4) Combine WMH prior^(1/(strength-0.8)) with random field and WM mask,
 %      smooth and normalize to [0,1].
-%   5) Update label_pve by adding 2*WMH and clipping to max class label 4,
-%      thereby introducing an additional WMH class contribution.
-%   6) Extend the GMM by adding a WMH class intensity equal to the GM mean
+%   5) Update label_pve by adding 5*WMH/strength^0.75 and clipping to max class
+%      label 4, thereby introducing an additional WMH class contribution.
+%   6) Extend res.mn by a WMH class intensity equal to the (weighted) GM mean.
 %
 % Notes
 %   - Class encoding after this step: CSF=1, GM=2, WM=3, WMH=4.
@@ -1523,6 +1537,10 @@ Ysimu = rf_field.*Ysimu;
 %     emphasize regions with higher WMH probability.
 %   - The WM erosion step helps avoid spuriously labeling GM/CSF boundaries
 %     as WMH.
+%   - Only res.mn is extended by the WMH class, because mg/vr/lkp describe the
+%     mixture model that is evaluated in likelihoods(), which must stay
+%     unchanged. synthesize_from_segmentation addresses the WMH class by its
+%     index K = numel(res.mg)+1.
 %==========================================================================
 function [WMH, res, label_pve] = simulate_WMHs(simu, res, label_pve, template_dir, idef_name)
 
@@ -1588,10 +1606,17 @@ WMH = WMH/max(WMH(:));
 label_pve = label_pve + 5*WMH/strength.^0.75;
 label_pve(label_pve > 4) = 4;
 
-% use mean of GM for additional class
-K   = numel(res.mg);
-intensity_WMH = mean(res.mn(1,res.lkp==1));
-K = K + 1;
+% Use mean of GM for the additional class. The mixing proportions mg sum to 1
+% within each class, thus the weighted mean is used here in the same way as
+% the GM/WM/CSF means are estimated in the main function.
+% Only res.mn is extended (and not mg/vr/lkp), because the WMH class is not
+% part of the mixture model that is evaluated in likelihoods(). It is
+% addressed by its index K in synthesize_from_segmentation.
+ind_GM = res.lkp == 1;
+mg_GM  = res.mg(ind_GM);
+mn_GM  = res.mn(1,ind_GM);
+intensity_WMH = sum(mg_GM(:) .* mn_GM(:));
+K = numel(res.mg) + 1;
 res.mn(1,K) = intensity_WMH;
 
 
