@@ -94,9 +94,10 @@ function mri_simulate(simu, rf)
 %         Either a scalar value for global constant thickness or a vector with 
 %         3 thickness values can be defined for the occipital and frontal lobes 
 %         (1st and 3rd values) and the rest of the brain (2nd value). The 
-%         Hammer atlas is used to define these areas, as well as subcortical areas 
-%         and the cerebellum, which are excluded from the thickness simulation to 
-%         obtain a more realistic MRI. Either thickness or atrophy can be simulated.
+%         Neuromorphometrics atlas is used to define these areas, as well as
+%         subcortical areas and the cerebellum, which are excluded from the
+%         thickness simulation to obtain a more realistic MRI. Either thickness
+%         or atrophy can be simulated.
 %         Default: 0 (disabled).
 %       - 'parpool' (integer): Specifies the number of workers (processors) for
 %.        the parpool command if the Parallel Computing Toolbox is available 
@@ -321,7 +322,13 @@ end
 
 % check that rf.save is not set for predefined MNI bias fields
 if ischar(rf.type) && rf.save
-  fprintf('Predifined MNI bias fields cannot be saved.\n');
+  fprintf('Predefined MNI bias fields cannot be saved.\n');
+  rf.save = 0;
+end
+
+% no bias field is created for an amplitude of 0 and thus nothing can be saved
+if rf.percent == 0 && rf.save
+  fprintf('No bias field is simulated for rf.percent = 0 and it cannot be saved.\n');
   rf.save = 0;
 end
 
@@ -546,18 +553,24 @@ volres   = zeros(Vres.dim);
 labelres_pve = zeros(Vres.dim);
 
 if change_resolution
+  if rf.save, rfres = zeros(Vres.dim); end
   for sl = 1:Vres.dim(3)
     M = spm_matrix([0 0 sl 0 0 0 1 1 1]);
     M1 = Vres.mat\V.mat\M;
-    
+
     % use sinc interpolation for simulated image
     volres(:,:,sl) = spm_slice_vol(Ysimu,M1,Vres.dim(1:2),-5);
     % and linear interpolation for label image
     labelres_pve(:,:,sl) = spm_slice_vol(label_pve,M1,Vres.dim(1:2),1);
+    % the bias field has to follow the same grid to be saved with Vres
+    if rf.save
+      rfres(:,:,sl) = spm_slice_vol(rf_field,M1,Vres.dim(1:2),1);
+    end
   end
 else % we can skip interpolation if voxels size is the same
   volres = Ysimu;
   labelres_pve = label_pve;
+  if rf.save, rfres = rf_field; end
 end
 
 volres = volres / mx_vol;
@@ -766,7 +779,7 @@ if rf.save
   Vres.fname = rf_name;
   Vres.pinfo = [1 0 352]';
   Vres.dt    = [16 0];
-  spm_write_vol(Vres, rf_field);
+  spm_write_vol(Vres, single(rfres));
   if is_gz
     gzip(rf_name);
     spm_unlink(rf_name);
@@ -888,7 +901,7 @@ mask = ismember(atlas, regions);
 %              order specified by 'order'. Will be overwritten by the simulated
 %              PVE-like segmentation created here.
 %   d        - [nx ny nz]: Volume dimensions.
-%   template_dir - char: Path to CAT/SPM template directory (for Hammer atlas).
+%   template_dir - char: Path to CAT/SPM template directory (for Neuromorphometrics atlas).
 %   idef_name    - char: Filename of inverse deformation field to warp atlas
 %                        into subject/native space with categorical interpolation.
 %   vx       - [vx vy vz]: Voxel sizes in mm.
@@ -902,7 +915,7 @@ mask = ismember(atlas, regions);
 %              the simulated PVE-like segmentation.
 %
 % Algorithm
-%   1) Atlas masks: Warp Hammer atlas to native space and build masks to exclude
+%   1) Atlas masks: Warp Neuromorphometrics atlas to native space and build masks to exclude
 %      subcortical/cerebellar regions from thickness manipulation. Optionally
 %      define region masks to apply three distinct thickness values (occipital,
 %      rest, frontal) when simu.thickness is a 3-vector.
@@ -922,7 +935,7 @@ mask = ismember(atlas, regions);
 %   - Class encoding: CSF=1, GM=2, WM=3 throughout.
 %   - When simu.thickness is scalar, the same thickness is applied globally.
 %     When it has 3 values, they are applied to occipital, rest, and frontal
-%     regions as defined by the Hammer atlas masks.
+%     regions as defined by the Neuromorphometrics atlas masks.
 %   - This function modifies Yseg directly to reflect the new PVE-like tissue
 %     maps, which are later used by the synthesis step to generate a T1 image.
 %==========================================================================
@@ -1266,6 +1279,15 @@ chan.T  = res.Tbias{1};
 % output image
 Ysimu = zeros(d, 'single');
 
+% Replace the GM/WM/CSF means of the mixture model by the means estimated for
+% this image. This is constant over slices and is therefore done only once.
+for k=1:3
+  res.mn(1,res.lkp==k) = mn(k);
+end
+
+% index of the last Gaussian that still belongs to GM/WM/CSF
+n_brain_gaussians = find(res.lkp<=3, 1, 'last');
+
 spm_progress_bar('init',length(x3),['Working on ' name],'Planes completed');
 for z = 1:length(x3)
 
@@ -1280,12 +1302,17 @@ for z = 1:length(x3)
   q1  = likelihoods(cr,[],res.mg,res.mn,res.vr);
   q1  = reshape(q1,[d(1:2),numel(res.mg)]);
   
-  % replace classes and means for GM/WM/CSF by external segmentations
+  % Replace classes for GM/WM/CSF by the external segmentations. A tissue
+  % class can be modelled by more than one Gaussian (with SPM defaults CSF
+  % uses two), and the mixing proportions mg sum to 1 within each class.
+  % The class probability is therefore distributed over its Gaussians using
+  % mg. Assigning the full class probability to each of its Gaussians would
+  % count that class numel(ind) times in the normalization sum s below and
+  % would scale the synthesized intensity of such a class by 1/numel(ind).
   for k=1:3
     ind = find(res.lkp==k);
     for j=1:numel(ind)
-      q1(:,:,ind(j)) = vol_seg(:,:,z,k);
-      res.mn(1,ind(j)) = mn(k);
+      q1(:,:,ind(j)) = res.mg(ind(j))*vol_seg(:,:,z,k);
     end
   end
 
@@ -1293,13 +1320,14 @@ for z = 1:length(x3)
   if ~isempty(WMH)
     q1(:,:,K) = WMH(:,:,z);
   end
-  
+
   s   = sum(q1,3);
   tmp = zeros(d(1:2));
 
-  % sum up over first 3 classes and normalize to sum of 1
-  for k=1:find(res.lkp<=3, 1, 'last')
-    tmp = tmp + res.mg(k)*res.mn(1,k)*q1(:,:,k)./s;
+  % sum up over first 3 classes and normalize to sum of 1 (mg is already
+  % contained in q1 and must not be applied a second time here)
+  for k=1:n_brain_gaussians
+    tmp = tmp + res.mn(1,k)*q1(:,:,k)./s;
   end
 
   % add remaining 3 BG classes from bias corrected image
@@ -1347,9 +1375,12 @@ rf_field = single(rf_field{1}{1});
 % apply defined percent and strength
 rf_field = abs(rf.percent)/100 * (single(rf_field));
 
-% invert field for neg. values
+% invert field for neg. values by changing the sign of the modulation, which
+% swaps bright and dark areas but keeps the defined amplitude (the previous
+% reciprocal 1./rf_field resulted in Inf for zero-valued voxels and in an
+% amplitude that was no longer related to rf.percent)
 if rf.percent < 0
-  rf_field = 1./rf_field;
+  rf_field = -rf_field;
 end
 
 ind = isfinite(rf_field);
@@ -1434,9 +1465,12 @@ rf_field = rf_field/max(rf_field(:));
 % apply defined percent
 rf_field = abs(rf.percent)/100 * rf_field;
 
-% invert field for neg. values
+% invert field for neg. values by changing the sign of the modulation, which
+% swaps bright and dark areas but keeps the defined amplitude (the previous
+% reciprocal 1./rf_field divided by zero here, because the field was scaled
+% to a range of exactly 0..1 above, and returned a NaN/-Inf field)
 if rf.percent < 0
-  rf_field = 1./rf_field;
+  rf_field = -rf_field;
 end
 rf_field = 1 + rf_field - mean(rf_field(:));
 
@@ -1501,7 +1535,23 @@ fprintf('Transform WMH map to native space.\n');
 WMH_name = fullfile(template_dir,'cat_wmh_miccai2017.nii');
 WMH = cat_vol_defs(struct('field1',{{idef_name}},'images',{{WMH_name}},'interp',1,'modulate',0));
 WMH = single(WMH{1}{1});
-dim = size(WMH);
+
+% The deformation field is always defined for the original image, thus the
+% warped map has to be resampled if the current grid differs (which is the
+% case after the internal resampling to 0.5mm for thickness simulation).
+Vref = res.image(1);
+dim  = Vref.dim(1:3);
+if any(size(WMH) ~= dim)
+  Vdef = spm_vol(idef_name);
+  Vdef = Vdef(1);
+  WMH_res = zeros(dim, 'single');
+  for sl = 1:dim(3)
+    M  = spm_matrix([0 0 sl 0 0 0 1 1 1]);
+    M1 = Vref.mat\Vdef.mat\M;
+    WMH_res(:,:,sl) = spm_slice_vol(WMH, M1, dim(1:2), 1);
+  end
+  WMH = WMH_res;
+end
 
 % slightly smooth WMH atlas
 spm_smooth(WMH, WMH, 2./vx);
