@@ -7,7 +7,7 @@
 ## Requirements
 
 - MATLAB with SPM12 (or SPM25) and CAT >= 12.10 on the MATLAB path (`cat_main_LASsimple` is required)
-- No MATLAB toolboxes beyond base MATLAB. `bwdist` (Image Processing Toolbox) is used when available, with a `cat_vbdist` fallback; `parpool` (Parallel Computing Toolbox) is used only for multiple input images
+- No MATLAB toolboxes beyond base MATLAB. Distances use CAT's `cat_bwdist` (and `cat_vbdist` where the index of the nearest voxel is needed) rather than the Image Processing Toolbox, so results do not depend on the installed toolboxes; `parpool` (Parallel Computing Toolbox) is used only for multiple input images
 - A T1-weighted NIfTI image (example: `colin27_t1_tal_hires.nii`)
 
 ---

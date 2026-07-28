@@ -14,10 +14,10 @@ function mri_simulate(simu, rf)
 %   Preprocessing with SPM12 segmentation is required for custom images.
 %   Requirements: SPM12 or SPM25 with CAT >= 26 installed (cat_main_LASsimple
 %   is required and is checked for at startup). No MATLAB toolboxes beyond
-%   base MATLAB are needed: bwdist is used when the Image Processing Toolbox
-%   is available and falls back to cat_vbdist otherwise, and parpool is only
-%   used for multiple input images when the Parallel Computing Toolbox is
-%   installed.
+%   base MATLAB are needed: distances use CAT's cat_bwdist (and cat_vbdist
+%   where the index of the nearest voxel is needed) so that the result does
+%   not depend on the installed toolboxes, and parpool is only used for
+%   multiple input images when the Parallel Computing Toolbox is installed.
 %
 %   The function also writes a JSON sidecar next to the main image
 %   containing key simulation metadata (tool/version, voxel size, noise/SNR,
@@ -1142,7 +1142,10 @@ if any(size(atlas) ~= d)
   atlas = atlas_res;
 end
 
-% Remove wm and extend GM areas using vbdist
+% Remove wm and fill it with the label of the nearest remaining structure.
+% cat_vbdist and not the faster cat_bwdist, because the index of the nearest
+% object voxel is needed here and only the vector propagation of cat_vbdist
+% can provide it.
 atlas(round(label) == wm_val) = 0;
 [~, Yind] = cat_vbdist( single(atlas>0) );
 atlas = atlas(Yind);
@@ -1236,12 +1239,18 @@ for pve_step = 1:numel(pve_range)
   % the excluded structures must not seed the cortical band
   wm(mask_orig) = 0;
 
-  % euclidean distance to wm (CAT12 function if Image Toolbox is not available)
-  if exist('bwdist','file')
-    Dwm = (bwdist(wm) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
-  else
-    Dwm = (cat_vbdist(single(wm)) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
-  end
+  % Euclidean distance to the WM surface, with the usual voxelsize/2
+  % correction that puts the surface on the voxel face.
+  %
+  % cat_bwdist is CAT's separable distance transform. It is used and not
+  % bwdist of the Image Processing Toolbox, because this distance defines the
+  % cortical band and a toolbox dependent branch would make the simulated
+  % thickness depend on the installation rather than only on the parameters.
+  % It is also exact, whereas cat_vbdist propagates the vector to the nearest
+  % object voxel and accumulates a small error with increasing distance.
+  % The voxel size is passed, so the distance is returned in mm directly and
+  % anisotropic voxels are handled correctly.
+  Dwm = cat_bwdist(single(wm), vx) - 0.5*mean(vx);
 
   for k=1:numel(simu.thickness)
     label1{k} = label_step;

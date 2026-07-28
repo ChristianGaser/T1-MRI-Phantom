@@ -30,7 +30,7 @@ To validate cortical thickness pipelines, the label image can be edited directly
 - MATLAB with SPM12 (or SPM25) and CAT >= 26 in the path (`cat_main_LASsimple` is required and is checked for at startup)
 - A T1-weighted NIfTI image (default examples use `colin27_t1_tal_hires.nii`)
 
-No MATLAB toolboxes beyond base MATLAB are needed. The Image Processing Toolbox is used opportunistically (`bwdist` in the thickness simulation, with a `cat_vbdist` fallback), and the Parallel Computing Toolbox is used only when several input images are given.
+No MATLAB toolboxes beyond base MATLAB are needed. Distances use CAT's `cat_bwdist` (and `cat_vbdist` where the index of the nearest voxel is needed) rather than the Image Processing Toolbox, so results do not depend on which toolboxes are installed. The Parallel Computing Toolbox is used only when several input images are given.
 
 ## Inputs
 ### simu: Simulation parameters (struct)
