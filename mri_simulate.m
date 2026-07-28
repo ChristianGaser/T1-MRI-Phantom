@@ -1082,23 +1082,59 @@ atlas(round(label) == wm_val) = 0;
 [~, Yind] = cat_vbdist( single(atlas>0) );
 atlas = atlas(Yind);
 
-% create mask for non-cortical structures (i.e. basal ganglia, cerebellum, 
-% hippocampus, amygdala
-basal_ganglia = [31:32 36:37 47:48 55:62];
-cerebellum = [11 35 38:41 71:73];
-mask_orig = is_in_atlas(atlas, [basal_ganglia cerebellum]);
+% In the neuromorphometrics atlas every cortical parcel has an id >= 100,
+% while all non-cortical structures (ventricles, subcortical grey matter,
+% cerebellum, brainstem, vessels, basal forebrain) use ids below 100. Both
+% masks below are built from that split instead of from hand-kept id lists,
+% so no structure can be forgotten.
+
+% Non-cortical structures are excluded from the thickness simulation and keep
+% their original labels. The ventricle/CSF labels and the two generic cerebral
+% white matter labels are deliberately not part of this mask. They do not
+% describe a structure that has to be preserved, and after the vbdist fill
+% above they also cover the deep and periventricular WM, which has to stay WM
+% and has to keep seeding the distance map below.
+ventricles = [4 11 49:52];
+mask_orig = atlas > 0 & atlas < 100 & ~is_in_atlas(atlas, [ventricles 44 45 46]);
 mask_orig = cat_vol_morph(mask_orig,'dd',1);
 
-% soften mask borders to avoid hard transitions when reusing original labels
-% (spm_smooth expects the FWHM in voxels for array input, thus the size in mm
-% has to be divided by the voxel size)
+% Region in which no cortical band may be grown. The distance map below has no
+% notion of cortex, so without this a GM band is also added around every other
+% WM surface, which is anatomically wrong for the corpus callosum and for the
+% periventricular WM: the CSF facing them is ventricle, not sulcus.
+%
+% This has to be an exclusion mask. Allowing the band only inside the cortical
+% parcels (atlas>=100) does not work, because the band is grown to a constant
+% thickness: wherever the original cortex was thinner than the requested
+% thickness, the band has to extend beyond the parcel into the surrounding CSF
+% (id 46) and across the WM boundary (ids 44/45). An inclusive cortex mask
+% truncates the band there and leaves large CSF spaces instead.
+mask_noband = mask_orig | is_in_atlas(atlas, ventricles);
+
+% Soften the border between the simulated cortex and the original labels that
+% are kept inside mask_orig. The two label sources can differ considerably
+% right at that border (the simulated side may carry a grown GM band where the
+% original side has WM), so a narrow transition shows up as a seam.
+%
+% The weights come from a smoothed binary mask. A linear ramp over the signed
+% distance to the border was tried and is clearly worse: it has a constant
+% width, but it is only piecewise linear, and the kinks where it reaches 0 and
+% 1 are themselves visible as edges (its second derivative there is two orders
+% of magnitude larger than anywhere in a Gaussian profile). Smoothing has no
+% such kinks, so widen border_fwhm if the transition is still too sharp.
+%
+% spm_smooth expects the FWHM in voxels for array input, thus the width in mm
+% has to be divided by the voxel size.
+border_fwhm = 2;  % width of the transition zone in mm
+
 mask_soft = single(mask_orig);
-spm_smooth(mask_soft, mask_soft, 0.75./vx);
+spm_smooth(mask_soft, mask_soft, border_fwhm./vx);
 mask_soft = min(max(mask_soft,0),1);
 
-% create mask for mainly occipital and frontal areas
+% create mask for mainly occipital and frontal areas (cortical parcels only,
+% 31:32 is the amygdala and was a leftover in the frontal list)
 region1 = [108:109 114:115 128:129 134:135 144:145 148:149 156:161 170:171 176:177 196:197];
-region3 = [31:32 102:105 120:121 132:133 136:137 146:147 152:155 162:165 172:173 178:179 190:191 202:205];
+region3 = [102:105 120:121 132:133 136:137 146:147 152:155 162:165 172:173 178:179 190:191 202:205];
 
 mask_thickness{1} = is_in_atlas(atlas, region1); % mainly occipital
 mask_thickness{3} = is_in_atlas(atlas, region3); % mainly frontal
@@ -1124,11 +1160,15 @@ pve_range = linspace(-0.25,0.25,15);
 label = cat_vol_morph(label,'gc',2);
 
 for pve_step = 1:numel(pve_range)
+  % label of this PVE step before the cortical band is built, used below to
+  % keep the original tissue inside the excluded structures
+  label_step = round(label+pve_range(pve_step));
+
   % define wm and remove disconnected regions
-  wm  = round(label+pve_range(pve_step)) == wm_val;
+  wm  = label_step == wm_val;
   wm = cat_vol_morph(wm,'l',1, vx);
 
-  % remove basal ganglia and cerebellum with soft blending
+  % the excluded structures must not seed the cortical band
   wm(mask_orig) = 0;
 
   % euclidean distance to wm (CAT12 function if Image Toolbox is not available)
@@ -1139,13 +1179,24 @@ for pve_step = 1:numel(pve_range)
   end
 
   for k=1:numel(simu.thickness)
-    label1{k} = round(label+pve_range(pve_step));
+    label1{k} = label_step;
 
     label1{k}(~wm) = csf_val;
     label1{k}(~mask) = 0;
 
-    % limit dilated gm to defined thickness
-    label1{k}(label1{k} == csf_val & Dwm <= simu.thickness(k)) = gm_val;
+    % limit dilated gm to defined thickness, but not into the ventricles or
+    % the non-cortical structures (corpus callosum, periventricular WM)
+    label1{k}(label1{k} == csf_val & Dwm <= simu.thickness(k) & ~mask_noband) = gm_val;
+
+    % Keep the original tissue inside the excluded structures. The line
+    % 'label1{k}(~wm) = csf_val' above turned all of them into CSF, because
+    % their WM was removed from the seed and their GM is not WM either. The
+    % soft blend at the end would then average a simulated CSF voxel with an
+    % original WM or GM voxel, and in a T1w image that average is exactly a
+    % GM-like intensity, which appears as a rim around every excluded
+    % structure. Widening the blend only widens that rim, so the two label
+    % sources have to agree here instead.
+    label1{k}(mask_orig) = label_step(mask_orig);
   end
 
   % replace tissue maps with modified label
