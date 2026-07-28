@@ -399,6 +399,11 @@ end
 % load seg8.mat file and define some parameters
 res = load(mat_name);
 
+% The seg8.mat stores the TPM with the absolute path of the machine it was
+% created on, so it is not found if the data were segmented elsewhere. Look
+% for the same file name in the local SPM and CAT template folders instead.
+res.tpm = find_missing_tpm(res.tpm);
+
 if size(res.mn,1) > 1
   fprintf('Multi-modal segmentation is not recommended! Try again to segment the image using T1w data only.\n');
 end
@@ -1012,6 +1017,74 @@ function mask = is_in_atlas(atlas, regions)
 
 atlas = round(atlas);
 mask = ismember(atlas, regions);
+
+%==========================================================================
+% function Vtpm = find_missing_tpm(Vtpm)
+%
+% Purpose
+%   Repair the TPM file names of a seg8.mat. The segmentation stores the TPM
+%   as spm_vol structs with the absolute path of the machine it was created
+%   on, so the file is not found when the data were segmented on a different
+%   system or when SPM was installed elsewhere. In that case the same file
+%   name is looked up in the local template folders.
+%
+% Inputs
+%   Vtpm - spm_vol struct array of the TPM, one entry per tissue class, all
+%          usually pointing to the same 4d file with a different volume
+%          index n.
+%
+% Output
+%   Vtpm - the same structure, with the file names of the local copy where
+%          the original ones do not exist. Entries that cannot be resolved
+%          are returned unchanged, so that the later read fails with its own
+%          message rather than silently using a wrong template.
+%
+% Note
+%   The volume index n is preserved per entry, and the structs are rebuilt
+%   with spm_vol so that the cached nifti handle in the private field points
+%   to the new file as well.
+%==========================================================================
+function Vtpm = find_missing_tpm(Vtpm)
+
+if isempty(Vtpm) || ~isstruct(Vtpm) || ~isfield(Vtpm,'fname'), return; end
+
+% search order: the tpm folder of SPM, then the CAT templates
+tpm_dirs = { fullfile(spm('dir'),'tpm'), ...
+             fullfile(spm('dir'),'toolbox','CAT','templates_MNI152NLin2009cAsym') };
+
+resolved = struct('old',{},'new',{});   % cache, all entries share one file
+
+for i = 1:numel(Vtpm)
+  if exist(Vtpm(i).fname,'file'), continue; end
+
+  % reuse the result for a file name that was already looked up
+  j = find(strcmp({resolved.old}, Vtpm(i).fname), 1);
+  if ~isempty(j)
+    newfile = resolved(j).new;
+  else
+    [~, nam, ext] = spm_fileparts(Vtpm(i).fname);
+    newfile = '';
+    for k = 1:numel(tpm_dirs)
+      candidate = fullfile(tpm_dirs{k}, [nam ext]);
+      if exist(candidate,'file'), newfile = candidate; break; end
+    end
+    resolved(end+1) = struct('old', Vtpm(i).fname, 'new', newfile); %#ok<AGROW>
+    if isempty(newfile)
+      fprintf(['Warning: TPM %s of the seg8.mat was not found and no copy ' ...
+               'exists in\n  %s\n  %s\n'], Vtpm(i).fname, tpm_dirs{:});
+    else
+      fprintf('TPM %s not found, using %s instead.\n', Vtpm(i).fname, newfile);
+    end
+  end
+  if isempty(newfile), continue; end
+
+  % rebuild the entry and keep its volume index
+  try
+    Vtpm(i) = spm_vol(sprintf('%s,%d', newfile, Vtpm(i).n(1)));
+  catch ME
+    fprintf('Warning: could not read %s: %s\n', newfile, ME.message);
+  end
+end
 
 %==========================================================================
 % function label = bids_label(str)
