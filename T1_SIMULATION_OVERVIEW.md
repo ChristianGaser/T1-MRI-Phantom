@@ -6,8 +6,8 @@
 
 ## Requirements
 
-- MATLAB with SPM12 (or SPM25) and CAT12 >= 12.10 on the MATLAB path
-- Image Processing Toolbox (only required when using cortical thickness simulation; uses `bwdist`)
+- MATLAB with SPM12 (or SPM25) and CAT >= 12.10 on the MATLAB path (`cat_main_LASsimple` is required)
+- No MATLAB toolboxes beyond base MATLAB. `bwdist` (Image Processing Toolbox) is used when available, with a `cat_vbdist` fallback; `parpool` (Parallel Computing Toolbox) is used only for multiple input images
 - A T1-weighted NIfTI image (example: `colin27_t1_tal_hires.nii`)
 
 ---
@@ -34,7 +34,7 @@ Add noise (Rician at target WM SNR by default; Gaussian %WM if `snrWM<=0`)
       ↓
 Apply contrast change (power-law Y^x, optional)
       ↓
-Outputs: Simulated image(s) + masked image + label map + JSON sidecars
+Outputs: Simulated image + label map (+ RF field) + JSON sidecar
 ```
 
 ---
@@ -111,7 +111,7 @@ mri_simulate(simu, rf);
 | `WMH` | White matter lesion strength | 0 (off), >=1 |
 | `atrophy` | Regional GM reduction | `{'atlas', [ROIs], [factors]}` |
 | `thickness` | Cortical thickness in mm | 1.5-2.5 or `[occ, mid, front]` |
-| `rng` | Random seed; 0 for deterministic | 0 (default) or `[]` (MATLAB rng) |
+| `rng` | Random seed; a fixed number gives every image the same noise | 0 (default), or `NaN`/`[]` to seed from the filename |
 | `derivative` | Save into BIDS `derivatives/mri_simulate-*` | 0/1 (default 1) |
 | `closeWMHholes` | Close WMH holes in deep WM | 0/1 (default 1) |
 
@@ -131,22 +131,19 @@ mri_simulate(simu, rf);
 
 ## What You Get
 
-Each simulation creates **3-4 output files**, written to the input folder or to `derivatives/mri_simulate-0.9.4/...` when `derivative=1` (default):
+Each simulation creates **2-3 output files** plus a JSON sidecar, written to the input folder or to `derivatives/mri_simulate-<version>/...` when `derivative=1` (default). Thickness simulations use `derivatives/mri_simulate_thickness-<version>/...`:
 
 1. **Simulated image**: `<name>_desc-<tags>T1w.nii[.gz]`
    - Full brain with all requested effects
 
-2. **Masked image**: `<name>_desc-<tags>masked_T1w.nii[.gz]`
-   - Brain-only (skull stripped)
-
-3. **Ground truth labels**: `<name>_desc-<effect>_label-seg.nii[.gz]`
+2. **Ground truth labels**: `<name>_desc-<effect>_label-seg.nii[.gz]`
    - CSF=1, GM=2, WM=3 (±WMH=4)
    - Useful for training/validation
 
-4. **RF bias field** (if requested and `type` numeric): `<name>_desc-<effect>_RFfield.nii[.gz]`
+3. **RF bias field** (if requested and `type` numeric): `<name>_desc-<effect>_RFfield.nii[.gz]`
    - Saved only for simulated fields when `rf.save=1`
  
-5. **JSON sidecars**: one per simulated and masked image
+4. **JSON sidecar**: one next to the simulated image
    - Includes tool info and SimulationParameters (voxel size, pn or snrWM, RF settings, thickness, WMH, atrophy)
 
 ---
@@ -200,7 +197,7 @@ Each simulation creates **3-4 output files**, written to the input folder or to 
 2. **Modification**: Alters tissue distributions based on your parameters (atrophy, thickness, WMH).
 3. **Synthesis**: Recreates T1w image from modified tissue maps via the SPM mixture model.
 4. **Artifacts**: Applies bias field, optional contrast change, and noise.
-5. **Outputs**: Saves simulated image(s), masked version, label map, JSON sidecars (in derivatives by default).
+5. **Outputs**: Saves the simulated image, the label map, optionally the RF field, and a JSON sidecar (in derivatives by default).
 
 ---
 
@@ -221,7 +218,7 @@ Each simulation creates **3-4 output files**, written to the input folder or to 
 - Empty `simu.name` opens file browser (interactive mode)
 
 ### Reproducibility
-- Default `rng=0` is deterministic; set `rng=[]` to use MATLAB rng; `rng=NaN` seeds from filename
+- Default `rng=0` is deterministic and gives every image the same noise pattern; `rng=NaN` or `rng=[]` seed from the filename instead, so each image gets its own reproducible noise
 - Set `rf.type = [2, 0]` for a reproducible simulated bias field
 - JSON sidecars capture key parameters automatically
 
@@ -264,7 +261,6 @@ Each simulation creates **3-4 output files**, written to the input folder or to 
 ### File Naming
 ```
 <name>_desc-<tags>T1w.nii[.gz]
-<name>_desc-<tags>masked_T1w.nii[.gz]
 <name>_desc-<effect>_label-seg.nii[.gz]
 <name>_desc-<effect>_RFfield.nii[.gz]
 

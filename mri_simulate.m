@@ -10,11 +10,16 @@ function mri_simulate(simu, rf)
 %   Noise can be added as either:
 %     • Gaussian noise specified as a percentage of the WM mean (simu.pn)
 %     • Rician magnitude noise at a target WM SNR (simu.snrWM>0)
-%   It supports simulations of atrophy or cortical thickness modifications. 
+%   It supports simulations of atrophy or cortical thickness modifications.
 %   Preprocessing with SPM12 segmentation is required for custom images.
-%   Requirements: SPM12 or SPM25 with CAT12 >= 12.10 installed.
+%   Requirements: SPM12 or SPM25 with CAT >= 26 installed (cat_main_LASsimple
+%   is required and is checked for at startup). No MATLAB toolboxes beyond
+%   base MATLAB are needed: bwdist is used when the Image Processing Toolbox
+%   is available and falls back to cat_vbdist otherwise, and parpool is only
+%   used for multiple input images when the Parallel Computing Toolbox is
+%   installed.
 %
-%   The function also writes JSON sidecars next to the main image
+%   The function also writes a JSON sidecar next to the main image
 %   containing key simulation metadata (tool/version, voxel size, noise/SNR,
 %   RF field parameters, thickness tags), using SPM's spm_jsonwrite.
 %
@@ -43,14 +48,18 @@ function mri_simulate(simu, rf)
 %         white matter. Uses the (noise-free) WM mean to compute the complex
 %         noise sigma via sigma = WMmean / snrWM, and generates magnitude
 %         Rician noise: sqrt((S + n1).^2 + n2.^2). Default: 30.
-%       - 'rng' (double, NaN or []): Seed for the random number generator. 
-%         Default: NaN (reproducible noise across runs). Set [] to use MATLAB's 
-%         default RNG behavior (non-deterministic across sessions).
+%       - 'rng' (double, NaN or []): Seed for the random number generator.
+%         A fixed number gives the same noise for every image, which is useful
+%         to compare simulations but means that a whole dataset shares one
+%         noise pattern. NaN or [] derive the seed from the filename instead,
+%         so that every image gets its own reproducible noise.
+%         Default: 0.
 %       - 'derivative' (logical): If true, save outputs under a BIDS-style
 %         derivatives folder at the dataset root, using the pipeline name
-%         'mri_simulate-1.0' and mirroring the subject/session path under it.
-%         Example: root/derivatives/mri_simulate-1.0/sub-*/ses-*/[anat|...]/
-%         Default: 0 (save next to input file).
+%         'mri_simulate-<version>' ('mri_simulate_thickness-<version>' for
+%         thickness simulations) and mirroring the subject/session path.
+%         Example: root/derivatives/mri_simulate-0.9.9/sub-*/ses-*/[anat|...]/
+%         Default: 1 (save into derivatives).
 %       - 'contrast' (double): Power-law contrast-change exponent applied to the
 %         simulated image intensities after noise. The image is normalized to
 %         [0,1], transformed as Y.^contrast, and rescaled back to its original
@@ -61,8 +70,9 @@ function mri_simulate(simu, rf)
 %         simulated image. Default: NaN (keep original resolution). If scalar,
 %         it is applied to all three axes; if a 3-vector, each axis is set individually.
 %       - 'closeWMHholes' (logical): Detect and fill WMHs in WM and correct
-%         segmenations to obtain a clean simulated image without WMHs (which 
+%         segmentations to obtain a clean simulated image without WMHs (which
 %         later allows to simulate additional WMHs using the WMH option).
+%         Default: 1 (enabled).
 %       - 'WMH' (integer or >=1 scalar): Strength of simulated white matter
 %         hyperintensities (WMHs).
 %           0  -> no WMHs
@@ -99,8 +109,11 @@ function mri_simulate(simu, rf)
 %         thickness simulation to obtain a more realistic MRI. Either thickness
 %         or atrophy can be simulated.
 %         Default: 0 (disabled).
-%       - 'parpool' (integer): Specifies the number of workers (processors) for
-%.        the parpool command if the Parallel Computing Toolbox is available 
+%       - 'parpool' (integer): Number of workers (processors) used by the
+%         parpool command if the Parallel Computing Toolbox is available and
+%         more than one image is given. It is limited to the number of images.
+%         Default: half of the available cores.
+%
 %   rf (struct): RF bias field parameters.
 %       - 'percent' (double): Amplitude of the bias field in percentage.
 %         Negative values invert the field. Default: 30.
@@ -123,11 +136,11 @@ function mri_simulate(simu, rf)
 %
 % Outputs:
 %   Simulated MRI image files based on the specified parameters and features:
-%     - Main simulated image (full brain)
-%     - Masked simulated image (brain only)
-%     - Ground-truth PVE label image
-%     - Optional: RF bias field (for simulated fields)
-%     - JSON sidecars for main images with simulation metadata
+%     - Main simulated image:  <name>_desc-<opts>T1w.nii
+%     - Ground-truth PVE label: <name>_desc-<opts>_label-seg.nii
+%     - Optional RF bias field (simulated fields only, rf.save=1):
+%                               <name>_desc-<opts>_RFfield.nii
+%     - JSON sidecar next to the main image with simulation metadata
 %
 % Usage:
 %   To simulate an MRI, specify the simulation (`simu`) and RF bias field
@@ -174,9 +187,10 @@ function mri_simulate(simu, rf)
 %
 % TODO: simulation of motion artefacts using FFT and shift of phase information
 
-version = '0.9.9';
+% named tool_version and not version to not shadow the MATLAB builtin version()
+tool_version = '0.9.9';
 
-if ~exist('cat_main_LASsimple')
+if ~exist('cat_main_LASsimple','file')
   error('Please update to a newer version >=CAT26 to use mri_simulate')
 end
 
@@ -217,7 +231,7 @@ n_images = size(simu.name,1);
 
 if n_images > 1
   % set number of workers/processors if Parallel Computing Toolbox is available
-  if exist('parpool')
+  if exist('parpool','file')
     parpool(min(simu.parpool, n_images));
   end
   P = simu.name;
@@ -226,7 +240,7 @@ if n_images > 1
     simu_i.name = deblank(P(i,:));
     mri_simulate(simu_i, rf);
   end
-  if exist('parpool')
+  if exist('parpool','file')
     delete(gcp('nocreate'))
   end
   return
@@ -268,18 +282,18 @@ if isfield(simu,'derivative') && simu.derivative
       root_dir = fullfile(parts{1:idx_sub-1});
       rel_parts = parts(idx_sub:end); % sub-..[/ses-..]/anat/...
       if simu.thickness(1) > 0
-        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate_thickness-' version]);
+        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate_thickness-' tool_version]);
       else
-        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate-' version]);
+        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate-' tool_version]);
       end
       out_pth = fullfile(pipeline_dir, rel_parts{:});
     else
       % Fallback: place outputs under derivatives without mirroring
       root_dir = fileparts(pth);
       if simu.thickness(1) > 0
-        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate_thickness-' version]);
+        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate_thickness-' tool_version]);
       else
-        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate-' version]);
+        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate-' tool_version]);
       end
       out_pth = pipeline_dir;
     end
@@ -385,7 +399,6 @@ vx = sqrt(sum(V.mat(1:3,1:3).^2));
 
 % keep native geometry for final output if needed
 V_native = V;
-dim_native = dim;
 vx_native = vx;
 
 % inverse deformation field name must follow the original image filename
@@ -521,13 +534,13 @@ end
 
 Ysimu = synthesize_from_segmentation(Yseg, name, res, mn, dim, WMH);
 
-% apply either predefined MNI bias field or simulated bias filed before resizing
+% apply either predefined MNI bias field or simulated bias field before resizing
 % to defined output resolution
 if rf.percent ~= 0
   if ischar(rf.type)
     [Ysimu, rf_field] = add_bias_field(Ysimu, rf, idef_name, pth_root); % add predefined MNI field
   else
-    [Ysimu, rf_field] = add_simulated_bias_field(Ysimu, rf);
+    [Ysimu, rf_field] = add_simulated_bias_field(Ysimu, rf, vx);
   end
 end
 
@@ -704,7 +717,7 @@ end
 % write JSON sidecar with simulation parameters for both images
 try
   gen.Name = 'mri_simulate';
-  gen.Version = 'unknown';
+  gen.Version = tool_version;
   gen.SourceDatasets = {sprintf('%s%s', name_out, ext)};
 
   if simu.snrWM > 0
@@ -941,11 +954,7 @@ mask = ismember(atlas, regions);
 %==========================================================================
 function [label, Yseg] = simulate_thickness(label, simu, Yseg, d, template_dir, idef_name, vx, Vref, order)
 
-Yp0toC = @(Yp0,c) 1-min(1,abs(Yp0-c));
 csf_val = 1; gm_val = 2; wm_val = 3;
-
-% rescue original label for cerebellum/basal ganglia
-label0 = label;
 
 % warp atlas to native space using categorical interpolation
 fprintf('Transform atlas to native space. This may take a while...\n');
@@ -1021,7 +1030,7 @@ for pve_step = 1:numel(pve_range)
   wm(mask_orig) = 0;
 
   % euclidean distance to wm (CAT12 function if Image Toolbox is not available)
-  if exist('bwdist')
+  if exist('bwdist','file')
     Dwm = (bwdist(wm) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
   else
     Dwm = (cat_vbdist(single(wm)) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
@@ -1069,125 +1078,6 @@ mask = label > 0.5;
 label(mask ~= cat_vol_morph(mask,'dc',4)) = 1;
 
 
-function [label, Yseg] = simulate_thickness_hammers(label, simu, Yseg, d, template_dir, idef_name, vx, Vref, order)
-
-Yp0toC = @(Yp0,c) 1-min(1,abs(Yp0-c));
-csf_val = 1; gm_val = 2; wm_val = 3;
-
-% rescue original label for cerebellum/basal ganglia
-label0 = label;
-
-% warp atlas to native space using categorical interpolation
-fprintf('Transform atlas to native space. This may take a while...\n');
-hammers_name = fullfile(template_dir,'hammers.nii');
-hammers = cat_vol_defs(struct('field1',{{idef_name}},'images',{{hammers_name}},'interp',-1,'modulate',0));
-hammers = single(hammers{1}{1});
-
-% resample atlas to current grid if needed
-if any(size(hammers) ~= d)
-  Vdef = spm_vol(idef_name);
-  Vdef = Vdef(1);
-  hammers_res = zeros(Vref.dim, 'single');
-  for sl = 1:Vref.dim(3)
-    M = spm_matrix([0 0 sl 0 0 0 1 1 1]);
-    M1 = Vref.mat\Vdef.mat\M;
-    hammers_res(:,:,sl) = spm_slice_vol(hammers, M1, Vref.dim(1:2), 0);
-  end
-  hammers = hammers_res;
-end
-
-% create mask for basal ganglia and cerebellum
-mask_orig = (hammers>0   & hammers<5)  | hammers==9  | hammers==10 | ...
-            (hammers>16  & hammers<20) | (hammers>33 & hammers<50) | ...
-             hammers==74 | hammers==75;
-mask_orig = cat_vol_morph(mask_orig,'dd',1);
-
-% soften mask borders to avoid hard transitions when reusing original labels
-mask_soft = single(mask_orig);
-spm_smooth(mask_soft, mask_soft, 1.5./vx);
-mask_soft = min(max(mask_soft,0),1);
-
-% create mask for occipital and frontal areas and remaining parts
-mask_thickness{1} = (hammers > 63.5 & hammers < 67.5) | (hammers > 21.5 & hammers < 23.5); % occipital
-mask_thickness{3} = (hammers > 55.5 & hammers < 59.5) | (hammers > 27.5 & hammers < 29.5) | (hammers > 68.5 & hammers < 71.5); % frontal
-
-mask_thickness{3} = (hammers > 55.5 & hammers < 59.5) | (hammers > 12.5 & hammers < 14.5); % inferior/superior frontal + inferior/middle temporal
-mask_thickness{2} = ~mask_thickness{1} & ~mask_thickness{3}; % remaining parts
-
-mask = round(label) > 0;
-
-% force stronger PVE effects by smoothing (FWHM in mm, converted to voxels)
-spm_smooth(label,label,2.5./vx);
-
-label1 = cell(numel(simu.thickness),1);
-
-% save original segmentation to later include original cerebellum and basal
-% ganglia
-Yseg0 = Yseg(:,:,:,1:3);
-Yseg(:,:,:,1:3) = 0;
-
-% vary range of PVE from -0.25..0.25 in 15 steps to get more realistic PVE
-% effects (optionally weighted)
-pve_range = linspace(-0.25,0.25,15);
-
-% apply gray closing to strengthen thin WM structures
-label = cat_vol_morph(label,'gc',2);
-
-for pve_step = 1:numel(pve_range)
-  % define wm and remove disconnected regions
-  wm  = round(label+pve_range(pve_step)) == wm_val;
-  wm = cat_vol_morph(wm,'l',1, vx);
-
-  % remove basal ganglia and cerebellum with soft blending
-  wm(mask_orig) = 0;
-
-  % euclidean distance to wm (CAT12 function if Image Toolbox is not available)
-  if exist('bwdist')
-    Dwm = (bwdist(wm) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
-  else
-    Dwm = (cat_vbdist(single(wm)) - 0.5) * mean(vx); % also consider voxelsize/2 correction of distance
-  end
-  
-  for k=1:numel(simu.thickness)
-    label1{k} = round(label+pve_range(pve_step));
-
-    label1{k}(~wm) = csf_val;
-    label1{k}(~mask) = 0;
-    
-    % limit dilated gm to defined thickness
-    label1{k}(label1{k} == csf_val & Dwm <= simu.thickness(k)) = gm_val; 
-  end
-    
-  % replace tissue maps with modified label
-  for j = 1:3
-    if isscalar(simu.thickness)
-      % only simulate 2mm thickness
-      tmp_seg = single(round(label1{1}) == (j));
-    else
-      tmp_seg = Yseg(:,:,:,order(j));
-      for k = 1:3
-        tmp_seg(mask_thickness{k}) = single(round(label1{k}(mask_thickness{k})) == (j));
-      end
-    end
-
-    Yseg(:,:,:,order(j)) = Yseg(:,:,:,order(j)) + tmp_seg/numel(pve_range);
-  end
-end
-
-% update ground truth label
-label = zeros(d, 'single');
-
-for k = 1:3
-  Yseg(:,:,:,order(k)) = Yseg(:,:,:,order(k)).*(1-mask_soft) + Yseg0(:,:,:,order(k)).*mask_soft;
-  label = label + k*Yseg(:,:,:,order(k));
-end
-
-
-% close remaining holes in CSF
-mask = label > 0.5;
-label(mask ~= cat_vol_morph(mask,'dc',4)) = 1;
-
-
 %==========================================================================
 % function Yseg = simulate_atrophy(simu, Yseg, dims, template_dir, idef_name)
 %
@@ -1197,13 +1087,21 @@ label(mask ~= cat_vol_morph(mask,'dc',4)) = 1;
 %
 % Inputs
 %   simu         - struct with .atrophy = {atlasName, roiIds[], factors[]}
-%   Yseg         - single(dims,3): tissue maps (CSF/GM/WM order as used).
+%   Yseg         - single(dims,3): tissue maps in GM/WM/CSF order, i.e. the
+%                  SPM class order, thus Yseg(:,:,:,3) is CSF.
 %   dims         - [nx ny nz] dimensions of the volume.
 %   template_dir - path to atlas templates; atlas is warped categorically.
 %   idef_name    - inverse deformation field to native space.
 %
 % Output
-%   Yseg         - updated tissue maps with CSF increased in target ROIs.
+%   Yseg         - updated tissue maps with CSF increased in target ROIs and
+%                  all three classes renormalized to a sum of 1 per voxel.
+%
+% Note
+%   The atlas is warped with the deformation field of the original image and
+%   is not resampled here. This is only valid as long as Yseg is on that same
+%   grid, which the caller guarantees by not allowing atrophy to be combined
+%   with thickness simulation (the latter resamples to 0.5mm internally).
 %==========================================================================
 function Yseg = simulate_atrophy(simu, Yseg, dims, template_dir, idef_name)
 
@@ -1249,19 +1147,28 @@ end
 % function Ysimu = synthesize_from_segmentation(vol_seg, name, res, mn, d, WMH)
 %
 % Purpose
-%   Generate a T1-like image from provided CSF/GM/WM maps by inserting them
+%   Generate a T1-like image from provided GM/WM/CSF maps by inserting them
 %   into SPM's mixture model and computing the expected intensity per voxel.
 %
 % Inputs
-%   vol_seg - single(dims,3): tissue maps used in place of SPM posteriors.
+%   vol_seg - single(dims,3): tissue maps used in place of the SPM posteriors,
+%             in GM/WM/CSF order (the SPM class order given by res.lkp).
 %   name    - base name for progress display.
-%   res     - struct from SPM segmentation (mg, mn, vr, Tbias, etc.).
-%   mn      - 3x1 means for CSF/GM/WM replacing the corresponding mixture means.
+%   res     - struct from SPM segmentation (mg, mn, vr, Tbias, etc.). If WMHs
+%             are simulated, res.mn carries one additional column with the WMH
+%             intensity (see simulate_WMHs).
+%   mn      - 3x1 means for GM/WM/CSF replacing the corresponding mixture means.
 %   d       - [nx ny nz] dimensions.
 %   WMH     - optionally add white matter hyperintensities (WMHs)
 %
 % Output
 %   Ysimu   - synthesized T1-weighted image volume (single).
+%
+% Note
+%   A tissue class can be modelled by several Gaussians (res.lkp maps the
+%   Gaussians to the classes). The class probability is therefore split over
+%   its Gaussians with the mixing proportions mg, which sum to 1 within a
+%   class, so that each class enters the normalization sum exactly once.
 %==========================================================================
 function Ysimu = synthesize_from_segmentation(vol_seg, name, res, mn, d, WMH)
 % go through all peaks that are defined
@@ -1355,9 +1262,48 @@ end
 
 % Sometimes huge values occur due to bias correction in the noisy
 % background and we have to limit values to 98% percentile
-th = prctile(Ysimu(:),98);
+th = get_percentile(Ysimu,98);
 Ysimu(Ysimu>th) = th;
 spm_progress_bar('clear');
+
+
+%==========================================================================
+% function th = get_percentile(Y, p)
+%
+% Purpose
+%   Percentile of the finite values of Y. This replaces prctile, which
+%   requires the Statistics and Machine Learning Toolbox, to keep the
+%   toolbox requirements of mri_simulate limited to SPM and CAT.
+%
+% Inputs
+%   Y - numeric array (of any size); non-finite values are ignored.
+%   p - percentile in the range 0..100.
+%
+% Output
+%   th - the p-th percentile of Y, using the same convention as prctile
+%        (sorted value i represents the 100*(i-0.5)/n percentile, with
+%        linear interpolation in between and clamping at both ends).
+%==========================================================================
+function th = get_percentile(Y, p)
+
+Y = sort(Y(isfinite(Y)));
+n = numel(Y);
+
+if n == 0
+  th = 0;
+  return
+end
+
+pos = p/100*n + 0.5;
+if pos <= 1
+  th = double(Y(1));
+elseif pos >= n
+  th = double(Y(n));
+else
+  lo = floor(pos);
+  w  = pos - lo;
+  th = (1-w)*double(Y(lo)) + w*double(Y(lo+1));
+end
 
 
 %==========================================================================
@@ -1402,7 +1348,7 @@ Ysimu(ind) = rf_field(ind).*Ysimu(ind);
 
 
 %==========================================================================
-% function [Ysimu, rf_field] = add_simulated_bias_field(Ysimu, rf)
+% function [Ysimu, rf_field] = add_simulated_bias_field(Ysimu, rf, vx)
 %
 % Purpose
 %   Create a smooth, random RF bias field via FFT-domain filtering with a
@@ -1412,12 +1358,25 @@ Ysimu(ind) = rf_field(ind).*Ysimu(ind);
 % Inputs
 %   Ysimu  - image to modulate.
 %   rf     - struct: .type = [strength, rngSeed], .percent amplitude (signed).
+%   vx     - [vx vy vz]: voxel size in mm of Ysimu, used to define the
+%            smoothness of the field in mm rather than in voxels.
 %
 % Outputs
 %   Ysimu    - modulated image.
 %   rf_field - generated RF field after smoothing and scaling.
+%
+% Notes
+%   - The field is smooth by construction (it originates from an NxNxN random
+%     field), and is therefore built and smoothed on a coarse grid that is
+%     interpolated to the image size afterwards. Smoothing at full resolution
+%     would need a border padding of 3*FWHM voxels in every direction, which
+%     for a 0.5mm image means a temporary volume of more than 1GB without
+%     changing the resulting field noticeably.
+%   - The smoothing FWHM is defined in mm, so that the same field is obtained
+%     for any input resolution. The value corresponds to the 30 voxels that
+%     were previously used for the 0.5mm reference phantom.
 %==========================================================================
-function [Ysimu, rf_field] = add_simulated_bias_field(Ysimu, rf)
+function [Ysimu, rf_field] = add_simulated_bias_field(Ysimu, rf, vx)
 
 dim = size(Ysimu);
 
@@ -1425,8 +1384,7 @@ dim = size(Ysimu);
 rng(rf.type(2),'twister')
 
 N = 2^round(rf.type(1)); % Define the size of the 3D field w.r.t. defined strength
-fwhm = 30; % Smoothing size
-pad  = 3*fwhm; % pad border to prevent smoothing issues at image borders
+fwhm_mm = 15;            % Smoothing size in mm
 
 % Generate a random 3D field
 field = rand(N, N, N);
@@ -1445,16 +1403,29 @@ fieldFFTShifted = fftshift(fieldFFT);
 % Apply the smoothness filter in the frequency domain
 filteredFFT = fieldFFTShifted .* smoothnessFilter;
 
-% Shift back and apply inverse 3D FFT
-filteredField = ifftn(ifftshift(filteredFFT));
+% Shift back and apply inverse 3D FFT. The filter is symmetric, thus the
+% result is real apart from rounding errors, but ifftn only drops the
+% imaginary part for an exactly conjugate symmetric input. Taking the real
+% part explicitly avoids that min/max below compare complex numbers by their
+% magnitude, which would silently return a different field.
+filteredField = real(ifftn(ifftshift(filteredFFT)));
+
+% Coarse grid on which the field is smoothed: at least 6 samples per FWHM are
+% used, which is more than enough for a Gaussian and keeps the padded volume
+% small. The field is never sampled finer than the image itself.
+res_c = max(vx, fwhm_mm/6);              % coarse voxel size in mm
+dim_c = max(4, ceil(dim.*vx./res_c));    % coarse dimensions
+res_c = dim.*vx./dim_c;                  % exact voxel size after rounding
+fwhm_c = fwhm_mm./res_c;                 % FWHM in coarse voxels
+pad = ceil(3*max(fwhm_c));               % pad border to prevent smoothing issues
 
 % Original grid
 [x, y, z] = ndgrid(1:N, 1:N, 1:N);
 
-% New grid dimensions
-[xq, yq, zq] = ndgrid(linspace(1, N, dim(1)), ...
-                      linspace(1, N, dim(2)), ...
-                      linspace(1, N, dim(3)));
+% Coarse grid dimensions
+[xq, yq, zq] = ndgrid(linspace(1, N, dim_c(1)), ...
+                      linspace(1, N, dim_c(2)), ...
+                      linspace(1, N, dim_c(3)));
 
 % Interpolate using interpn
 filteredField = interpn(x, y, z, filteredField, xq, yq, zq, 'linear');
@@ -1463,13 +1434,20 @@ filteredField = interpn(x, y, z, filteredField, xq, yq, zq, 'linear');
 filteredField = filteredField - min(filteredField(:));
 filteredField = filteredField/max(filteredField(:));
 
-% pad border and create background 0f 0.5 to prevent smoothing issues at image border
-vol = 0.5*ones(dim(1)+2*pad,dim(2)+2*pad,dim(3)+2*pad);
-vol(pad+1:dim(1)+pad,pad+1:dim(2)+pad,pad+1:dim(3)+pad) = filteredField;
+% pad border and create background of 0.5 to prevent smoothing issues at image border
+vol = 0.5*ones(dim_c(1)+2*pad,dim_c(2)+2*pad,dim_c(3)+2*pad);
+vol(pad+1:dim_c(1)+pad,pad+1:dim_c(2)+pad,pad+1:dim_c(3)+pad) = filteredField;
 
-% smooth and resize back
-spm_smooth(vol,vol,[fwhm fwhm fwhm]);
-rf_field = vol(pad+1:dim(1)+pad,pad+1:dim(2)+pad,pad+1:dim(3)+pad);
+% smooth and remove padding
+spm_smooth(vol,vol,fwhm_c);
+vol = vol(pad+1:dim_c(1)+pad,pad+1:dim_c(2)+pad,pad+1:dim_c(3)+pad);
+
+% interpolate the smoothed coarse field to the image size
+[xc, yc, zc] = ndgrid(1:dim_c(1), 1:dim_c(2), 1:dim_c(3));
+[xq, yq, zq] = ndgrid(linspace(1, dim_c(1), dim(1)), ...
+                      linspace(1, dim_c(2), dim(2)), ...
+                      linspace(1, dim_c(3), dim(3)));
+rf_field = interpn(xc, yc, zc, vol, xq, yq, zq, 'linear');
 
 % scale to an amplitude and mean of 1
 rf_field = rf_field - min(rf_field(:));
@@ -1639,27 +1617,25 @@ res.mn(1,K) = intensity_WMH;
 %              .mg  (mixture weights)
 %              .lkp (lookup of class index per component, 1..6)
 %   dim  - [nx ny nz]: Volume dimensions of the images.
-%   T3th - 1x3 double: Intensity thresholds [CMth, CSFth, WMth] used by APRG
-%          (derived from get_tissue_thresholds). CMth is a central-matter
-%          threshold between GM and WM, CSFth approximates CSF mean, WMth is a
-%          robust WM anchor.
+%   T3th - 1x3 double: Intensity anchors [CMth, GMth, WMth] as returned by
+%          get_tissue_thresholds and passed on to APRG in the position where
+%          it expects [CSF GM WM]. CMth is an extrapolated low anchor below
+%          the GM mean, GMth is the GM mean and WMth a robust WM anchor.
 %
 % Output
 %   Yb   - logical/single(dims): Brain mask estimated by APRG (1=brain, 0=non-brain).
 %
 % Algorithm (summary)
-%   1) Estimate class-specific intensity anchors via weighted means of the GMM
-%      parameters (clsint for CSF/GM/WM).
-%   2) Build a 4D stack P(:,:,:,1..6) from Ycls (uint8 posteriors), as required
-%      by CAT12’s APRG routine.
-%   3) Derive robust thresholds for WM and a central matter (CM) value using the
-%      WM posterior median within Ysrc, which mitigates issues in presence of WMHs.
-%   4) Call cat_main_APRG(Ysrc, P, res, T3th) to obtain the brain mask.
+%   1) Build a 4D stack P(:,:,:,1..6) from Ycls (uint8 posteriors), as required
+%      by CAT12's APRG routine.
+%   2) Call cat_main_APRG(Ysrc, P, res, T3th) to obtain the brain mask. The
+%      intensity anchors themselves are estimated beforehand by the caller in
+%      get_tissue_thresholds.
 %
 % Notes
 %   - Assumes T1-like contrast (WM > GM > CSF) for threshold reasoning; a median
 %     WM intensity is used to be robust to WMHs.
-%   - Requires CAT12 on the MATLAB path; uses cat_main_APRG.
+%   - Requires CAT on the MATLAB path; uses cat_main_APRG.
 %   - The output mask matches the input volume dimensions and orientation.
 %==========================================================================
 function Yb = skull_strip_APRG(Ysrc, Ycls, res, dim, T3th)
@@ -1681,15 +1657,18 @@ function Yseg = close_WM_GM_holes(Yseg, Ysrc, Ycorr, Ycls, Yy, res, vx_vol)
 %   Detect and close WMHs using CAT12 WMH detection
 %
 % Inputs
-%   Yseg   - single(dims,3): current class volumes (CSF/GM/WM-like) derived 
-%            from LAS-corrected intensities.
+%   Yseg   - single(dims,3): current class volumes in GM/WM/CSF order, i.e.
+%            the SPM class order, derived from LAS-corrected intensities.
+%   Ysrc   - single(dims): source image passed on to cat_main_updateSPM1639.
+%   Ycorr  - single(dims): LAS-corrected image used by cat_vol_partvol.
 %   Ycls   - 1x6 cell of uint8(dims): SPM tissue posteriors (0..255).
+%   Yy     - deformation field to the TPM, required by the CAT functions.
 %   res    - segmentation structure from SPM segmentation.
 %   vx_vol - voxel size in mm
 %
 % Output
 %   Yseg   - class volumes with WMHs reassigned to WM, leaving cortex and
-%            and boundaries untouched as much as possible.
+%            boundaries untouched as much as possible.
 
 % we have to prepare some parameters for cat_main_updateSPM1639
 global cat; cat_defaults;
@@ -1740,13 +1719,16 @@ function T3th = get_tissue_thresholds(Ysrc, Ycls, res)
 % GET_TISSUE_THRESHOLDS - Estimate robust CSF/GM/WM thresholds
 %
 % Purpose
-%   Compute three intensity anchors used by LAS/APRG steps:
-%     - WMth: a robust white-matter threshold derived from the weighted WM
-%       mean (from the GMM) and the median intensity within high WM posterior
+%   Compute the three intensity anchors that LAS and APRG expect in the
+%   [CSF GM WM] positions:
+%     - CMth: the low anchor. It is not the CSF mean but the GM mean mirrored
+%       away from WM (2*GMmean - WMth), clipped so that it never exceeds the
+%       CSF mean. This puts it below the GM mean and adapts to the current
+%       image contrast. For inverted contrast (CSF > WM) the CSF mean is used.
+%     - GMth: the weighted GM mean from the GMM (clsint(1)).
+%     - WMth: a robust white-matter anchor derived from the weighted WM mean
+%       (from the GMM) and the median intensity within high WM posterior
 %       voxels to mitigate WMH effects.
-%     - CSFth: an approximation of the CSF intensity anchor from the GMM.
-%     - CMth: a central-matter threshold between GM and WM that adapts to the
-%       current image contrast.
 %
 % Inputs
 %   Ysrc - single(dims): Source image used to compute medians within WM.
@@ -1756,18 +1738,19 @@ function T3th = get_tissue_thresholds(Ysrc, Ycls, res)
 %          parameters mn, mg, and lookup lkp.
 %
 % Output
-%   T3th - 1x3 double: [CMth, CSFth, WMth] thresholds used by skull stripping
+%   T3th - 1x3 double: [CMth, GMth, WMth] anchors used by skull stripping
 %          and LAS normalization routines.
 %
 % Algorithm
 %   1) clsint(k): weighted class mean from the GMM for class k.
 %   2) WMth: max(clsint(WM), median(Ysrc within high WM posterior)).
-%   3) CMth: if intensities are inverted (CSF > WM), use CSF anchor; otherwise
-%      use 2*GMmean - WMth, clipped not to exceed CSF anchor.
-%   4) Return [CMth, CSFmean, WMth].
+%   3) CMth: if intensities are inverted (CSF > WM), use the CSF anchor;
+%      otherwise use 2*GMmean - WMth, clipped not to exceed the CSF anchor.
+%   4) Return [CMth, GMmean, WMth].
 %
 % Notes
-%   - Class indices follow SPM/CAT convention (typically: 1=GM, 2=WM, 3=CSF).
+%   - Class indices follow SPM/CAT convention (1=GM, 2=WM, 3=CSF), so clsint(1)
+%     is GM and clsint(3) is CSF.
 %   - High WM posterior is defined with a conservative threshold (Ycls{2}>192
 %     on 0..255 scale) to obtain a stable median.
 %   - These anchors are designed for T1-like contrast but include a simple

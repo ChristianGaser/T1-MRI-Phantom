@@ -20,16 +20,17 @@ This label-driven synthesis minimizes dependence on the initial segmentation whi
 ## Cortical thickness and PVE simulation
 To validate cortical thickness pipelines, the label image can be edited directly:
 
-- Cortical thickness is defined geometrically: WM is morphologically closed, then GM is grown via Euclidean distance maps to reach target thickness (global or 3-region using the Hammers atlas).
+- Cortical thickness is defined geometrically: WM is morphologically closed, then GM is grown via Euclidean distance maps to reach target thickness (global or 3-region using the neuromorphometrics atlas).
 - Thickness values can vary across regions (e.g., frontal, occipital, remaining cortex) to produce known ground truth.
 - Partial volume is approximated by jittering tissue boundaries across multiple subvoxel offsets and averaging hard labels (CSF=1, GM=2, WM=3), replacing the original SPM labels in synthesis.
 
 ![Thickness control](docs/T1-MRI-Phantom-Thickness.png)
 
 ## Requirements
-- MATLAB with SPM12 (or SPM25) and CAT12 >= 12.10 in the path
-- Image Processing Toolbox (only required when using cortical thickness simulation; uses `bwdist`)
+- MATLAB with SPM12 (or SPM25) and CAT >= 26 in the path (`cat_main_LASsimple` is required and is checked for at startup)
 - A T1-weighted NIfTI image (default examples use `colin27_t1_tal_hires.nii`)
+
+No MATLAB toolboxes beyond base MATLAB are needed. The Image Processing Toolbox is used opportunistically (`bwdist` in the thickness simulation, with a `cat_vbdist` fallback), and the Parallel Computing Toolbox is used only when several input images are given.
 
 ## Inputs
 ### simu: Simulation parameters (struct)
@@ -39,19 +40,21 @@ Parameter | Description (Default)
 name | Input image(s). A single T1w filename. (Default: `''`)
 snrWM | add Rician magnitude noise with target SNR for white matter. Uses WM mean to derive complex noise sigma; when set, `pn` is ignored. (Default: `30`)
 pn | If `>0`,add Gaussian noise as percent of the WM peak. (Default: `0`)
-rng | RNG seed for reproducible noise; set `[]` for MATLAB default behavior. (Default: `0`)
+rng | RNG seed for reproducible noise. A fixed number gives every image the same noise pattern; `NaN` or `[]` derive the seed from the filename instead, so each image gets its own reproducible noise. (Default: `0`)
 contrast | Power-law exponent for contrast change. Image is normalized to [0,1], transformed as Y.^contrast, then rescaled to original min/max. Meaningful values to simulate contrast are 0.5 (low contrast) and 1.5 (high contrast). (Default: `1`)
-derivative | If `1`, save outputs into BIDS derivatives at the dataset root: `derivatives/mri_simulate-1.0/sub-*/ses-*/...`, mirroring the subject/session path. (Default: `0`)
+derivative | If `1`, save outputs into BIDS derivatives at the dataset root: `derivatives/mri_simulate-<version>/sub-*/ses-*/...`, mirroring the subject/session path. Thickness simulations use `mri_simulate_thickness-<version>`. (Default: `1`)
 resolution | Output voxel size: scalar (applied to x,y,z) or `[x y z]`. `NaN` keeps the original resolution. (Default: `NaN`)
 WMH | Strength of white matter hyperintensities. `0`=off; `1`=mild; `2`=medium; `3`=strong; values `>=1` allowed. Larger values broaden the WMH prior via exponent `1/(WMH-0.8)` and scale the label contribution by `~1/WMH^0.75`. Constrained to (eroded) WM and modulated by a random field. (Default: `0`)
 atrophy | Atrophy specification: `{atlasName, roiIds[], factors[]}`; factors >1 increase CSF (reduce GM) within ROIs. Either thickness or atrophy can be simulated. (Default: `[]`)
-thickness | Cortical thickness in mm. Scalar = global; 3-vector = `[occipital rest frontal]` using Hammer atlas masks. Subcortical/cerebellar regions are excluded from thickness simulation and the original thickness values are kept. Either thickness or atrophy can be simulated. (Default: `0`)
+thickness | Cortical thickness in mm. Scalar = global; 3-vector = `[occipital rest frontal]` using neuromorphometrics atlas masks. Subcortical/cerebellar regions are excluded from thickness simulation and the original thickness values are kept. Either thickness or atrophy can be simulated. (Default: `0`)
+closeWMHholes | Detect and fill existing WMHs in WM so that the simulated image starts from a clean WM, which allows synthetic WMHs to be added via `WMH`. (Default: `1`)
+parpool | Number of workers used when several input images are given and the Parallel Computing Toolbox is available; limited to the number of images. (Default: half the available cores)
 
 ### rf: RF bias field parameters (struct)
 
 Parameter | Description (Default)
 ----------|------------------------
-percent | Amplitude in percent; negative values invert the field. (Default: `20`)
+percent | Peak-to-peak amplitude in percent; negative values invert the field, i.e. swap its bright and dark areas at the same amplitude. (Default: `30`)
 type | `'A'|'B'|'C'` (predefined MNI fields) or numeric `[strength rngSeed]` for a simulated field. Strength in `1..4` (3–4 ~ stronger 7T-like). (Default: `[2 0]`)
 save | Save the simulated bias field only when `type` is numeric; ignored for `'A'|'B'|'C'`. (Default: `0`)
 
@@ -59,22 +62,25 @@ save | Save the simulated bias field only when `type` is numeric; ignored for `'
 If `simu` and/or `rf` are omitted or partially specified, missing fields are filled with defaults. If `simu.name` is empty, a file selection dialog opens.
 
 ```matlab
-simu = struct('name', '', 'snrWM', 10, 'snrWM', 0, 'contrast', 1, ...
-              'resolution', NaN, 'WMH', 0, 'atrophy', [], 'thickness', 0, 'rng', 0);
-rf   = struct('percent', 20, 'type', [2 0], 'save', 0);
+simu = struct('name', '', 'snrWM', 30, 'pn', 0, 'contrast', 1, ...
+              'resolution', NaN, 'WMH', 0, 'atrophy', [], 'thickness', 0, ...
+              'rng', 0, 'derivative', 1, 'closeWMHholes', 1);
+rf   = struct('percent', 30, 'type', [2 0], 'save', 0);
 ```
 
 ## Outputs
-The function saves:
-- Simulated image: `snr{snrWM}_{meanRes}mm_{name}{opts}.nii`
-- Simulated masked image: `snr{snrWM}_{meanRes}mm_m{name}{opts}.nii`
-- Ground-truth PVE label: `label_pve_{meanRes}mm_{name}{opts}.nii`
-- If requested, RF field (simulated only): `{opts}_{meanRes}mm_{name}.nii`
-- JSON sidecars (main and masked images): `{simuFile}.json` including tool metadata and SimulationParameters (voxel size, pn or snrWM, RF settings, thickness tag)
+The function saves, per input image:
+- Simulated image: `{name}_desc-{noise}_{opts}T1w.nii`
+- Ground-truth PVE label: `{name}_desc-{opts}_label-seg.nii`
+- If requested (`rf.save=1`, simulated fields only): `{name}_desc-{opts}_RFfield.nii`
+- One JSON sidecar next to the simulated image: `{simuFile}.json`, including tool metadata and SimulationParameters (voxel size, pn or snrWM, RF settings, thickness tag)
+
+If the input name contains `_T1w`, that entity is replaced in place; otherwise the `_desc-` part is appended to the input name.
 
 Notes:
-- When `pn>0`, filenames use `pn{pn}` instead of `snr{snrWM}`.
-- `{opts}` aggregates options, e.g., `_rf20_A`, `_WMH2`, `_hammers_28_2`, `_thickness1.5mm-2.5mm`.
+- `{noise}` is `snr{snrWM}`, or `pn{pn}` when `pn>0` and `snrWM=0`.
+- `{opts}` aggregates the remaining options, e.g., `_rf20_A`, `_WMH2`, `_hammers_28_2`, `_res-10mm`, `_thickness15mm-25mm`.
+- The label file carries only `{opts}` and not the noise tag, since the ground truth does not depend on the noise level. Runs that differ only in SNR therefore share one label file.
 - When thickness is used, the label is PVE-like from the boundary jittering averaging.
 - When WMH is used, a 4th label contribution is added (WMH).
 
@@ -101,7 +107,7 @@ rf = struct('percent', 20, 'type', 'A', 'save', 0);
 mri_simulate(simu, rf);
 ```
 
-### 2) Advanced simulation with atrophy (2% in left middle frontal gyrus and 3% in right middle frontal gyrus based on Hammers atlas), custom RF field and thicker slices
+### 2) Advanced simulation with atrophy (~10% in left middle frontal gyrus and ~15% in right middle frontal gyrus based on Hammers atlas), custom RF field and thicker slices
 ```matlab
 simu = struct('name', 'custom_t1.nii', 'snrWM', 30, ...
               'resolution', [0.5, 0.5, 1.5], 'rng', []);
@@ -145,8 +151,20 @@ mri_simulate(simu, rf);
 
 ## File Naming Examples
 
+For an input named `colin27_t1_tal_hires.nii`:
+
 ```
-pn3_1.0mm_input_rf20_A.nii                     % Gaussian noise at 3%
-snr30_1.0mm_input_rf20_A.nii                   % Rician noise at SNR=30 in WM
-snr30_res-10mm_input_thickness2.5mm.nii          % With thickness tag
+colin27_t1_tal_hires_desc-pn3_rf20_A_.nii              % Gaussian noise at 3%
+colin27_t1_tal_hires_desc-snr30_rf20_A_.nii            % Rician noise at SNR=30 in WM
+colin27_t1_tal_hires_desc-snr30_rf20_A_res-10mm.nii    % Resampled to 1.0mm
+colin27_t1_tal_hires_desc-res-10mm_thickness25mm_label-seg.nii  % Label for a 2.5mm thickness run
 ```
+
+For a BIDS input named `sub-01_T1w.nii`, the `_T1w` entity is replaced instead:
+
+```
+sub-01_desc-snr30_rf20_A_T1w.nii
+sub-01_desc-rf20_A_label-seg.nii
+```
+
+Note that the `desc-` values contain underscores and are therefore not strictly BIDS-valid entity labels.
