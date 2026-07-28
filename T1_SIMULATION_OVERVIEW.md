@@ -113,7 +113,7 @@ mri_simulate(simu, rf);
 | `thickness` | Cortical thickness in mm | 1.5-2.5 or `[occ, mid, front]` |
 | `rng` | Random seed; a fixed number gives every image the same noise | 0 (default), or `NaN`/`[]` to seed from the filename |
 | `derivative` | Save into BIDS `derivatives/mri_simulate-*` | 0/1 (default 1) |
-| `closeWMHholes` | Close WMH holes in deep WM | 0/1 (default 1) |
+| `closeWMHholes` | Close WMH holes in deep WM | 0/1 (default 0) |
 
 ### RF Bias Field Options (rf)
 
@@ -198,7 +198,7 @@ Plus a `dataset_description.json` at the root of the pipeline folder, which BIDS
 
 1. **Segmentation**: Uses SPM12 to identify GM/WM/CSF in input image.
 2. **Modification**: Alters tissue distributions based on your parameters (atrophy, thickness, WMH).
-3. **Synthesis**: Recreates T1w image from modified tissue maps via the SPM mixture model.
+3. **Synthesis**: Recreates the T1w image as the probability-weighted mixture of the tissue means taken from the SPM segmentation, using the modified tissue maps as weights. Non-brain keeps the intensity of the bias-corrected input.
 4. **Artifacts**: Applies bias field, optional contrast change, and noise.
 5. **Outputs**: Saves the simulated image, the label map, optionally the RF field, and a JSON sidecar (in derivatives by default).
 

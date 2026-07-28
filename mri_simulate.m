@@ -58,7 +58,7 @@ function mri_simulate(simu, rf)
 %         derivatives folder at the dataset root, using the pipeline name
 %         'mri_simulate-<version>' ('mri_simulate_thickness-<version>' for
 %         thickness simulations) and mirroring the subject/session path.
-%         Example: root/derivatives/mri_simulate-0.9.9/sub-*/ses-*/[anat|...]/
+%         Example: root/derivatives/mri_simulate-0.10.0/sub-*/ses-*/[anat|...]/
 %         Default: 1 (save into derivatives).
 %       - 'contrast' (double): Power-law contrast-change exponent applied to the
 %         simulated image intensities after noise. The image is normalized to
@@ -72,7 +72,7 @@ function mri_simulate(simu, rf)
 %       - 'closeWMHholes' (logical): Detect and fill WMHs in WM and correct
 %         segmentations to obtain a clean simulated image without WMHs (which
 %         later allows to simulate additional WMHs using the WMH option).
-%         Default: 1 (enabled).
+%         Default: 0 (disabled).
 %       - 'WMH' (integer or >=1 scalar): Strength of simulated white matter
 %         hyperintensities (WMHs).
 %           0  -> no WMHs
@@ -198,7 +198,7 @@ function mri_simulate(simu, rf)
 % TODO: simulation of motion artefacts using FFT and shift of phase information
 
 % named tool_version and not version to not shadow the MATLAB builtin version()
-tool_version = '0.9.9';
+tool_version = '0.10.0';
 
 if ~exist('cat_main_LASsimple','file')
   error('Please update to a newer version >=CAT26 to use mri_simulate')
@@ -213,9 +213,9 @@ def.atrophy    = [];
 def.thickness  = 0;
 def.rng        = 0;
 def.snrWM      = 30;
-def.contrast   = 1;  % power-law contrast change exponent (1 = unchanged)
-def.derivative = 1;  % save outputs into BIDS derivatives
-def.closeWMHholes = 1; % close WMHs inside deep WM
+def.contrast   = 1;    % power-law contrast change exponent (1 = unchanged)
+def.derivative = 1;    % save outputs into BIDS derivatives
+def.closeWMHholes = 0; % don't close WMHs inside deep WM
 def.parpool = feature('numcores')/2; % use half of the available processors
 
 if nargin < 1, simu = def;
@@ -437,7 +437,10 @@ cat_sanlm(Ycorr,3,1);
 
 % Replace GM/WM/CSF segmentation by labels using LAS corrected image
 Yp0toC = @(Yp0,c) 1-min(1,abs(Yp0-c));
-Yseg = zeros([dim, 3]);
+% single is sufficient for tissue probabilities in [0,1] and halves the memory,
+% which matters most for parfor where every worker holds its own copy (a 0.5mm
+% volume needs ~0.7GB instead of ~1.4GB here)
+Yseg = zeros([dim, 3], 'single');
 
 % Use CAT12 adaptive probability region-growing (APRG) approach for
 % skull-stripping (uses T3th anchors; see skull_strip_APRG)
@@ -503,7 +506,7 @@ end
 
 % add atrophy to GM by decreasing GM value in ROI and increasing CSF value
 if simu_atrophy
-  Yseg = simulate_atrophy(simu, Yseg, dim, template_dir, idef_name);
+  Yseg = simulate_atrophy(simu, Yseg, dim, template_dir, idef_name, V);
 end
 
 % get ground truth label using GM/WM/CSF
@@ -631,8 +634,10 @@ if simu.snrWM > 0
   sigma = sigma_abs / mx_vol;        % normalized-domain sigma
   % Complex noise components (n1,n2) are Gaussian. Magnitude combination yields
   % Rician noise (approx. Gaussian at high SNR).
+  % both components are drawn from the same stream. Reseeding in between with
+  % simu.rng+1 would make the n1 of one run identical to the n2 of the run
+  % with the preceding seed, i.e. the two runs would be correlated.
   n1 = sigma * randn(size(volres));
-  rng(simu.rng+1,'twister');
   n2 = sigma * randn(size(volres));
   volres = sqrt( (volres + n1).^2 + (n2).^2 );
 else
@@ -927,45 +932,6 @@ return
 
 
 %==========================================================================
-% function p = likelihoods(f,bf,mg,mn,vr)
-% from spm_preproc_write8.m
-%
-% Purpose
-%   Compute per-voxel likelihoods for a Gaussian mixture model given features
-%   (optionally bias-corrected) and component parameters.
-%
-% Inputs
-%   f   - cell array with one feature image; values are vectorized internally.
-%   bf  - optional bias field multiplier (same shape as f{1}); [] for none.
-%   mg  - mixture weights for each Gaussian component (1 x K).
-%   mn  - means per component (N x K, N=#features).
-%   vr  - covariance matrices per component (N x N x K).
-%
-% Output
-%   p   - per-voxel likelihoods for each component (numel(f{1}) x K).
-%==========================================================================
-function p = likelihoods(f,bf,mg,mn,vr)
-K  = numel(mg);
-N  = numel(f);
-M  = numel(f{1});
-cr = zeros(M,N);
-for n=1:N
-  if isempty(bf)
-    cr(:,n) = double(f{1}(:));
-  else
-    cr(:,n) = double(f{1}(:).*bf{1}(:));
-  end
-end
-
-p  = ones(numel(f{1}),K);
-for k=1:K
-  amp    = mg(k)/sqrt((2*pi)^N * det(vr(:,:,k)));
-  d      = bsxfun(@minus,cr,mn(:,k)')/chol(vr(:,:,k));
-  p(:,k) = amp*exp(-0.5*sum(d.*d,2)) + eps;
-end
-return
-
-%==========================================================================
 % function mask = is_in_atlas(atlas, regions)
 % Purpose
 %   Create mask of defined regions 
@@ -1215,7 +1181,7 @@ label(mask ~= cat_vol_morph(mask,'dc',4)) = 1;
 
 
 %==========================================================================
-% function Yseg = simulate_atrophy(simu, Yseg, dims, template_dir, idef_name)
+% function Yseg = simulate_atrophy(simu, Yseg, dims, template_dir, idef_name, Vref)
 %
 % Purpose
 %   Apply regional atrophy by increasing CSF (and effectively reducing GM)
@@ -1228,35 +1194,48 @@ label(mask ~= cat_vol_morph(mask,'dc',4)) = 1;
 %   dims         - [nx ny nz] dimensions of the volume.
 %   template_dir - path to atlas templates; atlas is warped categorically.
 %   idef_name    - inverse deformation field to native space.
+%   Vref         - struct: target volume definition of the current grid, used
+%                  to resample the warped atlas if it does not match dims.
 %
 % Output
 %   Yseg         - updated tissue maps with CSF increased in target ROIs and
 %                  all three classes renormalized to a sum of 1 per voxel.
-%
-% Note
-%   The atlas is warped with the deformation field of the original image and
-%   is not resampled here. This is only valid as long as Yseg is on that same
-%   grid, which the caller guarantees by not allowing atrophy to be combined
-%   with thickness simulation (the latter resamples to 0.5mm internally).
 %==========================================================================
-function Yseg = simulate_atrophy(simu, Yseg, dims, template_dir, idef_name)
+function Yseg = simulate_atrophy(simu, Yseg, dims, template_dir, idef_name, Vref)
 
-% warp atlas to native spave using categorical interpolation
+% warp atlas to native space using categorical interpolation
 fprintf('Transform atlas to native space. This may take a while...\n');
 atlas_name = fullfile(template_dir,[simu.atrophy{1} '.nii']);
 atlas = cat_vol_defs(struct('field1',{{idef_name}},'images',{{atlas_name}},'interp',-1,'modulate',0));
 atlas = single(atlas{1}{1});
 
+% The deformation field is always defined for the original image, thus the
+% warped atlas has to be resampled if the current grid differs. Nearest
+% neighbour keeps the labels categorical.
+if any(size(atlas) ~= dims)
+  Vdef = spm_vol(idef_name);
+  Vdef = Vdef(1);
+  atlas_res = zeros(dims, 'single');
+  for sl = 1:dims(3)
+    M  = spm_matrix([0 0 sl 0 0 0 1 1 1]);
+    M1 = Vref.mat\Vdef.mat\M;
+    atlas_res(:,:,sl) = spm_slice_vol(atlas, M1, dims(1:2), 0);
+  end
+  atlas = atlas_res;
+end
+
 % go through all defined ROIs
 for i = 1:numel(simu.atrophy{2})
   ind_atlas = round(atlas) == simu.atrophy{2}(i);
-  
-  % check that ROI is not empty because it was not correct defined
-  if isempty(ind_atlas)
-    fprintf('ROI #%d seems to be wrong and does not exist in %s.\n', simu.atrophy{2}, simu.atrophy{1});
-    return
+
+  % check that the ROI exists, an id that is not in the atlas gives an
+  % all-false mask (and not an empty array, which never triggered here)
+  if ~any(ind_atlas(:))
+    fprintf('ROI #%d does not exist in %s and is skipped.\n', simu.atrophy{2}(i), simu.atrophy{1});
+    continue
   end
-  
+
+
   % create atrophy mask with defined value in mask and otherwise 1
   mod_atlas = zeros(dims, 'single');
   mod_atlas(ind_atlas) = simu.atrophy{3}(i);
@@ -1283,28 +1262,41 @@ end
 % function Ysimu = synthesize_from_segmentation(vol_seg, name, res, mn, d, WMH)
 %
 % Purpose
-%   Generate a T1-like image from provided GM/WM/CSF maps by inserting them
-%   into SPM's mixture model and computing the expected intensity per voxel.
+%   Generate a T1-like image from provided GM/WM/CSF maps. The intensity of a
+%   voxel is the probability weighted mixture of the tissue means, where the
+%   probabilities are the external segmentation and the remaining probability
+%   describes everything that is not brain.
 %
 % Inputs
-%   vol_seg - single(dims,3): tissue maps used in place of the SPM posteriors,
-%             in GM/WM/CSF order (the SPM class order given by res.lkp).
+%   vol_seg - single(dims,3): tissue probabilities in GM/WM/CSF order (the SPM
+%             class order given by res.lkp), summing to at most 1 per voxel.
 %   name    - base name for progress display.
-%   res     - struct from SPM segmentation (mg, mn, vr, Tbias, etc.). If WMHs
-%             are simulated, res.mn carries one additional column with the WMH
-%             intensity (see simulate_WMHs).
-%   mn      - 3x1 means for GM/WM/CSF replacing the corresponding mixture means.
+%   res     - struct from SPM segmentation. Used are image(1) and Tbias for the
+%             bias corrected image. If WMHs are simulated, res.mn carries one
+%             additional column with the WMH intensity (see simulate_WMHs).
+%   mn      - 3x1 means for GM/WM/CSF.
 %   d       - [nx ny nz] dimensions.
 %   WMH     - optionally add white matter hyperintensities (WMHs)
 %
 % Output
 %   Ysimu   - synthesized T1-weighted image volume (single).
 %
-% Note
-%   A tissue class can be modelled by several Gaussians (res.lkp maps the
-%   Gaussians to the classes). The class probability is therefore split over
-%   its Gaussians with the mixing proportions mg, which sum to 1 within a
-%   class, so that each class enters the normalization sum exactly once.
+% Algorithm
+%   Pbrain = sum of the given tissue probabilities (plus the WMH map). With
+%     s = max(Pbrain,1):
+%       I = ( sum_k mn(k)*seg_k [+ mn_WMH*WMH] + Ibias*(s-Pbrain) ) / s
+%   where Ibias is the bias corrected input image. Inside the brain Pbrain is 1
+%   and this is the linear partial volume mixture of the tissue means. Outside
+%   the brain Pbrain is 0 and the bias corrected image is kept, so skull and
+%   background stay as they are. In between the two blend continuously.
+%
+% Notes
+%   - The SPM mixture model is not evaluated here. Its Gaussian likelihoods for
+%     the non-brain classes are unnormalized densities on an arbitrary scale,
+%     so mixing them into the same normalization sum as the tissue
+%     probabilities darkened the brain boundary by an ill-defined amount.
+%   - WMHs are added on top of the WM class, so Pbrain can reach 2 there and
+%     the result is the mean of the WM and the WMH intensity.
 %==========================================================================
 function Ysimu = synthesize_from_segmentation(vol_seg, name, res, mn, d, WMH)
 % go through all peaks that are defined
@@ -1326,73 +1318,50 @@ chan.T  = res.Tbias{1};
 % output image
 Ysimu = zeros(d, 'single');
 
-% Replace the GM/WM/CSF means of the mixture model by the means estimated for
-% this image. This is constant over slices and is therefore done only once.
-for k=1:3
-  res.mn(1,res.lkp==k) = mn(k);
+% intensity of the additional WMH class, stored by simulate_WMHs as the last
+% entry of res.mn (it is not part of res.lkp)
+if ~isempty(WMH)
+  intensity_WMH = res.mn(1,K);
 end
-
-% index of the last Gaussian that still belongs to GM/WM/CSF
-n_brain_gaussians = find(res.lkp<=3, 1, 'last');
 
 spm_progress_bar('init',length(x3),['Working on ' name],'Planes completed');
 for z = 1:length(x3)
 
-  % Bias corrected image
+  % Bias corrected image. It provides the intensities of everything that is
+  % not GM/WM/CSF, i.e. skull, soft tissue and background.
   f  = spm_sample_vol(res.image(1),x1,x2,o*x3(z),0);
   bf = exp(transf(chan.B1,chan.B2,chan.B3(z,:),chan.T));
-  cr{1} = bf.*f;
+  cr = bf.*f;
 
-  msk = any((f==0) | ~isfinite(f),3);
+  msk = (f==0) | ~isfinite(f);
 
-  % Parametric representation of intensity distributions
-  q1  = likelihoods(cr,[],res.mg,res.mn,res.vr);
-  q1  = reshape(q1,[d(1:2),numel(res.mg)]);
-  
-  % Replace classes for GM/WM/CSF by the external segmentations. A tissue
-  % class can be modelled by more than one Gaussian (with SPM defaults CSF
-  % uses two), and the mixing proportions mg sum to 1 within each class.
-  % The class probability is therefore distributed over its Gaussians using
-  % mg. Assigning the full class probability to each of its Gaussians would
-  % count that class numel(ind) times in the normalization sum s below and
-  % would scale the synthesized intensity of such a class by 1/numel(ind).
-  for k=1:3
-    ind = find(res.lkp==k);
-    for j=1:numel(ind)
-      q1(:,:,ind(j)) = res.mg(ind(j))*vol_seg(:,:,z,k);
-    end
+  % The expected intensity is the probability weighted mixture of the tissue
+  % means, where the probabilities are given by the external segmentation.
+  % The remaining probability (1-Pbrain) is non-brain and keeps the intensity
+  % of the bias corrected image.
+  tmp    = zeros(d(1:2));
+  Pbrain = zeros(d(1:2));
+  for k = 1:3
+    seg    = double(vol_seg(:,:,z,k));
+    tmp    = tmp + mn(k)*seg;
+    Pbrain = Pbrain + seg;
   end
-
-  % add WMHs as last class
   if ~isempty(WMH)
-    q1(:,:,K) = WMH(:,:,z);
+    seg    = double(WMH(:,:,z));
+    tmp    = tmp + intensity_WMH*seg;
+    Pbrain = Pbrain + seg;
   end
 
-  s   = sum(q1,3);
-  tmp = zeros(d(1:2));
+  % WMHs are added on top of the WM class, thus Pbrain can exceed 1. The
+  % normalization then averages the contributions instead of adding a
+  % non-brain part, and s>=1 keeps the division safe everywhere.
+  s   = max(Pbrain, 1);
+  tmp = (tmp + cr.*(s - Pbrain)) ./ s;
 
-  % sum up over first 3 classes and normalize to sum of 1 (mg is already
-  % contained in q1 and must not be applied a second time here)
-  for k=1:n_brain_gaussians
-    tmp = tmp + res.mn(1,k)*q1(:,:,k)./s;
-  end
-
-  % The WMH class is not part of res.lkp and is therefore added separately.
-  % Its intensity is stored as last entry of res.mn by simulate_WMHs. Without
-  % this term the WMH map would only appear in the normalization sum s and
-  % would just dilute (i.e. darken) the WM intensity instead of contributing
-  % the intended WMH intensity.
-  if ~isempty(WMH)
-    tmp = tmp + res.mn(1,K)*q1(:,:,K)./s;
-  end
-
-  % add remaining 3 BG classes from bias corrected image
-  ind = tmp == 0;
-  tmp(ind) = cr{1}(ind);
   tmp(msk) = 1e-3;
 
   Ysimu(:,:,z) = tmp;
-  
+
   spm_progress_bar('set',z);
 end
 
@@ -1651,10 +1620,10 @@ Ysimu = rf_field.*Ysimu;
 %     emphasize regions with higher WMH probability.
 %   - The WM erosion step helps avoid spuriously labeling GM/CSF boundaries
 %     as WMH.
-%   - Only res.mn is extended by the WMH class, because mg/vr/lkp describe the
-%     mixture model that is evaluated in likelihoods(), which must stay
-%     unchanged. synthesize_from_segmentation addresses the WMH class by its
-%     index K = numel(res.mg)+1.
+%   - Only res.mn is extended by the WMH class, because mg/lkp keep describing
+%     the Gaussians of the original SPM segmentation and are still used to
+%     compute weighted class means. synthesize_from_segmentation addresses the
+%     WMH class by its index K = numel(res.mg)+1.
 %==========================================================================
 function [WMH, res, label_pve] = simulate_WMHs(simu, res, label_pve, template_dir, idef_name)
 
@@ -1723,9 +1692,9 @@ label_pve(label_pve > 4) = 4;
 % Use mean of GM for the additional class. The mixing proportions mg sum to 1
 % within each class, thus the weighted mean is used here in the same way as
 % the GM/WM/CSF means are estimated in the main function.
-% Only res.mn is extended (and not mg/vr/lkp), because the WMH class is not
-% part of the mixture model that is evaluated in likelihoods(). It is
-% addressed by its index K in synthesize_from_segmentation.
+% Only res.mn is extended (and not mg/lkp), because those keep describing the
+% Gaussians of the original SPM segmentation. The WMH class is addressed by
+% its index K in synthesize_from_segmentation.
 ind_GM = res.lkp == 1;
 mg_GM  = res.mg(ind_GM);
 mn_GM  = res.mn(1,ind_GM);
@@ -1805,11 +1774,37 @@ function Yseg = close_WM_GM_holes(Yseg, Ysrc, Ycorr, Ycls, Yy, res, vx_vol)
 % Output
 %   Yseg   - class volumes with WMHs reassigned to WM, leaving cortex and
 %            boundaries untouched as much as possible.
+%
+% Note
+%   This step costs minutes because cat_vol_partvol solves several region
+%   growings with cat_vol_laplace3R, and for an image without WMHs all of it
+%   ends in an empty mask that leaves Yseg unchanged. A cheap geometric
+%   pre-test to skip it was tried and rejected: WMHs are hypointense islands
+%   inside WM, but so are the thalamus and the basal ganglia, and the two
+%   cannot be told apart by size or intensity. Filling the WM mask with a
+%   closing does separate them, yet only for lesions smaller than the closing
+%   radius, so lesions above roughly 7mm (and any periventricular rim) become
+%   invisible while deep grey matter stays excluded. Separating the two needs
+%   the atlas information that cat_vol_partvol already uses. Set
+%   simu.closeWMHholes = 0 to skip this step for inputs known to be free of
+%   WMHs, such as the Colin27 template.
 
 % we have to prepare some parameters for cat_main_updateSPM1639
 global cat; cat_defaults;
 job = cat;
 job.extopts.inv_weighting = 0; job.extopts.verb = 0;
+
+% Internal working resolution of cat_vol_partvol. It defaults to 0.7mm, which
+% for a 0.5mm phantom means that the iterative region growing in
+% cat_vol_laplace3R (the dominating cost of this step, marked as bottleneck in
+% cat_vol_partvol itself) runs on ~12 million voxels and takes minutes.
+% Only Yl1 and the WMH class are used below, both as coarse masks that are
+% afterwards dilated by 8mm and closed by 12mm, so a finer grid brings nothing
+% here. cat_vol_partvol restores the native resolution of its outputs, thus
+% this only affects the internal computation. Lowering it towards 0.7 gives a
+% more detailed WMH mask at a steeply increasing cost (roughly linear in the
+% number of voxels, i.e. ~3x from 1.0 to 0.7 and ~12x from 1.5 to 0.7).
+job.extopts.uhrlim = max(1.0, max(vx_vol));
 P = zeros([size(Ycls{1}) numel(Ycls)],'uint8');
 for i=1:numel(Ycls), P(:,:,:,i) = Ycls{i}; end
 clear Ycls;
@@ -1826,12 +1821,30 @@ stime2 = cat_io_cmd('');
 [~,Ycls,Yb] = cat_main_updateSPM1639(Ysrc,P,Yy,tpm,job,res,stime,stime2);
 [Yl1,Ycls] = cat_vol_partvol(Ycorr,Ycls,Yb,Yy,vx_vol,job.extopts,tpm.V,noise,job,false(size(Yb)));
 
-NS = @(Ys,s) Ys==s | Ys==s+1; 
+NS = @(Ys,s) Ys==s | Ys==s+1;
 LAB = job.extopts.LAB;
+
+% Mask of structures where WMHs must not be corrected. The dilation by 8mm and
+% the closing by 12mm are deliberately coarse, but at native resolution they
+% are distance transforms over the full volume (~20s for a 0.5mm image). The
+% mask is therefore built on a 1.5mm grid, where the same radii cost a
+% fraction of that, and is then resampled back.
 Ynwmh = NS(Yl1,LAB.TH) | NS(Yl1,LAB.BG) | NS(Yl1,LAB.HC) | NS(Yl1,LAB.CB) | NS(Yl1,LAB.BS);
-Ynwmh = cat_vol_morph(cat_vol_morph( Ynwmh, 'dd', 8 , vx_vol),'dc',12 , vx_vol) & ...
-        ~cat_vol_morph( NS(Yl1,LAB.VT), 'dd', 4 , vx_vol); 
-Ywmh  = Ycls{7}>0 & ~Ynwmh;
+Yvt   = NS(Yl1,LAB.VT);
+
+[Ynwmh_r, Yvt_r, resTr] = cat_vol_resize({single(Ynwmh), single(Yvt)}, ...
+                                         'reduceV', vx_vol, 1.5, 32);
+vx_r = resTr.vx_volr;
+Ynwmh_r = cat_vol_morph(cat_vol_morph( Ynwmh_r>0.5, 'dd', 8, vx_r), 'dc', 12, vx_r) & ...
+          ~cat_vol_morph( Yvt_r>0.5, 'dd', 4, vx_r);
+Ynwmh = cat_vol_resize(single(Ynwmh_r), 'dereduceV', resTr) > 0.5;
+
+% the WMH class of cat_vol_partvol is only present when WMH correction ran
+if numel(Ycls) >= 7 && ~isempty(Ycls{7})
+  Ywmh = Ycls{7}>0 & ~Ynwmh;
+else
+  Ywmh = false(size(Ynwmh));
+end
 
 % reassign these WMHs to WM in Yseg
 Yseg(:,:,:,1) = min(Yseg(:,:,:,1), (1 - Ywmh));
