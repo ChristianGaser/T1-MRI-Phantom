@@ -69,18 +69,25 @@ rf   = struct('percent', 30, 'type', [2 0], 'save', 0);
 ```
 
 ## Outputs
-The function saves, per input image:
-- Simulated image: `{name}_desc-{noise}_{opts}T1w.nii`
-- Ground-truth PVE label: `{name}_desc-{opts}_label-seg.nii`
-- If requested (`rf.save=1`, simulated fields only): `{name}_desc-{opts}_RFfield.nii`
-- One JSON sidecar next to the simulated image: `{simuFile}.json`, including tool metadata and SimulationParameters (voxel size, pn or snrWM, RF settings, thickness tag)
+Output names follow the [BIDS](https://bids.neuroimaging.io) filename grammar: entity-value pairs followed by a suffix, where entity labels contain only letters and digits. All option tags are therefore collected into a single camelCase `desc` label, while the output resolution uses the standard `res` entity.
 
-If the input name contains `_T1w`, that entity is replaced in place; otherwise the `_desc-` part is appended to the input name.
+Per input image:
+- Simulated image: `{entities}[_res-{vx}mm]_desc-{opts}_T1w.nii`
+- Ground-truth PVE label: `{entities}[_res-{vx}mm][_desc-{anatOpts}]_dseg.nii`
+- If requested (`rf.save=1`, simulated fields only): `{entities}[_res-{vx}mm]_desc-{anatOpts}Biasfield_T1w.nii`
+- A JSON sidecar next to the simulated image and next to the label image
+
+When `derivative=1`, a `dataset_description.json` is written to the root of the pipeline folder, which BIDS requires for a derivative dataset to be valid.
+
+If the input name ends in `_T1w`, its entities are preserved and the new `res`/`desc` entities are inserted before the suffix (an existing `desc` entity of the input is replaced). For a non-BIDS input the basename is kept unchanged, so the result cannot be fully BIDS-valid — only the entities and the suffix added here follow the specification.
 
 Notes:
-- `{noise}` is `snr{snrWM}`, or `pn{pn}` when `pn>0` and `snrWM=0`.
-- `{opts}` aggregates the remaining options, e.g., `_rf20_A`, `_WMH2`, `_hammers_28_2`, `_res-10mm`, `_thickness15mm-25mm`.
-- The label file carries only `{opts}` and not the noise tag, since the ground truth does not depend on the noise level. Runs that differ only in SNR therefore share one label file.
+- `{opts}` combines the noise tag (`snr30`, or `pn3` when `pn>0` and `snrWM=0`), the bias field (`Rf20A`, `Rf20T2`, `RfNeg20A` for an inverted field), the contrast (`ConLow`/`ConHigh`/`Con1p3`) and the anatomical tags.
+- `{anatOpts}` covers only the anatomical options (`hammersRoi28F2`, `hammersMulti`, `Wmh2`, `Thickness25mm`, `Thickness15to25mm`). The label file omits the noise tag, since the ground truth does not depend on the noise level, so runs that differ only in SNR share one label file.
+- Decimal points become `p` (`Con1.3` → `Con1p3`), since BIDS labels must be alphanumeric.
+- `res` gives the voxel size in mm with the same `p` convention (`res-0p5mm`, `res-1mm`). Anisotropic voxels are listed per axis (`res-0p5x0p5x1p5mm`) rather than averaged — the previous mean-based `res-08mm` form was both unreadable and lossy, mapping `[0.75 0.75 0.75]` and `[0.5 0.5 1.5]` onto the same name.
+- With no options at all the label would be empty, so `desc-simu` is used to keep the output distinct from the input.
+- The `dseg` suffix normally implies integer labels; here the values are continuous PVE labels, which the label sidecar documents.
 - When thickness is used, the label is PVE-like from the boundary jittering averaging.
 - When WMH is used, a 4th label contribution is added (WMH).
 
@@ -151,20 +158,26 @@ mri_simulate(simu, rf);
 
 ## File Naming Examples
 
-For an input named `colin27_t1_tal_hires.nii`:
+For a BIDS input named `sub-01_T1w.nii`:
 
 ```
-colin27_t1_tal_hires_desc-pn3_rf20_A_.nii              % Gaussian noise at 3%
-colin27_t1_tal_hires_desc-snr30_rf20_A_.nii            % Rician noise at SNR=30 in WM
-colin27_t1_tal_hires_desc-snr30_rf20_A_res-10mm.nii    % Resampled to 1.0mm
-colin27_t1_tal_hires_desc-res-10mm_thickness25mm_label-seg.nii  % Label for a 2.5mm thickness run
+sub-01_desc-pn3Rf20A_T1w.nii                        % Gaussian noise at 3%
+sub-01_desc-snr30Rf20A_T1w.nii                      % Rician noise at SNR=30 in WM
+sub-01_res-1mm_desc-snr30Rf20A_T1w.nii              % Resampled to 1.0mm
+sub-01_res-0p5x0p5x1p5mm_desc-snr30Rf20A_T1w.nii    % Anisotropic voxels
+sub-01_res-1mm_desc-snr30RfNeg20A_T1w.nii           % Inverted bias field
+sub-01_desc-snr30Rf20T2Con1p3_T1w.nii               % Simulated field, strength 2, contrast 1.3
+sub-01_desc-snr30Rf20AThickness25mm_T1w.nii         % 2.5mm constant thickness
+sub-01_desc-Thickness25mm_dseg.nii                  % Label for that thickness run
+sub-01_desc-hammersRoi28F2_dseg.nii                 % Label for a single-ROI atrophy run
+sub-01_desc-biasfield_T1w.nii                       % Saved RF field
 ```
 
-For a BIDS input named `sub-01_T1w.nii`, the `_T1w` entity is replaced instead:
+Existing entities of the input are preserved and the new ones inserted before the suffix, e.g. `sub-01_ses-1_acq-mprage_T1w.nii` becomes `sub-01_ses-1_acq-mprage_desc-snr30Rf20A_T1w.nii`.
+
+For a non-BIDS input such as `colin27_t1_tal_hires.nii` the basename is kept, so the result is not BIDS-valid even though the added entities are:
 
 ```
-sub-01_desc-snr30_rf20_A_T1w.nii
-sub-01_desc-rf20_A_label-seg.nii
+colin27_t1_tal_hires_desc-snr30Rf20A_T1w.nii
+colin27_t1_tal_hires_dseg.nii
 ```
-
-Note that the `desc-` values contain underscores and are therefore not strictly BIDS-valid entity labels.

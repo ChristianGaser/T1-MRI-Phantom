@@ -133,18 +133,21 @@ mri_simulate(simu, rf);
 
 Each simulation creates **2-3 output files** plus a JSON sidecar, written to the input folder or to `derivatives/mri_simulate-<version>/...` when `derivative=1` (default). Thickness simulations use `derivatives/mri_simulate_thickness-<version>/...`:
 
-1. **Simulated image**: `<name>_desc-<tags>T1w.nii[.gz]`
+1. **Simulated image**: `<entities>[_res-<vx>mm]_desc-<tags>_T1w.nii[.gz]`
    - Full brain with all requested effects
 
-2. **Ground truth labels**: `<name>_desc-<effect>_label-seg.nii[.gz]`
-   - CSF=1, GM=2, WM=3 (±WMH=4)
+2. **Ground truth labels**: `<entities>[_res-<vx>mm][_desc-<effect>]_dseg.nii[.gz]`
+   - CSF=1, GM=2, WM=3 (±WMH=4), with continuous partial volume values in between
    - Useful for training/validation
 
-3. **RF bias field** (if requested and `type` numeric): `<name>_desc-<effect>_RFfield.nii[.gz]`
+3. **RF bias field** (if requested and `type` numeric): `<entities>[_res-<vx>mm]_desc-<effect>Biasfield_T1w.nii[.gz]`
    - Saved only for simulated fields when `rf.save=1`
- 
-4. **JSON sidecar**: one next to the simulated image
+
+4. **JSON sidecars**: one next to the simulated image and one next to the label image
    - Includes tool info and SimulationParameters (voxel size, pn or snrWM, RF settings, thickness, WMH, atrophy)
+   - The label sidecar documents the label values and their partial volume encoding
+
+Plus a `dataset_description.json` at the root of the pipeline folder, which BIDS requires for a valid derivative dataset.
 
 ---
 
@@ -260,14 +263,17 @@ Each simulation creates **2-3 output files** plus a JSON sidecar, written to the
 
 ### File Naming
 ```
-<name>_desc-<tags>T1w.nii[.gz]
-<name>_desc-<effect>_label-seg.nii[.gz]
-<name>_desc-<effect>_RFfield.nii[.gz]
+<entities>[_res-<vx>mm]_desc-<tags>_T1w.nii[.gz]
+<entities>[_res-<vx>mm][_desc-<effect>]_dseg.nii[.gz]
+<entities>[_res-<vx>mm]_desc-<effect>Biasfield_T1w.nii[.gz]
 
-Tags combine noise/SNR, RF, WMH, atrophy/thickness, and resolution, e.g.:
-colin27_desc-snr30_rf20_A_res-10mm_WMH2_T1w.nii
-colin27_desc-conHigh_rf15_B_thickness15mm_T1w.nii
-colin27_desc-rf20_2_res-10mm_hammers_28_2_label-seg.nii
+BIDS entity labels must be alphanumeric, so the tags for noise/SNR, RF,
+contrast, WMH and atrophy/thickness are concatenated into one camelCase
+desc label, while the resolution uses the standard res entity. Decimal
+points become 'p' and anisotropic voxels are listed per axis, e.g.:
+sub-01_res-1mm_desc-snr30Rf20AWmh2_T1w.nii
+sub-01_desc-ConHighRf15BThickness15mm_T1w.nii
+sub-01_res-0p5x0p5x1p5mm_desc-hammersRoi28F2_dseg.nii
 ```
 
 ### Label Values

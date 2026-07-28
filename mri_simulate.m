@@ -135,12 +135,22 @@ function mri_simulate(simu, rf)
 %   See the examples below for constructing minimal 'simu' and 'rf' structs.
 %
 % Outputs:
-%   Simulated MRI image files based on the specified parameters and features:
-%     - Main simulated image:  <name>_desc-<opts>T1w.nii
-%     - Ground-truth PVE label: <name>_desc-<opts>_label-seg.nii
+%   Simulated MRI image files based on the specified parameters and features.
+%   Names follow the BIDS filename grammar, i.e. entity-value pairs followed
+%   by a suffix, where all option tags are collected in one alphanumeric
+%   desc label and the output resolution uses the res entity:
+%     - Main simulated image:   <entities>[_res-<vx>mm]_desc-<opts>_T1w.nii
+%     - Ground-truth PVE label: <entities>[_res-<vx>mm][_desc-<opts>]_dseg.nii
 %     - Optional RF bias field (simulated fields only, rf.save=1):
-%                               <name>_desc-<opts>_RFfield.nii
-%     - JSON sidecar next to the main image with simulation metadata
+%                               <entities>[_res-<vx>mm]_desc-<opts>Biasfield_T1w.nii
+%     - JSON sidecar next to the simulated image and the label image
+%   <vx> is the voxel size in mm with 'p' as decimal separator, e.g.
+%   res-0p5mm. Anisotropic voxels are listed per axis (res-0p5x0p5x1p5mm).
+%   When simu.derivative is set, a dataset_description.json is written to the
+%   root of the derivatives pipeline folder, as BIDS requires for a valid
+%   derivative dataset. Fully valid BIDS names are only possible for a BIDS
+%   input; for any other input the entities and the suffix added here still
+%   follow the specification, but the input basename is kept as it is.
 %
 % Usage:
 %   To simulate an MRI, specify the simulation (`simu`) and RF bias field
@@ -272,8 +282,15 @@ pth_root = fileparts(which(mfilename));
 
 % Determine output folder (optionally BIDS derivatives)
 out_pth = pth;
+source_uri = '';        % BIDS URI of the input image, if it can be derived
 if isfield(simu,'derivative') && simu.derivative
   try
+    if any(simu.thickness)
+      pipeline_name = ['mri_simulate_thickness-' tool_version];
+    else
+      pipeline_name = ['mri_simulate-' tool_version];
+    end
+
     parts = strsplit(pth, filesep);
     if isempty(parts{1}), parts{1} = filesep; end
     idx_sub = find(strncmp(parts,'sub-',4), 1, 'first');
@@ -281,26 +298,26 @@ if isfield(simu,'derivative') && simu.derivative
       % Derivatives at dataset root
       root_dir = fullfile(parts{1:idx_sub-1});
       rel_parts = parts(idx_sub:end); % sub-..[/ses-..]/anat/...
-      if simu.thickness(1) > 0
-        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate_thickness-' tool_version]);
-      else
-        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate-' tool_version]);
-      end
+      pipeline_dir = fullfile(root_dir, 'derivatives', pipeline_name);
       out_pth = fullfile(pipeline_dir, rel_parts{:});
+      % BIDS URI of the source image relative to the raw dataset root, which
+      % always uses '/' as separator independent of the platform
+      source_uri = ['bids::' strjoin([rel_parts, {[name ext]}], '/')];
     else
       % Fallback: place outputs under derivatives without mirroring
       root_dir = fileparts(pth);
-      if simu.thickness(1) > 0
-        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate_thickness-' tool_version]);
-      else
-        pipeline_dir = fullfile(root_dir, 'derivatives', ['mri_simulate-' tool_version]);
-      end
+      pipeline_dir = fullfile(root_dir, 'derivatives', pipeline_name);
       out_pth = pipeline_dir;
     end
     if ~exist(out_pth,'dir'), mkdir(out_pth); end
+
+    % A BIDS derivative dataset requires a dataset_description.json at the
+    % root of the pipeline directory, otherwise the dataset is not valid.
+    write_dataset_description(pipeline_dir, pipeline_name, tool_version);
   catch
     % In case of any issue, fall back to input folder
     out_pth = pth;
+    source_uri = '';
   end
 end
 
@@ -628,79 +645,125 @@ end
 % Clamp and rescale back
 volres = mx_vol * max(min(volres, 1), 0);
 
-mean_resolution = round(10*mean(simu.resolution));
+%--------------------------------------------------------------------------
+% Build BIDS-compatible output names.
+%
+% A BIDS filename is a sequence of entity-value pairs followed by a suffix:
+%   <entity>-<label>[_<entity>-<label>...]_<suffix>.<extension>
+% Entity labels must consist of letters and digits only, thus all option
+% tags are concatenated into a single camelCase label for the desc entity
+% (bids_label removes/replaces everything else). The output resolution uses
+% the standard res entity instead and therefore stays outside of desc.
+% Suffixes are T1w for the simulated image and dseg for the label image.
+%--------------------------------------------------------------------------
 
+% tags describing the acquisition: noise, bias field and contrast
+desc_acq = '';
 if simu.snrWM > 0
-  str1 = sprintf('snr%g',simu.snrWM);
+  desc_acq = sprintf('snr%g',simu.snrWM);
 elseif simu.pn > 0
-  str1 = sprintf('pn%g',simu.pn);
-else
-  str1 = '';
+  desc_acq = sprintf('pn%g',simu.pn);
 end
 if rf.percent ~= 0
+  % the sign of rf.percent selects an inverted field and has to be kept,
+  % but a minus sign is not allowed inside a BIDS label
+  if rf.percent < 0, rf_sign = 'Neg'; else, rf_sign = ''; end
   if isnumeric(rf.type)
-    str1 = sprintf('%s_rf%g_%d', str1, rf.percent, rf.type(1));
+    % the T separates the strength from the amplitude, which would otherwise
+    % be concatenated into an ambiguous number (e.g. 30 and 2 -> 302)
+    rf_str = sprintf('T%d', rf.type(1));
   else
-    str1 = sprintf('%s_rf%g_%s', str1, rf.percent, rf.type);
+    rf_str = rf.type;
   end
+  desc_acq = sprintf('%sRf%s%g%s', desc_acq, rf_sign, abs(rf.percent), rf_str);
 end
 if simu.contrast ~= 1
   switch  simu.contrast
     case 0.5
-      str1 = sprintf('%s_conLow', str1);
+      desc_acq = sprintf('%sConLow', desc_acq);
     case 1.5
-      str1 = sprintf('%s_conHigh', str1);
+      desc_acq = sprintf('%sConHigh', desc_acq);
     otherwise
-      str1 = sprintf('%s_con%g', str1, simu.contrast);
+      desc_acq = sprintf('%sCon%g', desc_acq, simu.contrast);
   end
 end
 
+% tags describing the anatomy: atrophy, WMHs and thickness. These do not
+% depend on the noise or the bias field and are reused for the label image.
+desc_anat = '';
 if simu_atrophy
   if numel(simu.atrophy{2}) > 1
-    str2 = sprintf('%s_multi',simu.atrophy{1});
+    desc_anat = sprintf('%sMulti',simu.atrophy{1});
   else
-    str2 = sprintf('%s_%d_%g',simu.atrophy{1},simu.atrophy{2},simu.atrophy{3});
+    % Roi/F separate the region id from the atrophy factor, which would
+    % otherwise be concatenated into an ambiguous number
+    desc_anat = sprintf('%sRoi%dF%g',simu.atrophy{1},simu.atrophy{2},simu.atrophy{3});
   end
-else
-  str2 = '';
 end
 if simu.WMH
-  str2 = sprintf('%s_WMH%g', str2, simu.WMH);
-end
-if change_resolution
-  str2 = sprintf('%s_res-%02dmm',str2,mean_resolution);
+  desc_anat = sprintf('%sWmh%g', desc_anat, simu.WMH);
 end
 if any(simu.thickness)
   thickness = round(10*simu.thickness);
   if isscalar(simu.thickness)
-    str2 = sprintf('%s_thickness%02dmm',str2,thickness);
+    desc_anat = sprintf('%sThickness%02dmm',desc_anat,thickness);
   else
-    str2 = sprintf('%s_thickness%02dmm-%02dmm',str2,min(thickness),max(thickness));
+    desc_anat = sprintf('%sThickness%02dto%02dmm',desc_anat,min(thickness),max(thickness));
   end
 end
 
-if ~isempty(str2) & strcmp(str2(1),'_')
-  if length(str2)>1
-    str2 = str2(2:end);
-  else
-    str2 = '';
-  end
-end
-str = strrep([str1 '_' str2 '_'],'__','_');
-if strcmp(str(1),'_'), str = str(2:end); end
-if contains(name_out, '_T1w')
-  new_name = strrep(name_out,'_T1w',['_desc-' str 'T1w']);
-  new_name_label = strrep(name_out,'_T1w',['_desc-' str2  '_label-seg']);
-  new_name_bias = strrep(name_out,'_T1w',['_desc-' str2  '_RFfield']);
+% the simulated image is described by both groups of tags
+desc_main = bids_label([desc_acq desc_anat]);
+desc_anat = bids_label(desc_anat);
+
+% Without any option (no noise, no bias field, no contrast change and no
+% anatomical modification) the desc entity would be empty and the simulated
+% image could end up with the very name of the input image, so a minimal
+% label is used to always keep the two apart.
+if isempty(desc_main), desc_main = 'simu'; end
+
+% Entities of the input name without the T1w suffix. A desc entity of the
+% input is dropped, because desc must not occur twice and the new one
+% describes this simulation.
+if endsWith(name_out,'_T1w')
+  bids_prefix = regexprep(name_out(1:end-4),'_desc-[a-zA-Z0-9]+$','');
 else
-  new_name = [name_out '_desc-' str];
-  new_name_label = [name_out '_desc-' str2 '_label-seg'];
-  new_name_bias = [name_out '_desc-' str2 '_RFfield'];
+  % not a BIDS input, so the whole name is kept as a prefix and only the
+  % entities and the suffix added here can follow the specification
+  bids_prefix = name_out;
 end
 
-% Remove remaining string issues
-new_name_label = strrep(new_name_label,'desc-_','desc-');
-new_name_bias = strrep(new_name_bias,'desc-_','desc-');
+% res is a standard BIDS derivative entity and precedes desc. The voxel size
+% is given in mm with 'p' as decimal separator, because a BIDS label must be
+% alphanumeric (0.5mm -> res-0p5mm). Anisotropic voxels are listed per axis
+% instead of being averaged, which would both hide the anisotropy and report
+% a size that no axis actually has.
+if change_resolution
+  res_lab = arrayfun(@(x) bids_label(sprintf('%g',x)), simu.resolution(:)', ...
+                     'UniformOutput', false);
+  if all(abs(simu.resolution - simu.resolution(1)) < 1e-6)
+    ent_res = ['_res-' res_lab{1} 'mm'];
+  else
+    ent_res = ['_res-' strjoin(res_lab,'x') 'mm'];
+  end
+else
+  ent_res = '';
+end
+
+if isempty(desc_main), ent_main = ''; else, ent_main = ['_desc-' desc_main]; end
+if isempty(desc_anat), ent_anat = ''; else, ent_anat = ['_desc-' desc_anat]; end
+
+% there is no registered BIDS suffix for a bias field, so it is written as a
+% described variant of the T1w image
+if isempty(desc_anat)
+  ent_bias = '_desc-biasfield';
+else
+  ent_bias = ['_desc-' desc_anat 'Biasfield'];
+end
+
+new_name       = [bids_prefix ent_res ent_main '_T1w'];
+new_name_label = [bids_prefix ent_res ent_anat '_dseg'];
+new_name_bias  = [bids_prefix ent_res ent_bias '_T1w'];
 
 % write simulated image (optionally to derivatives folder)
 simu_name = fullfile(out_pth, [new_name '.nii']); simu_name_main = simu_name;
@@ -714,11 +777,13 @@ if is_gz
   spm_unlink(simu_name);
 end
 
-% write JSON sidecar with simulation parameters for both images
+% write JSON sidecar with simulation parameters
 try
+  % GeneratedBy only carries the tool itself; the input image is referenced
+  % with the top level Sources field, which BIDS expects to hold BIDS URIs
+  gen = struct();
   gen.Name = 'mri_simulate';
   gen.Version = tool_version;
-  gen.SourceDatasets = {sprintf('%s%s', name_out, ext)};
 
   if simu.snrWM > 0
     SNRval = simu.snrWM;
@@ -738,6 +803,7 @@ try
     thickStr = '';
   end
 
+  simpar = struct();
   if isfinite(NoiseFrac), simpar.NoiseFraction = NoiseFrac; end
   if isfinite(SNRval), simpar.SNR = SNRval; end
   if isfield(simu,'contrast') && ~isempty(simu.contrast) && simu.contrast ~= 1
@@ -764,6 +830,7 @@ try
 
   meta = struct();
   meta.GeneratedBy = {gen};
+  if ~isempty(source_uri), meta.Sources = {source_uri}; end
   meta.SimulationParameters = simpar;
 
   % write JSON next to main image using SPM's writer (handles NaN/null nicely)
@@ -780,6 +847,27 @@ Vres.fname = label_pve_name;
 Vres.pinfo = [1/255/3 0 352]';
 Vres.dt    = [4 0];
 spm_write_vol(Vres, labelres_pve);
+
+% sidecar for the label image: the dseg suffix normally implies integer
+% labels, so the partial volume encoding has to be documented here
+try
+  lmeta = struct();
+  lmeta.GeneratedBy = {gen};
+  if ~isempty(source_uri), lmeta.Sources = {source_uri}; end
+  lmeta.Manual = false;
+  lmeta.Description = ['Ground truth partial volume label image. Values are ' ...
+                       'continuous and interpolate between the tissue labels, ' ...
+                       'e.g. 2.5 is an equal mixture of GM and WM.'];
+  if simu.WMH
+    lmeta.Labels = struct('CSF',1,'GM',2,'WM',3,'WMH',4);
+  else
+    lmeta.Labels = struct('CSF',1,'GM',2,'WM',3);
+  end
+  spm_jsonwrite(regexprep(label_pve_name,'\.nii(\.gz)?$','.json'), lmeta);
+catch ME
+  fprintf('Warning: Failed to write label JSON sidecar: %s\n', ME.message);
+end
+
 if is_gz
   gzip(label_pve_name);
   spm_unlink(label_pve_name);
@@ -893,6 +981,54 @@ function mask = is_in_atlas(atlas, regions)
 
 atlas = round(atlas);
 mask = ismember(atlas, regions);
+
+%==========================================================================
+% function label = bids_label(str)
+%
+% Purpose
+%   Turn a tag into a valid BIDS entity label. BIDS only allows letters and
+%   digits inside an entity value, so that a label like 'thickness15mm-25mm'
+%   or 'con1.3' would make the filename invalid.
+%
+% Inputs
+%   str - char: arbitrary tag.
+%
+% Output
+%   label - char: str with decimal points replaced by 'p' (1.3 -> 1p3) and
+%           all remaining non-alphanumeric characters removed.
+%==========================================================================
+function label = bids_label(str)
+
+label = strrep(str, '.', 'p');
+label = regexprep(label, '[^a-zA-Z0-9]', '');
+
+%==========================================================================
+% function write_dataset_description(pipeline_dir, pipeline_name, tool_version)
+%
+% Purpose
+%   Write the dataset_description.json that BIDS requires at the root of a
+%   derivative dataset. Without it the derivatives folder is not a valid
+%   BIDS dataset. An existing file is never overwritten, so that a manually
+%   edited description survives.
+%
+% Inputs
+%   pipeline_dir  - char: root folder of the derivative pipeline.
+%   pipeline_name - char: name of the pipeline (used as dataset Name).
+%   tool_version  - char: version of mri_simulate.
+%==========================================================================
+function write_dataset_description(pipeline_dir, pipeline_name, tool_version)
+
+dd_name = fullfile(pipeline_dir, 'dataset_description.json');
+if exist(dd_name,'file'), return; end
+if ~exist(pipeline_dir,'dir'), mkdir(pipeline_dir); end
+
+dd = struct();
+dd.Name        = pipeline_name;
+dd.BIDSVersion = '1.8.0';
+dd.DatasetType = 'derivative';
+dd.GeneratedBy = {struct('Name','mri_simulate','Version',tool_version)};
+
+spm_jsonwrite(dd_name, dd);
 
 %==========================================================================
 % function [label, Yseg] = simulate_thickness(label, simu, Yseg, d, template_dir, idef_name, vx, Vref, order)
