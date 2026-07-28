@@ -113,6 +113,19 @@ function mri_simulate(simu, rf)
 %         parpool command if the Parallel Computing Toolbox is available and
 %         more than one image is given. It is limited to the number of images.
 %         Default: half of the available cores.
+%       - 'psf' (double): Width of the acquisition point spread function, as
+%         a FWHM in units of the OUTPUT voxel size. Image and ground truth
+%         label are smoothed with it before they are sampled onto the output
+%         grid, which models that a voxel integrates the tissue over its own
+%         extent instead of sampling it at a point. This is what creates the
+%         partial volume effect, also when the output resolution equals the
+%         working resolution, and it is at the same time the anti-alias
+%         filter for a coarser output resolution.
+%         Larger values give softer tissue borders. The kernel is symmetric,
+%         so tissue boundaries do not move and a simulated cortical thickness
+%         is preserved. Set 0 to disable, which gives hard borders and
+%         aliasing whenever the output resolution is the coarser one.
+%         Default: 1 (FWHM of one output voxel).
 %
 %   rf (struct): RF bias field parameters.
 %       - 'percent' (double): Amplitude of the bias field in percentage.
@@ -217,6 +230,7 @@ def.contrast   = 1;    % power-law contrast change exponent (1 = unchanged)
 def.derivative = 1;    % save outputs into BIDS derivatives
 def.closeWMHholes = 0; % don't close WMHs inside deep WM
 def.parpool = feature('numcores')/2; % use half of the available processors
+def.psf = 1; % width of the acquisition PSF in units of the output voxel size
 
 if nargin < 1, simu = def;
 else, simu = cat_io_checkinopt(simu, def); end
@@ -550,6 +564,57 @@ end
 if any(simu.thickness)
   [label_pve, Yseg] = simulate_thickness(label_pve, simu, Yseg, dim, ...
         template_dir, idef_name, vx, V, order);
+end
+
+%--------------------------------------------------------------------------
+% Point spread function of the acquisition.
+%
+% A scanner does not sample the tissue distribution point by point. The
+% signal of a voxel is the tissue distribution integrated over the voxel and
+% blurred by the point spread function of the imaging, and the two together
+% are what makes the partial volume effect wider than the tissue boundary
+% itself. It is modelled here by smoothing the tissue fractions with a kernel
+% that is tied to the OUTPUT voxel size, before the image is synthesized and
+% before the data are sampled onto the output grid.
+%
+% That single step covers two things:
+%   - it creates a partial volume effect even when no resampling takes place,
+%     i.e. when the output resolution equals the working resolution, where a
+%     hard tissue boundary would otherwise stay hard;
+%   - it is the anti-alias filter for the resampling further below.
+%     spm_slice_vol interpolates with a kernel defined on the input grid, so
+%     without a prefilter a coarser output resolution samples the volume
+%     below its Nyquist rate and aliases instead of averaging.
+%
+% The tissue fractions are smoothed one by one and the label is rebuilt from
+% them afterwards. Smoothing the combined label instead would average CSF (1)
+% and WM (3) to 2 wherever the two touch directly, i.e. along the ventricle
+% wall, and thereby invent a rim of grey matter in the ground truth.
+%
+% The kernel is symmetric and normalised, so it does not move a tissue
+% boundary: the 0.5 isolevels keep their positions and a simulated cortical
+% thickness is preserved.
+%--------------------------------------------------------------------------
+if simu.psf > 0
+  psf_fwhm = simu.psf * simu.resolution ./ vx;   % FWHM in working grid voxels
+
+  for k = 1:3
+    Yk = Yseg(:,:,:,k);
+    spm_smooth(Yk, Yk, psf_fwhm);
+    Yseg(:,:,:,k) = Yk;
+  end
+  if ~isempty(WMH), spm_smooth(WMH, WMH, psf_fwhm); end
+
+  % rebuild the ground truth label from the smoothed tissue fractions
+  label_pve = zeros(dim, 'single');
+  for k = 1:3
+    label_pve = label_pve + k*Yseg(:,:,:,order(k));
+  end
+  if simu.WMH
+    label_pve = label_pve + 5*WMH/simu.WMH.^0.75;
+    label_pve(label_pve > 4) = 4;
+  end
+  clear Yk;
 end
 
 Ysimu = synthesize_from_segmentation(Yseg, name, res, mn, dim, WMH);
@@ -1152,12 +1217,12 @@ label1 = cell(numel(simu.thickness),1);
 Yseg0 = Yseg(:,:,:,1:3);
 Yseg(:,:,:,1:3) = 0;
 
+% apply gray closing to strengthen thin WM structures
+label = cat_vol_morph(label,'gc',2);
+
 % vary range of PVE from -0.25..0.25 in 15 steps to get more realistic PVE
 % effects (optionally weighted)
 pve_range = linspace(-0.25,0.25,15);
-
-% apply gray closing to strengthen thin WM structures
-label = cat_vol_morph(label,'gc',2);
 
 for pve_step = 1:numel(pve_range)
   % label of this PVE step before the cortical band is built, used below to
