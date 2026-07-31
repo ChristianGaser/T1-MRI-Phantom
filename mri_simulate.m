@@ -27,7 +27,7 @@ function mri_simulate(simu, rf)
 %   - A constant cortical thickness (global or region-wise) is synthesized by
 %     expanding GM outward from the original WM using a Euclidean distance map.
 %   - To obtain partial-volume-like transitions, the label boundary is shifted
-%     across 20 sub-voxel offsets in the range [-0.25, 0.25] voxels, simulating
+%     across 15 sub-voxel offsets in the range [-0.25, 0.25] voxels, simulating
 %     realistic boundary uncertainty. Each offset yields a hard label image
 %     (CSF=1, GM=2, WM=3), and the results are averaged to produce a smooth
 %     PVE-like label map.
@@ -1173,7 +1173,7 @@ spm_jsonwrite(dd_name, dd);
 %      define region masks to apply three distinct thickness values (occipital,
 %      rest, frontal) when simu.thickness is a 3-vector.
 %   2) Boundary jittering (PVE simulation): To emulate partial volume effects,
-%      shift the label boundaries by 20 sub-voxel offsets uniformly spaced in
+%      shift the label boundaries by 15 sub-voxel offsets uniformly spaced in
 %      [-0.25, 0.25] voxels. For each offset:
 %        a. Threshold labels to obtain a hard WM mask and clean it with simple
 %           morphological steps.
@@ -1181,7 +1181,7 @@ spm_jsonwrite(dd_name, dd);
 %        c. Set CSF everywhere, then assign GM to voxels where D_WM <= thickness
 %           (per region), preserving WM where present.
 %        d. Convert the hard labels (1..3)
-%   3) Average the 20 accumulated volumes to form a smooth PVE-like segmentation
+%   3) Average the 15 accumulated volumes to form a smooth PVE-like segmentation
 %      and rebuild the final label image in [1..3] by weighted sum with class IDs.
 %
 % Notes
