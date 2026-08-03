@@ -1,6 +1,7 @@
 .DS_Store
 *.nii
 !rf100_?.nii
+!*TPM.nii
 *old.m
 *seg8.mat
 .refact
