@@ -11,7 +11,11 @@ function mri_simulate(simu, rf)
 %     • Gaussian noise specified as a percentage of the WM mean (simu.pn)
 %     • Rician magnitude noise at a target WM SNR (simu.snrWM>0)
 %   It supports simulations of atrophy or cortical thickness modifications.
-%   Preprocessing with SPM12 segmentation is required for custom images.
+%   Preprocessing with SPM12 segmentation is required for custom images. It
+%   runs automatically with the Blaiotta head and neck TPM and its batch job
+%   BlaiottaSegmentJob.m, both stored next to this file, and is cached in
+%   <name>_seg8.mat. An existing seg8.mat is reused as it is, thus delete it
+%   to segment data again that were segmented with another TPM.
 %   Requirements: SPM12 or SPM25 with CAT >= 26 installed (cat_main_LASsimple
 %   is required and is checked for at startup). No MATLAB toolboxes beyond
 %   base MATLAB are needed: distances use CAT's cat_bwdist (and cat_vbdist
@@ -27,10 +31,15 @@ function mri_simulate(simu, rf)
 %   - A constant cortical thickness (global or region-wise) is synthesized by
 %     expanding GM outward from the original WM using a Euclidean distance map.
 %   - To obtain partial-volume-like transitions, the label boundary is shifted
-%     across 20 sub-voxel offsets in the range [-0.25, 0.25] voxels, simulating
+%     across 15 sub-voxel offsets in the range [-0.25, 0.25] voxels, simulating
 %     realistic boundary uncertainty. Each offset yields a hard label image
 %     (CSF=1, GM=2, WM=3), and the results are averaged to produce a smooth
 %     PVE-like label map.
+%   - Deep inside the WM, i.e. at a safe distance from the GM/WM boundary, the
+%     original tissue fractions are blended back in. The hard labels alone
+%     would give a WM fraction of exactly 1 there and thus a perfectly flat
+%     WM, whereas the original fractions carry the local variation that the
+%     simulation without thickness manipulation shows.
 %   - The final PVE label map is then used to synthesize a T1 image from the
 %     SPM segmentation model by replacing GM/WM/CSF class posteriors and using
 %     their Gaussian mixture parameters (means, variances, weights).
@@ -40,14 +49,19 @@ function mri_simulate(simu, rf)
 %
 % Parameters:
 %   simu (struct): Simulation parameters. Defaults are applied for missing fields.
-%       - 'name' (char): T1-weighted input image filename. Default: '' (empty),
-%         which triggers an interactive file selection dialog (T1 only).
+%       - 'name' (char): T1-weighted input image filename, either .nii or
+%         .nii.gz. A compressed image is uncompressed next to the original
+%         before the segmentation is run, because SPM would otherwise name
+%         the segmentation parameters <name>.nii_seg8.mat, and the copy is
+%         removed again afterwards. The outputs of a compressed input are
+%         written compressed as well. Default: '' (empty), which triggers an
+%         interactive file selection dialog (T1 only).
 %       - 'pn' (double): Percentage noise level (Gaussian) relative to the WM
 %         mean intensity. Ignored if 'snrWM' > 0. Default: 0 (percent of WM).
 %       - 'snrWM' (double): If >0, adds Rician noise at a user-defined SNR for
 %         white matter. Uses the (noise-free) WM mean to compute the complex
 %         noise sigma via sigma = WMmean / snrWM, and generates magnitude
-%         Rician noise: sqrt((S + n1).^2 + n2.^2). Default: 30.
+%         Rician noise: sqrt((S + n1).^2 + n2.^2). Default: 40.
 %       - 'rng' (double, NaN or []): Seed for the random number generator.
 %         A fixed number gives the same noise for every image, which is useful
 %         to compare simulations but means that a whole dataset shares one
@@ -58,10 +72,11 @@ function mri_simulate(simu, rf)
 %         derivatives folder at the dataset root, using the pipeline name
 %         'mri_simulate-<version>' ('mri_simulate_thickness-<version>' for
 %         thickness simulations) and mirroring the subject/session path.
-%         Example: root/derivatives/mri_simulate-0.10.0/sub-*/ses-*/[anat|...]/
+%         Example: root/derivatives/mri_simulate-0.10.1/sub-*/ses-*/[anat|...]/
 %         Default: 1 (save into derivatives).
 %       - 'contrast' (double): Power-law contrast-change exponent applied to the
-%         simulated image intensities after noise. The image is normalized to
+%         simulated image intensities before the noise is added. It is
+%         normalized to
 %         [0,1], transformed as Y.^contrast, and rescaled back to its original
 %         min/max range. Use values >1 to increase contrast, <1 to reduce.
 %         Default: 1 (no change). Meaningful values to simulate contrast
@@ -151,11 +166,14 @@ function mri_simulate(simu, rf)
 %   Simulated MRI image files based on the specified parameters and features.
 %   Names follow the BIDS filename grammar, i.e. entity-value pairs followed
 %   by a suffix, where all option tags are collected in one alphanumeric
-%   desc label and the output resolution uses the res entity:
+%   desc label and the output resolution uses the res entity. <opts> covers
+%   every option, i.e. the noise, the bias field, the contrast and the
+%   anatomy, while <anatOpts> covers the anatomy alone, so that runs which
+%   differ only in noise or bias field share one ground truth:
 %     - Main simulated image:   <entities>[_res-<vx>mm]_desc-<opts>_T1w.nii
-%     - Ground-truth PVE label: <entities>[_res-<vx>mm][_desc-<opts>]_dseg.nii
+%     - Ground-truth PVE label: <entities>[_res-<vx>mm][_desc-<anatOpts>]_dseg.nii
 %     - Optional RF bias field (simulated fields only, rf.save=1):
-%                               <entities>[_res-<vx>mm]_desc-<opts>Biasfield_T1w.nii
+%                               <entities>[_res-<vx>mm]_desc-<anatOpts>Biasfield_T1w.nii
 %     - JSON sidecar next to the simulated image and the label image
 %   <vx> is the voxel size in mm with 'p' as decimal separator, e.g.
 %   res-0p5mm. Anisotropic voxels are listed per axis (res-0p5x0p5x1p5mm).
@@ -188,20 +206,20 @@ function mri_simulate(simu, rf)
 %
 %   Example 3 - Thickness simulation with 3 different thickness values using 
 %   original voxel size:
-%       simu = struct('name', 'colin27_t1_tal_hires.nii', 'snrWM', 30,...
+%       simu = struct('name', 'colin27_t1_tal_hires.nii', 'snrWM', 40,...
 %                     'resolution', NaN,...
 %                     'thickness', [1.5 2.0 2.5]);
 %       rf = struct('percent', 20, 'type', 'A');
 %       mri_simulate(simu, rf);
 %
 %   Example 4 - Simulation with custom RF field and added WMHs (medium strength)
-%       simu = struct('name', 'custom_t1.nii', 'snrWM', 30,...
+%       simu = struct('name', 'custom_t1.nii', 'snrWM', 40,...
 %                     'resolution', NaN, 'WMH', 2);
 %       rf = struct('percent', 15, 'type', [3, 42]);
 %       mri_simulate(simu, rf);
 %
 %   Example 5 - Apply contrast change (power-law, high contrast)
-%       simu = struct('name', 'colin27_t1_tal_hires.nii', 'snrWM', 30, ...
+%       simu = struct('name', 'colin27_t1_tal_hires.nii', 'snrWM', 40, ...
 %                     'resolution', NaN, 'contrast', 2);
 %       rf = struct('percent', 20, 'type', 'A');
 %       mri_simulate(simu, rf);
@@ -211,7 +229,7 @@ function mri_simulate(simu, rf)
 % TODO: simulation of motion artefacts using FFT and shift of phase information
 
 % named tool_version and not version to not shadow the MATLAB builtin version()
-tool_version = '0.10.0';
+tool_version = '0.10.1';
 
 if ~exist('cat_main_LASsimple','file')
   error('Please update to a newer version >=CAT26 to use mri_simulate')
@@ -225,12 +243,19 @@ def.WMH        = 0;
 def.atrophy    = [];
 def.thickness  = 0;
 def.rng        = 0;
-def.snrWM      = 30;
+def.snrWM      = 40;
 def.contrast   = 1;    % power-law contrast change exponent (1 = unchanged)
 def.derivative = 1;    % save outputs into BIDS derivatives
 def.closeWMHholes = 0; % don't close WMHs inside deep WM
 def.parpool = feature('numcores')/2; % use half of the available processors
 def.psf = 1; % width of the acquisition PSF in units of the output voxel size
+
+% An empty rng means the same as NaN here, i.e. seed from the filename. It has
+% to be translated before cat_io_checkinopt, which drops empty fields and would
+% thus silently replace it by the default seed.
+if nargin > 0 && isstruct(simu) && isfield(simu,'rng') && isempty(simu.rng)
+  simu.rng = NaN;
+end
 
 if nargin < 1, simu = def;
 else, simu = cat_io_checkinopt(simu, def); end
@@ -275,20 +300,57 @@ if ~exist(fullfile(pth, [name ext]), 'file')
   fprintf("File %s not found.\n", simu.name);
   return
 end
-if strcmp(ext,'.gz')
-  fname = gunzip(fullfile(pth, [name ext]));
-  simu.name = fname{1};
+
+% The interactive selection returns the frame number of the image, i.e.
+% 'sub-01_T1w.nii,1'. spm_fileparts splits it off above, thus rebuilding the
+% name from its parts removes it from everything that follows.
+simu.name = fullfile(pth, [name ext]);
+
+% Name of the input as it was given, thus still with .gz. It is only needed
+% for the BIDS URI of the source in the JSON sidecars, which has to name the
+% file of the dataset and not the uncompressed copy created below.
+source_name = [name ext];
+
+% Uncompress a gzipped input before anything else.
+%
+% SPM can read a .nii.gz, spm_vol uncompresses it into a temporary file, but
+% the segmentation must not run on it: SPM names the segmentation parameters
+% after the input file without its extension, so a compressed input is saved
+% as <name>.nii_seg8.mat, and the inverse deformation field and everything
+% else that is derived from the file name is malformed in the same way.
+% Everything below therefore works on an uncompressed copy, and the outputs
+% are compressed again at the end.
+%
+% An uncompressed file that is already there is used as it is and is never
+% overwritten. It can be the file of the user and not a leftover of a former
+% run, and gunzip would replace it without a word.
+is_gz = strcmpi(ext,'.gz');   % spm_vol accepts .GZ as well, thus so do we
+if is_gz
+  nii_name = fullfile(pth, name);   % name still carries the .nii of a .nii.gz
+  if exist(nii_name,'file')
+    fprintf('Uncompressed %s exists already and is used as it is.\n', nii_name);
+    simu.name = nii_name;
+  else
+    fname = gunzip(fullfile(pth, [name ext]));
+    simu.name = fname{1};
+
+    % Only a copy that was created here may be removed again. That has to
+    % happen on every way out of the function, including the parameter checks
+    % below that return early and an error inside the simulation, thus it is
+    % left to onCleanup instead of to the cleanup at the end.
+    gz_temp = simu.name;
+    cleanup_gz = onCleanup(@() spm_unlink(gz_temp));
+  end
   [pth, name, ext] = spm_fileparts(simu.name);
-  is_gz = 1;
-else
-  is_gz = 0;
 end
 
 % keep output names clean if a temporary resample suffix is present
 name_out = regexprep(name,'_thicknessRes05$','');
 
-% if simu.rng is not defined we use the filename to create a seed
-if isempty(simu.rng) | isnan(simu.rng)
+% If simu.rng is not defined we use the filename to create a seed. The test
+% has to short-circuit: for an empty rng, 'isempty(x) | isnan(x)' is the empty
+% array and not true, because isnan([]) is empty, and 'if []' does not run.
+if isempty(simu.rng) || isnan(simu.rng)
   simu.rng = sum(double(name));
 end
 
@@ -316,7 +378,7 @@ if isfield(simu,'derivative') && simu.derivative
       out_pth = fullfile(pipeline_dir, rel_parts{:});
       % BIDS URI of the source image relative to the raw dataset root, which
       % always uses '/' as separator independent of the platform
-      source_uri = ['bids::' strjoin([rel_parts, {[name ext]}], '/')];
+      source_uri = ['bids::' strjoin([rel_parts, {source_name}], '/')];
     else
       % Fallback: place outputs under derivatives without mirroring
       root_dir = fileparts(pth);
@@ -341,14 +403,36 @@ mat_name = fullfile(pth, [name '_seg8.mat']);
 % CAT12 template dir is later used for defining atrophy atlas
 template_dir = fullfile(spm('dir'),'toolbox','CAT','templates_MNI152NLin2009cAsym');
 
-% call SPM segmentation if necessary and only save the seg8.mat file
+% Call SPM segmentation if necessary and only keep the seg8.mat file.
+%
+% The segmentation uses the Blaiotta head and neck TPM and the batch job that
+% belongs to it, both stored next to this file. That TPM is considerably more
+% reliable than the SPM default one. The job is taken as it is instead of
+% being rebuilt here, because it carries the settings of the validation work
+% of the paper describing the TPM, and in particular the number of Gaussians
+% per tissue, which describes that TPM and not an arbitrary one.
 if ~exist(mat_name,'file')
+  job_name = fullfile(pth_root,'BlaiottaSegmentJob.m');
+  if ~exist(job_name,'file')
+    error('Segmentation job %s was not found.', job_name);
+  end
+  matlabbatch = load_batch_job(job_name);
+
   matlabbatch{1}.spm.spatial.preproc.channel.vols = {simu.name};
+
+  % The job defines the TPM itself, and a missing one would otherwise only
+  % show up as an error of spm_vol deep inside the segmentation.
+  tpm_name = spm_file(matlabbatch{1}.spm.spatial.preproc.tissue(1).tpm{1},'number','');
+  if ~exist(tpm_name,'file')
+    error('TPM %s used by %s was not found.', tpm_name, job_name);
+  end
+
+  n_tissue = numel(matlabbatch{1}.spm.spatial.preproc.tissue);
   spm_jobman('run',matlabbatch);
   clear matlabbatch
 
-  % remove native segmentations that were saved
-  for i=1:5
+  % remove native segmentations in case the job was changed to write them
+  for i=1:n_tissue
     spm_unlink(fullfile(pth,['c' num2str(i) name ext]));
   end
 end
@@ -408,13 +492,33 @@ if size(res.mn,1) > 1
   fprintf('Multi-modal segmentation is not recommended! Try again to segment the image using T1w data only.\n');
 end
 
-% get means for GM/WM/CSF
+% Intensities of GM/WM/CSF from the Gaussian mixture of the segmentation.
+%
+% GM and WM use the mixing weighted mean over all their Gaussians. CSF must
+% not: the segmentation models CSF with two Gaussians, and only the darker one
+% describes CSF, while the brighter one quite often covers GM. Their weighted
+% mean is therefore far too bright, and because this value is both the CSF
+% intensity of the synthesis and the low anchor of the LAS correction and the
+% skull stripping (see get_tissue_thresholds), it destabilizes the whole CSF
+% segmentation. Only the darkest CSF Gaussian is used instead, which for a
+% single Gaussian is the class mean and thus leaves that case unchanged.
+csf_cls = 3;   % SPM class order, i.e. 1 = GM, 2 = WM, 3 = CSF
 mn = zeros(3,1);
 for k=1:3
   ind = find(res.lkp==k);
-  for j=1:numel(ind)
-    mn(k) = mn(k) + res.mg(ind(j))*res.mn(1,ind(j));
-  end  
+  if k == csf_cls
+    mn(k) = min(res.mn(1,ind));
+  else
+    mg_k  = reshape(res.mg(ind),1,[]);   % row, whatever orientation mg has
+    mn(k) = sum(mg_k .* res.mn(1,ind));
+  end
+end
+
+if sum(res.lkp==csf_cls) < 2
+  fprintf(['Warning: the segmentation describes CSF by a single Gaussian, thus the ' ...
+           'darker CSF peak cannot be separated from the brighter one that often covers ' ...
+           'GM.\n  Delete %s and run again to segment with %s, which uses two ' ...
+           'Gaussians for CSF.\n'], mat_name, fullfile(pth_root,'BlaiottaSegmentJob.m'));
 end
 
 % check that it's indeed T1w data by checking CSF < GM < WM
@@ -448,7 +552,7 @@ resampled_name = '';
 [Ysrc, Ycls, Yy] = cat_spm_preproc_write8(res,zeros(max(res.lkp),4),zeros(2,2),[1 0],0,2);
 
 % get tissue thresholds for CSF/GM/WM (see get_tissue_thresholds for details)
-T3th = get_tissue_thresholds(Ysrc, Ycls, res);
+T3th = get_tissue_thresholds(Ysrc, Ycls, mn);
 
 % LAS correction and SANLM denoising
 Ycorr = cat_main_LASsimple(Ysrc, Ycls, T3th);
@@ -962,12 +1066,11 @@ if rf.save
   end
 end
 
-% remove temporary files
+% Remove temporary files. The uncompressed copy of a gzipped input is not
+% among them, it is removed by its onCleanup above, which also covers the ways
+% out of the function that never arrive here.
 if ~isempty(idef_name_orig) && exist(idef_name_orig,'file')
   spm_unlink(idef_name_orig);
-end
-if is_gz
-  spm_unlink(simu.name);
 end
 if thickness_resampled && exist(resampled_name,'file')
   spm_unlink(resampled_name);
@@ -1048,10 +1151,11 @@ function Vtpm = find_missing_tpm(Vtpm)
 
 if isempty(Vtpm) || ~isstruct(Vtpm) || ~isfield(Vtpm,'fname'), return; end
 
-% search order: the tpm folder of SPM, then the CAT templates
+% search order: the tpm folder of SPM, then the CAT templates, finally
+% mri_simulate folder
 tpm_dirs = { fullfile(spm('dir'),'tpm'), ...
-             fullfile(spm('dir'),'toolbox','CAT','templates_MNI152NLin2009cAsym') };
-
+             fullfile(spm('dir'),'toolbox','CAT','templates_MNI152NLin2009cAsym'), ...;
+             spm_fileparts(which('mri_simulate')) };
 resolved = struct('old',{},'new',{});   % cache, all entries share one file
 
 for i = 1:numel(Vtpm)
@@ -1085,6 +1189,25 @@ for i = 1:numel(Vtpm)
     fprintf('Warning: could not read %s: %s\n', newfile, ME.message);
   end
 end
+
+%==========================================================================
+% function matlabbatch = load_batch_job(job_name)
+%
+% Purpose
+%   Return the batch job that a job script defines. The script is executed in
+%   the workspace of this function and not in the one of the caller, thus the
+%   variables it needs besides matlabbatch cannot collide with anything there.
+%
+% Inputs
+%   job_name - char: filename of the batch job script.
+%
+% Output
+%   matlabbatch - cell: the batch job that the script defines.
+%==========================================================================
+function matlabbatch = load_batch_job(job_name)
+
+matlabbatch = {};
+run(job_name);
 
 %==========================================================================
 % function label = bids_label(str)
@@ -1173,7 +1296,7 @@ spm_jsonwrite(dd_name, dd);
 %      define region masks to apply three distinct thickness values (occipital,
 %      rest, frontal) when simu.thickness is a 3-vector.
 %   2) Boundary jittering (PVE simulation): To emulate partial volume effects,
-%      shift the label boundaries by 20 sub-voxel offsets uniformly spaced in
+%      shift the label boundaries by 15 sub-voxel offsets uniformly spaced in
 %      [-0.25, 0.25] voxels. For each offset:
 %        a. Threshold labels to obtain a hard WM mask and clean it with simple
 %           morphological steps.
@@ -1181,8 +1304,13 @@ spm_jsonwrite(dd_name, dd);
 %        c. Set CSF everywhere, then assign GM to voxels where D_WM <= thickness
 %           (per region), preserving WM where present.
 %        d. Convert the hard labels (1..3)
-%   3) Average the 20 accumulated volumes to form a smooth PVE-like segmentation
+%   3) Average the 15 accumulated volumes to form a smooth PVE-like segmentation
 %      and rebuild the final label image in [1..3] by weighted sum with class IDs.
+%   4) Blend the original tissue fractions back in, both inside the excluded
+%      structures and inside the WM interior. The latter restores the local
+%      fluctuations of the original segmentation that the hard labels and the
+%      grey closing removed, and thus the intensity texture of the WM, without
+%      touching the GM/WM boundary that defines the simulated thickness.
 %
 % Notes
 %   - Class encoding: CSF=1, GM=2, WM=3 throughout.
@@ -1364,11 +1492,61 @@ for pve_step = 1:numel(pve_range)
   end
 end
 
+% restore the original tissue fractions inside the excluded structures
+for k = 1:3
+  Yseg(:,:,:,order(k)) = Yseg(:,:,:,order(k)).*(1-mask_soft) + Yseg0(:,:,:,order(k)).*mask_soft;
+end
+
+% Restore the original tissue fractions deep inside the WM.
+%
+% Everything above works on hard labels, and the grey closing that repairs
+% thin WM structures also fills every small hole in the WM. Those holes are
+% exactly the local GM fractions of the original segmentation, and in a
+% simulation without thickness manipulation they are what makes the WM look
+% like tissue: the synthesis turns a WM fraction of 0.95 into an intensity
+% between the WM and the GM mean, so the small fluctuations of the original
+% segmentation carry over into the image. After the closing and the averaging
+% over the PVE steps the WM fraction is exactly 1 everywhere in the interior,
+% and the synthesized WM is therefore perfectly flat.
+%
+% Blending the original fractions back in for the WM interior restores that
+% texture, and because the intensity is a function of the fractions alone
+% (see synthesize_from_segmentation) the result is identical to the intensity
+% of the untouched simulation there.
+%
+% The restore has to stay away from the GM/WM boundary, otherwise it would
+% move the boundary and change the simulated thickness. Two things keep it
+% away: the core is eroded by wm_core_dist, and the weight is smoothed with
+% the same width as the border blend above, so it has decayed to zero well
+% before the boundary is reached. The erosion also excludes the gyral WM
+% blades, which are too thin to hold a core at all.
+wm_core_dist = 2;  % distance to the WM surface that is left untouched, in mm
+
+Ywm = Yseg(:,:,:,order(3));
+wm_soft = single(cat_vol_morph(Ywm > 0.99,'de',wm_core_dist,vx));
+spm_smooth(wm_soft, wm_soft, border_fwhm./vx);
+wm_soft = min(max(wm_soft,0),1);
+
+% Limit the restored deviation so that the ground truth stays WM, i.e. the
+% blended WM fraction cannot drop below 0.5 and the label cannot drop below
+% 2.5. Without this, a hypointense lesion of the original segmentation would
+% reappear as an island of GM in the middle of the WM of the ground truth,
+% which is not what a phantom with a defined cortical thickness should carry.
+% The cap is a per-voxel weight and not a clamp of the fractions, so the three
+% classes still sum to one. It leaves the ordinary fluctuations untouched,
+% they are an order of magnitude smaller than the 0.5 it allows.
+wm_soft = wm_soft .* min(1, max(Ywm - 0.5,0) ./ ...
+                            max(Ywm - Yseg0(:,:,:,order(3)), eps('single')));
+clear Ywm
+
+for k = 1:3
+  Yseg(:,:,:,order(k)) = Yseg(:,:,:,order(k)).*(1-wm_soft) + Yseg0(:,:,:,order(k)).*wm_soft;
+end
+
 % update ground truth label
 label = zeros(d, 'single');
 
 for k = 1:3
-  Yseg(:,:,:,order(k)) = Yseg(:,:,:,order(k)).*(1-mask_soft) + Yseg0(:,:,:,order(k)).*mask_soft;
   label = label + k*Yseg(:,:,:,order(k));
 end
 
@@ -1913,8 +2091,9 @@ res.mn(1,K) = intensity_WMH;
 % Inputs
 %   Ysrc - single(dims): Source image used for threshold estimation (same space
 %          as SPM/CAT outputs from preproc). Typically the first channel.
-%   Ycls - 1x6 cell of uint8(dims): Tissue class posteriors (0..255) from
-%          cat_spm_preproc_write8, in SPM/CAT convention (c1..c6).
+%   Ycls - cell of uint8(dims): Tissue class posteriors (0..255) from
+%          cat_spm_preproc_write8, one per tissue of the TPM and in SPM/CAT
+%          convention, i.e. GM, WM, CSF, head tissues, background.
 %   res  - struct: SPM/CAT segmentation result with fields used here:
 %              .mn  (means per class/component)
 %              .mg  (mixture weights)
@@ -1943,9 +2122,13 @@ res.mn(1,K) = intensity_WMH;
 %==========================================================================
 function Yb = skull_strip_APRG(Ysrc, Ycls, res, dim, T3th)
 
-% we need a 4D array for cat_main_APRG
-P = zeros([dim 6],'uint8');
-for i=1:6
+% We need a 4D array for cat_main_APRG. All classes of the TPM are passed and
+% not only the first six of the SPM default one: cat_main_APRG uses the last
+% class as background and everything from the fourth on as head tissue, so
+% dropping the last classes of a TPM with more tissues (the Blaiotta TPM has
+% seven) would hand it soft tissue in the place of the background.
+P = zeros([dim numel(Ycls)],'uint8');
+for i=1:numel(Ycls)
   P(:,:,:,i) = Ycls{i};
 end
 
@@ -1964,7 +2147,8 @@ function Yseg = close_WM_GM_holes(Yseg, Ysrc, Ycorr, Ycls, Yy, res, vx_vol)
 %            the SPM class order, derived from LAS-corrected intensities.
 %   Ysrc   - single(dims): source image passed on to cat_main_updateSPM1639.
 %   Ycorr  - single(dims): LAS-corrected image used by cat_vol_partvol.
-%   Ycls   - 1x6 cell of uint8(dims): SPM tissue posteriors (0..255).
+%   Ycls   - cell of uint8(dims): SPM tissue posteriors (0..255), one per
+%            tissue of the TPM.
 %   Yy     - deformation field to the TPM, required by the CAT functions.
 %   res    - segmentation structure from SPM segmentation.
 %   vx_vol - voxel size in mm
@@ -2006,9 +2190,9 @@ job.extopts.uhrlim = max(1.0, max(vx_vol));
 P = zeros([size(Ycls{1}) numel(Ycls)],'uint8');
 for i=1:numel(Ycls), P(:,:,:,i) = Ycls{i}; end
 clear Ycls;
-tpm.dat = cell(6,1);
+tpm.dat = cell(numel(res.tpm),1);
 tpm.V = res.tpm;
-for i=1:6
+for i=1:numel(res.tpm)
   tpm.dat{i} = spm_read_vols(res.tpm(i));
 end
 noise = 0.03;
@@ -2037,9 +2221,14 @@ Ynwmh_r = cat_vol_morph(cat_vol_morph( Ynwmh_r>0.5, 'dd', 8, vx_r), 'dc', 12, vx
           ~cat_vol_morph( Yvt_r>0.5, 'dd', 4, vx_r);
 Ynwmh = cat_vol_resize(single(Ynwmh_r), 'dereduceV', resTr) > 0.5;
 
-% the WMH class of cat_vol_partvol is only present when WMH correction ran
+% The WMH class of cat_vol_partvol is only present when WMH correction ran.
+%
+% It is written to Ycls{7}, which for a TPM with seven tissues (the Blaiotta
+% TPM) is also the index of the background class of the segmentation. Both are
+% told apart by the brain mask, because WMHs lie inside the brain and the
+% background does not.
 if numel(Ycls) >= 7 && ~isempty(Ycls{7})
-  Ywmh = Ycls{7}>0 & ~Ynwmh;
+  Ywmh = Ycls{7}>0 & ~Ynwmh & Yb>0.5;
 else
   Ywmh = false(size(Ynwmh));
 end
@@ -2062,7 +2251,7 @@ end
 
 
 
-function T3th = get_tissue_thresholds(Ysrc, Ycls, res)
+function T3th = get_tissue_thresholds(Ysrc, Ycls, mn)
 % GET_TISSUE_THRESHOLDS - Estimate robust CSF/GM/WM thresholds
 %
 % Purpose
@@ -2072,45 +2261,45 @@ function T3th = get_tissue_thresholds(Ysrc, Ycls, res)
 %       away from WM (2*GMmean - WMth), clipped so that it never exceeds the
 %       CSF mean. This puts it below the GM mean and adapts to the current
 %       image contrast. For inverted contrast (CSF > WM) the CSF mean is used.
-%     - GMth: the weighted GM mean from the GMM (clsint(1)).
-%     - WMth: a robust white-matter anchor derived from the weighted WM mean
-%       (from the GMM) and the median intensity within high WM posterior
+%     - GMth: the GM intensity of the mixture model (mn(1)).
+%     - WMth: a robust white-matter anchor derived from the WM intensity of
+%       the mixture model and the median intensity within high WM posterior
 %       voxels to mitigate WMH effects.
 %
 % Inputs
 %   Ysrc - single(dims): Source image used to compute medians within WM.
-%   Ycls - 1x6 cell of uint8(dims): SPM/CAT posteriors (0..255), where
-%          Ycls{2} corresponds to WM.
-%   res  - struct: SPM/CAT segmentation result providing Gaussian mixture
-%          parameters mn, mg, and lookup lkp.
+%   Ycls - cell of uint8(dims): SPM/CAT posteriors (0..255), one per tissue of
+%          the TPM, where Ycls{2} corresponds to WM.
+%   mn   - 3x1 double: intensities of the tissues in SPM class order, i.e.
+%          [GM WM CSF], as estimated by the caller from the Gaussian mixture
+%          of the segmentation. They are passed and not derived here, because
+%          the CSF entry is not the class mean but the darkest CSF Gaussian
+%          and both users of the intensities have to see the same value.
 %
 % Output
 %   T3th - 1x3 double: [CMth, GMth, WMth] anchors used by skull stripping
 %          and LAS normalization routines.
 %
 % Algorithm
-%   1) clsint(k): weighted class mean from the GMM for class k.
-%   2) WMth: max(clsint(WM), median(Ysrc within high WM posterior)).
-%   3) CMth: if intensities are inverted (CSF > WM), use the CSF anchor;
+%   1) WMth: max(mn(WM), median(Ysrc within high WM posterior)).
+%   2) CMth: if intensities are inverted (CSF > WM), use the CSF anchor;
 %      otherwise use 2*GMmean - WMth, clipped not to exceed the CSF anchor.
-%   4) Return [CMth, GMmean, WMth].
+%   3) Return [CMth, GMmean, WMth].
 %
 % Notes
-%   - Class indices follow SPM/CAT convention (1=GM, 2=WM, 3=CSF), so clsint(1)
-%     is GM and clsint(3) is CSF.
+%   - Class indices follow SPM/CAT convention (1=GM, 2=WM, 3=CSF), so mn(1)
+%     is GM and mn(3) is CSF.
 %   - High WM posterior is defined with a conservative threshold (Ycls{2}>192
 %     on 0..255 scale) to obtain a stable median.
 %   - These anchors are designed for T1-like contrast but include a simple
 %     inversion check (CSF > WM) for robustness.
 
-clsint = @(x) round( sum(res.mn(res.lkp==x) .* res.mg(res.lkp==x)') * 10^5)/10^5;
-
 % Use median for WM threshold estimation to avoid problems in case of WMHs
-WMth = double(max(clsint(2), cat_stat_nanmedian(Ysrc(Ycls{2}>192)))); 
-if clsint(3)>clsint(2) % invers
-  CMth = clsint(3); 
+WMth = double(max(mn(2), cat_stat_nanmedian(Ysrc(Ycls{2}>192))));
+if mn(3)>mn(2) % invers
+  CMth = mn(3);
 else
-  CMth = min([clsint(1) - diff([clsint(1),WMth]), clsint(3)]);
+  CMth = min([mn(1) - diff([mn(1),WMth]), mn(3)]);
 end
 
-T3th = double([CMth, clsint(1), WMth]);
+T3th = double([CMth, mn(1), WMth]);
