@@ -554,6 +554,9 @@ resampled_name = '';
 % get tissue thresholds for CSF/GM/WM (see get_tissue_thresholds for details)
 T3th = get_tissue_thresholds(Ysrc, Ycls, mn);
 
+% slightly correct CSF-threshold since it's often underestimated
+T3th(1) = 1.1*T3th(1);
+
 % LAS correction and SANLM denoising
 Ycorr = cat_main_LASsimple(Ysrc, Ycls, T3th);
 cat_sanlm(Ycorr,3,1);
@@ -574,6 +577,13 @@ seg_order = [2 3 1];
 for i = 1:3
     Yseg(:,:,:,i) = Yp0toC(3*Ycorr, seg_order(i)); 
 end
+
+% ensure that sum of Yseg is 1
+Ysum = sum(Yseg,4)+eps;
+for i = 1:3
+    Yseg(:,:,:,i) = Yseg(:,:,:,i)./Ysum; 
+end
+clear Ysum
 
 % optionally close WMHs within deep WM using CAT12 approach
 if isfield(simu,'closeWMHholes') && simu.closeWMHholes
@@ -704,7 +714,7 @@ end
 % boundary: the 0.5 isolevels keep their positions and a simulated cortical
 % thickness is preserved.
 %--------------------------------------------------------------------------
-if simu.psf > 0
+if simu.psf > 0 && any(simu.thickness) % only apply PSF to thickness data
   psf_fwhm = simu.psf * simu.resolution ./ vx;   % FWHM in working grid voxels
 
   for k = 1:3
