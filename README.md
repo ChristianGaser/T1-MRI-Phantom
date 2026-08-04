@@ -10,7 +10,6 @@ Simulates T1-weighted MR images with optional atrophy, cortical thickness contro
 - Locally normalize tissue intensities with CAT12 Local Adaptive Segmentation (LAS), denoise with SANLM and skull-strip with CAT's adaptive probability region-growing (APRG), then scale CSF/GM/WM to canonical values (1/2/3) to obtain a PVE-like label image.
 - Optionally close WM holes to remove native WMHs before adding synthetic lesions.
 - Insert user-defined anatomical changes: atlas-based atrophy (e.g., Hammers) and probabilistic WMHs.
-- Smooth the tissue fractions with the acquisition point spread function (`psf`), which creates the partial volume effect and acts as the anti-alias filter of the resampling.
 - Synthesize a new T1w as the probability-weighted mixture of the tissue means (estimated from the SPM Gaussian mixture) using the modified PVE labels and the optional WMH class as weights; everything that is not brain keeps the intensity of the bias-corrected input, and the two blend continuously at the brain boundary. Optionally modulate with RF bias fields, apply a contrast change and add Rician or Gaussian noise.
 - Outputs follow BIDS-like naming with JSON sidecars capturing all simulation parameters.
 
@@ -54,7 +53,6 @@ WMH | Strength of white matter hyperintensities. `0`=off; `1`=mild; `2`=medium; 
 atrophy | Atrophy specification: `{atlasName, roiIds[], factors[]}`; factors >1 increase CSF (reduce GM) within ROIs. Either thickness or atrophy can be simulated. (Default: `[]`)
 thickness | Cortical thickness in mm. Scalar = global; 3-vector = `[occipital rest frontal]` using neuromorphometrics atlas masks. The volume is internally resampled to 0.5 mm and written back at the requested resolution. The non-cortical structures of the atlas (subcortical grey matter, cerebellum, brainstem, hippocampus, vessels, basal forebrain) keep their original labels, and no cortical band is grown around them or around the ventricles. Either thickness or atrophy can be simulated. (Default: `0`)
 closeWMHholes | Detect and fill existing WMHs in WM so that the simulated image starts from a clean WM, which allows synthetic WMHs to be added via `WMH`. Costs minutes, since it runs CAT's WMH detection. (Default: `0`)
-psf | FWHM of the acquisition point spread function, in units of the **output** voxel size. The tissue fractions, the WMH map and the ground-truth label are smoothed with it before synthesis and before resampling, which creates the partial volume effect even when no resampling takes place and acts as the anti-alias filter for a coarser output grid. The kernel is symmetric and normalized, so tissue boundaries and a simulated cortical thickness keep their position. `0` disables it. (Default: `1`)
 parpool | Number of workers used when several input images are given and the Parallel Computing Toolbox is available; limited to the number of images. (Default: half the available cores)
 
 ### rf: RF bias field parameters (struct)
@@ -71,7 +69,7 @@ If `simu` and/or `rf` are omitted or partially specified, missing fields are fil
 ```matlab
 simu = struct('name', '', 'snrWM', 40, 'pn', 0, 'contrast', 1, ...
               'resolution', NaN, 'WMH', 0, 'atrophy', [], 'thickness', 0, ...
-              'rng', 0, 'derivative', 1, 'closeWMHholes', 0, 'psf', 1, ...
+              'rng', 0, 'derivative', 1, 'closeWMHholes', 0, ...
               'parpool', feature('numcores')/2);
 rf   = struct('percent', 30, 'type', [2 0], 'save', 0);
 ```

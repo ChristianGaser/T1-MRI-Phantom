@@ -29,8 +29,6 @@ Apply Modifications (optional):
   • Thickness (create uniform cortical thickness)
   • WMH (white matter hyperintensities)
       ↓
-Smooth tissue fractions with the acquisition PSF (`psf`)
-      ↓
 Synthesize new T1w image from modified tissues
       ↓
 Add RF bias field (optional; predefined A/B/C or simulated)
@@ -121,7 +119,6 @@ mri_simulate(simu, rf);
 | `rng` | Random seed; a fixed number gives every image the same noise | 0 (default), or `NaN`/`[]` to seed from the filename |
 | `derivative` | Save into BIDS `derivatives/mri_simulate-*` | 0/1 (default 1) |
 | `closeWMHholes` | Close WMH holes in deep WM (costs minutes) | 0/1 (default 0) |
-| `psf` | FWHM of the acquisition PSF in units of the output voxel, i.e. the partial volume / anti-alias filter | 0 (off) to ~1.5 (default 1) |
 | `parpool` | Workers used when several input images are given | default half the cores |
 
 ### RF Bias Field Options (rf)
