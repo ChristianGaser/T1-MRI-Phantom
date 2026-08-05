@@ -1,5 +1,5 @@
 .DS_Store
-*.nii
+*.nii*
 !rf100_?.nii
 !*TPM.nii
 *old.m
