@@ -127,15 +127,45 @@ A pose that is piecewise constant with a handful of steps gives a handful of dis
 
 It enters as a translation only. A translation is free in k-space (a phase ramp), while a rotation needs the volume resampled once more, and the assembly is grouped so that one resampling serves all the blocks sharing a rotation. The runtime therefore follows the number of *events*, not the number of blocks: measured on a 1 mm volume, a rotation resampling costs 2.9 s, so ~11 distinct rotations are ~30 s whether or not every block has its own translation. Giving the continuous component its own rotations would have made it 32 resamplings, i.e. ~90 s at 1 mm and ~12 min at 0.5 mm.
 
-## Gibbs ringing
+## Ringing
 
-`simu.ringing` is a separate artefact and can be combined with `motion`. It is the ripple that every finite acquisition matrix produces along a sharp edge, and it is simulated the way it arises: keep only the central `0.95 - 0.1*ringing` of k-space along each axis and reconstruct on the same grid. That both adds the ripples and blurs slightly, and it overshoots a step edge by about 9%, as a rect window should.
+`simu.ringing` is a separate artefact and can be combined with `motion`. There are **two types**, which are different artefacts and not two settings of one.
 
-Ringing | k-space kept
---------|-------------
-1 | 0.85
-2 | 0.75
-3 | 0.65
+Field | Meaning (Default)
+------|------------------
+strength | `0`=off, `1`/`2`/`3` = mild/moderate/severe, any positive value allowed
+type | `'notch'` (default) or `'gibbs'`
+pe | Axis the ringing runs along: `1`,`2`,`3`, `'x'`/`'y'`/`'z'`, or `'all'` (`'y'`)
+k0 | Band centre for `notch`, in units of the Nyquist frequency (`0.6`, where mriaug puts it)
+
+### `notch` — the pronounced regular ripples
+
+Damps or inverts a narrow band of k-space at `|k| = k0`; the gain inside the band is `1 - strength`, so the band is removed at strength 1 and inverted above it. Narrow in k-space means far-reaching in the image, so a single spatial frequency is laid over the whole image and shows as the strong regular ripple pattern that reads as ringing at first sight — **without** the blurring that truncation brings.
+
+This is what [mriaug](https://github.com/codingfisch/mriaug)'s `ringing3d` does, and it is what to use when the *appearance* of ringing is the goal. It is not what a scanner does: no acquisition removes an isolated band of frequencies.
+
+With `pe` set to a single axis the band is a flat slab, which gives directional stripes. With `'all'` it is a spherical shell, which gives concentric rings around edges.
+
+Implementation note: mriaug builds its band on uncentred array-index coordinates applied to unshifted k-space, so the band lands on one side of k-space only (at about `0.6` Nyquist), and its `torch.fft.irfftn` call then re-symmetrises the result. The version here uses a properly centred, symmetric band at the same `|k|`, which is real by construction. Checked side by side on a 1 mm T1, the two are visually indistinguishable and differ by 0.063 vs 0.058 relative difference at equal depth.
+
+### `gibbs` — the physical one
+
+The ripple that a finite acquisition matrix really produces: keep only the central part of k-space and reconstruct on the same grid. It overshoots a step edge by about 9%, as a rect window should.
+
+Strength | k-space kept | ripple period
+---------|--------------|--------------
+1 | 0.55 | ~3.6 voxels
+2 | 0.40 | ~4.9 voxels
+3 | 0.25 | ~8 voxels
+
+Two properties are worth knowing, and both were got wrong in the first version of this option:
+
+- **The overshoot is ~9% whatever the fraction is** — that is the Gibbs constant. Only the *period* of the ripples changes, roughly as `2/fraction` voxels. Above a fraction of about 0.6 the period is two to three voxels, which is the scale of the image texture, so it reads as noise and the only visible effect is the blur. Blurring and ringing cannot be separated here: they are two sides of the same truncation, and buying visible ripples always costs resolution. That is exactly why `notch` exists as a separate type.
+- **Only the phase-encoding axis is truncated by default.** That is the axis whose matrix an acquisition actually shortens while the readout is oversampled, and it is why clinical Gibbs ringing appears as bands along one direction. Truncating all three axes equally is an isotropic softening and reads as smoothing, not ringing.
+
+### Both types
+
+The `desc` tag keeps them apart (`Ringing2` for the notch, `Ringing2Gibbs`), so runs of the two types cannot overwrite each other.
 
 **Gibbs ringing and motion ringing are two different things.** Motion ringing comes from the mismatch between k-space lines acquired at different times; Gibbs ringing from k-space ending at a finite frequency. Only the latter is in every image whether the head moved or not. When both are requested they share one k-space: the truncation is applied to the k-space the motion assembled, before the magnitude image is reconstructed, which is the order a scanner produces them in — and that is measurably not the same as applying one after the other.
 
@@ -150,9 +180,9 @@ return modify_k_space(x, gain=1 - intensity, offset=offset)   # k*gain + offset
 
 i.e. `K = (1-α)·FFT(x) + α·FFT(shift(x))`. That gain and offset are uniform over all of k-space, so by linearity it equals `(1-α)·x + α·shift(x)` — a plain alpha blend of the image with a translated copy. Checked numerically on a 1 mm T1, the two agree to `6.7e-16`, i.e. the FFT round-trip does nothing. There is no k-space segmentation, hence no discontinuity and no ringing: of the residual energy only 11% lies in the outer half of k-space, against 48% for the block model here. Visually it is a double exposure rather than a motion artefact.
 
-mriaug's `ringing3d` is not Gibbs ringing either — it damps a narrow annular band of k-space by `1 - 10*intensity`, which at its documented default `intensity=0.5` is a factor of **−4**, and the image does not survive it (relative difference 1.12, i.e. larger than the image itself).
+mriaug's `ringing3d` is not Gibbs ringing either — it damps a narrow band of k-space by `1 - 10*intensity`, i.e. a factor of **−4** at its documented default. That is not what a finite acquisition matrix does, but it is a very effective way to *look* like ringing, so it is available here as the `notch` type (see [Ringing](#ringing)).
 
-So mriaug is not a better starting point for the motion model, but it is right that ringing deserves its own operator, which is why `simu.ringing` exists.
+So mriaug is not a better starting point for the motion model, but its ringing operator is worth having, which is why `simu.ringing` offers both types.
 
 ## Limitations of the artefact models
 
@@ -176,7 +206,7 @@ pn | If `>0`,add Gaussian noise as percent of the WM peak. (Default: `0`)
 rng | RNG seed for reproducible noise. A fixed number gives every image the same noise pattern; `NaN` or `[]` derive the seed from the filename instead, so each image gets its own reproducible noise. (Default: `0`)
 contrast | Power-law exponent for contrast change. Image is normalized to [0,1], transformed as Y.^contrast, then rescaled to original min/max. Meaningful values to simulate contrast are 0.5 (low contrast) and 1.5 (high contrast). (Default: `1`)
 motion | Movement artefacts. Scalar severity (`0`=off, `1`/`2`/`3` = mild/moderate/severe, intermediate and larger values allowed), or a struct with `severity`, `events`, `translation` (mm), `rotation` (deg), `blocks`, `continuous`, `pe`, `ordering` and `centre` to override single values. See [Movement artefacts and ringing](#movement-artefacts-and-ringing). (Default: `0`)
-ringing | Gibbs ringing from the finite acquisition matrix, simulated by keeping only the central `0.95 - 0.1*ringing` of k-space along every axis. `0`=off, `1`/`2`/`3` = mild/moderate/severe. Independent of `motion` and combinable with it. (Default: `0`)
+ringing | Ringing. `0`=off, `1`/`2`/`3` = mild/moderate/severe, or a struct with `strength`, `type` (`'notch'` default, or `'gibbs'`), `pe` and `k0`. Independent of `motion` and combinable with it. See [Ringing](#ringing). (Default: `0`)
 derivative | If `1`, save outputs into BIDS derivatives at the dataset root: `derivatives/mri_simulate-<version>/sub-*/ses-*/...`, mirroring the subject/session path. Thickness simulations use `mri_simulate_thickness-<version>`. (Default: `1`)
 resolution | Output voxel size: scalar (applied to x,y,z) or `[x y z]`. `NaN` keeps the original resolution. (Default: `NaN`)
 WMH | Strength of white matter hyperintensities. `0`=off; `1`=mild; `2`=medium; `3`=strong; values `>=1` allowed. Larger values broaden the WMH prior via exponent `1/(WMH-0.8)` and scale the label contribution by `~1/WMH^0.75`. Constrained to (eroded) WM and modulated by a random field. (Default: `0`)
@@ -319,11 +349,18 @@ simu.motion = struct('severity', 2, 'events', 3, 'translation', 4, ...
 mri_simulate(simu);
 ```
 
-### 10) Gibbs ringing, alone and combined with movement
+### 10) Ringing, alone and combined with movement
 ```matlab
 simu = struct('name', 'colin27_t1_tal_hires.nii', 'snrWM', 40, 'ringing', 2);
-mri_simulate(simu, struct('percent', 0));
+mri_simulate(simu, struct('percent', 0));   % notch, the pronounced ripples
 simu.motion = 2;
+mri_simulate(simu, struct('percent', 0));
+
+% the physical variant, and a spherical shell giving concentric rings
+simu.motion  = 0;
+simu.ringing = struct('strength', 2, 'type', 'gibbs');
+mri_simulate(simu, struct('percent', 0));
+simu.ringing = struct('strength', 2, 'pe', 'all');
 mri_simulate(simu, struct('percent', 0));
 ```
 
@@ -349,7 +386,8 @@ sub-01_res-0p5x0p5x1p5mm_desc-snr30Rf20A_T1w.nii    % Anisotropic voxels
 sub-01_res-1mm_desc-snr30RfNeg20A_T1w.nii           % Inverted bias field
 sub-01_desc-snr30Rf20T2Con1p3_T1w.nii               % Simulated field, strength 2, contrast 1.3
 sub-01_desc-snr30Rf20AMotion2_T1w.nii               % Moderate movement artefacts
-sub-01_desc-snr30Rf20AMotion2Ringing2_T1w.nii       % Movement and Gibbs ringing
+sub-01_desc-snr30Rf20AMotion2Ringing2_T1w.nii       % Movement and notch ringing
+sub-01_desc-snr30Rf20ARinging2Gibbs_T1w.nii         % The gibbs ringing type
 sub-01_dseg.nii                                     % Shared by every motion/ringing run
 sub-01_desc-snr30Rf20AThickness25mm_T1w.nii         % 2.5mm constant thickness
 sub-01_desc-Thickness25mm_dseg.nii                  % Label for that thickness run

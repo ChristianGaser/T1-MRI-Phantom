@@ -152,13 +152,46 @@ function mri_simulate(simu, rf)
 %         axis is left over and grows with the severity, from about a tenth of
 %         a voxel for mild to about half a voxel for severe motion.
 %         Default: 0 (disabled).
-%       - 'ringing' (double): Strength of Gibbs ringing, the ripples that a
-%         finite acquisition matrix produces along every sharp edge. It is
-%         simulated the way it arises, by keeping only the central part of
-%         k-space and reconstructing on the same grid, which both adds the
-%         ripples and slightly blurs the image. The retained fraction of
-%         k-space is 0.95 - 0.1*ringing along every axis, i.e. 0.85 for 1,
-%         0.75 for 2 and 0.65 for 3, and any positive value is allowed.
+%       - 'ringing' (double or struct): Strength of the ringing, 0 disables
+%         it and 1, 2 and 3 are mild, moderate and severe. Any positive value
+%         is allowed. Two types are available, which are different artefacts
+%         and not two settings of one:
+%           'notch' (default) damps or inverts a narrow band of k-space at
+%             |k| = k0. Narrow in k-space means far reaching in the image, so
+%             a single spatial frequency is laid over the whole image and
+%             shows as the pronounced regular ripples that read as ringing at
+%             first sight. The gain inside the band is 1-strength, i.e. the
+%             band is removed for 1 and inverted for larger values. This is
+%             what mriaug does and it is not what a scanner does, since no
+%             acquisition removes an isolated band of frequencies. Use it
+%             when the appearance of ringing is what is wanted.
+%           'gibbs' truncates k-space, which is how a finite acquisition
+%             matrix really produces ringing. The retained fraction is
+%             0.7 - 0.15*strength, i.e. 0.55, 0.4 and 0.25. Note that the
+%             overshoot at an edge is about 9% whatever the fraction is, the
+%             Gibbs constant, and only the period of the ripples changes,
+%             roughly as 2/fraction voxels. A fraction above about 0.6 gives
+%             a period of two to three voxels, the scale of the image
+%             texture, which is seen as noise and leaves the blurring as the
+%             only visible effect. Ringing and blurring cannot be separated
+%             here, they are two sides of the same truncation.
+%         A struct selects and configures the type:
+%           .strength - as above
+%           .type     - 'notch' (default) or 'gibbs'
+%           .pe       - axis the ringing runs along, 1, 2, 3 or 'x', 'y', 'z'
+%                       as for the motion, or 'all'. A single axis gives a
+%                       flat band ('notch') or a shorter phase encoding
+%                       ('gibbs'), which is what an acquisition really does,
+%                       since only the phase-encoding matrix is shortened
+%                       while the readout is oversampled, and it is why real
+%                       ringing runs along one direction. 'all' gives a
+%                       spherical shell ('notch') or a lower resolution in
+%                       every direction ('gibbs'), which for 'gibbs' is an
+%                       isotropic softening that reads as smoothing rather
+%                       than as ringing. Default: 'y'.
+%           .k0       - centre of the band for 'notch', in units of the
+%                       Nyquist frequency. Default: 0.6, which is where
+%                       mriaug puts it.
 %         Ringing is independent of the motion and the two can be combined.
 %         They then share one k-space, i.e. the truncation is applied to the
 %         k-space that the motion assembled and before the magnitude image is
@@ -313,11 +346,14 @@ function mri_simulate(simu, rf)
 %                            'rotation', 4, 'pe', 1);
 %       mri_simulate(simu);
 %
-%   Example 8 - Gibbs ringing alone, and combined with movement artefacts.
-%   Both leave the anatomy alone, thus all of these runs share one label image.
+%   Example 8 - Ringing alone, and combined with movement artefacts. Both
+%   leave the anatomy alone, thus all of these runs share one label image.
 %       simu = struct('name', 'custom_t1.nii', 'snrWM', 40, 'ringing', 2);
-%       mri_simulate(simu);
+%       mri_simulate(simu);          % notch, i.e. the pronounced ripples
 %       simu.motion = 2;
+%       mri_simulate(simu);
+%       simu.motion  = 0;            % the physical Gibbs ringing instead
+%       simu.ringing = struct('strength', 2, 'type', 'gibbs');
 %       mri_simulate(simu);
 %
 
@@ -351,20 +387,29 @@ if nargin > 0 && isstruct(simu) && isfield(simu,'rng') && isempty(simu.rng)
   simu.rng = NaN;
 end
 
-% simu.motion may be given as a struct while its default is not one, and
-% cat_io_updateStruct, which does the merging, removes such a field and only
-% tries to restore it inside a try block that swallows the failure. The field
-% is therefore kept aside and put back after the merge.
-motion_in = [];
-if nargin > 0 && isstruct(simu) && isfield(simu,'motion') && isstruct(simu.motion)
-  motion_in = simu.motion;
-  simu = rmfield(simu,'motion');
+% simu.motion and simu.ringing may be given as a struct while their default
+% is not one, and cat_io_updateStruct, which does the merging, removes such a
+% field and only tries to restore it inside a try block that swallows the
+% failure. Those fields are therefore kept aside and put back after the merge.
+struct_fields = {'motion','ringing'};
+kept = struct();
+if nargin > 0 && isstruct(simu)
+  for i = 1:numel(struct_fields)
+    f = struct_fields{i};
+    if isfield(simu,f) && isstruct(simu.(f))
+      kept.(f) = simu.(f);
+      simu = rmfield(simu,f);
+    end
+  end
 end
 
 if nargin < 1, simu = def;
 else, simu = cat_io_checkinopt(simu, def); end
 
-if ~isempty(motion_in), simu.motion = motion_in; end
+for i = 1:numel(struct_fields)
+  f = struct_fields{i};
+  if isfield(kept,f), simu.(f) = kept.(f); end
+end
   
 % keep requested output resolution separate from internal thickness resampling
 requested_resolution = simu.resolution;
@@ -509,16 +554,15 @@ mat_name = fullfile(pth, [name '_seg8.mat']);
 % CAT12 template dir is later used for defining atrophy atlas
 template_dir = fullfile(spm('dir'),'toolbox','CAT','templates_MNI152NLin2009cAsym');
 
-% Resolve the movement artefact options before anything expensive runs, so
-% that a wrong parameter is reported at once and not after the segmentation.
-% The orientation of the input is needed to map a phase-encoding direction
-% that is given as a world axis onto the voxel axis it corresponds to.
+% Resolve the movement artefact and ringing options before anything expensive
+% runs, so that a wrong parameter is reported at once and not after the
+% segmentation. The orientation of the input is needed to map a
+% phase-encoding direction that is given as a world axis onto the voxel axis
+% it corresponds to.
 Vin = spm_vol(simu.name);
-simu.motion = resolve_motion_options(simu.motion, Vin(1));
+simu.motion  = resolve_motion_options(simu.motion, Vin(1));
+simu.ringing = resolve_ringing_options(simu.ringing, Vin(1));
 clear Vin
-
-% fraction of k-space that the acquisition keeps, 1 for no Gibbs ringing
-ring_frac = resolve_ringing_options(simu.ringing);
 
 % Call SPM segmentation if necessary and only keep the seg8.mat file.
 %
@@ -883,9 +927,9 @@ end
 % as they do in a scanner.
 if ~isempty(simu.motion)
   [volres, simu.motion] = add_motion_artefacts(volres, simu.motion, Vres, ...
-                                               simu.rng, ring_frac);
-elseif ring_frac < 1
-  volres = add_ringing(volres, ring_frac);
+                                               simu.rng, simu.ringing);
+elseif ~isempty(simu.ringing)
+  volres = add_ringing(volres, simu.ringing);
 end
 
 % Add noise:
@@ -961,8 +1005,10 @@ end
 if ~isempty(simu.motion)
   desc_acq = sprintf('%sMotion%g', desc_acq, simu.motion.severity);
 end
-if ring_frac < 1
-  desc_acq = sprintf('%sRinging%g', desc_acq, simu.ringing);
+if ~isempty(simu.ringing)
+  % the type is part of the tag, otherwise the two would overwrite each other
+  if strcmp(simu.ringing.type,'gibbs'), ring_type = 'Gibbs'; else, ring_type = ''; end
+  desc_acq = sprintf('%sRinging%g%s', desc_acq, simu.ringing.strength, ring_type);
 end
 
 % tags describing the anatomy: atrophy, WMHs and thickness. These do not
@@ -1122,8 +1168,16 @@ try
       'Continuous',        simu.motion.continuous, ...
       'Pose',              simu.motion.pose);
   end
-  if ring_frac < 1
-    simpar.Ringing = struct('Strength', simu.ringing, 'KSpaceFraction', ring_frac);
+  if ~isempty(simu.ringing)
+    simpar.Ringing = struct('Strength', simu.ringing.strength, ...
+                            'Type',     simu.ringing.type, ...
+                            'Axes',     simu.ringing.axes);
+    if strcmp(simu.ringing.type,'gibbs')
+      simpar.Ringing.KSpaceFraction = simu.ringing.fraction;
+    else
+      simpar.Ringing.BandCentre = simu.ringing.k0;
+      simpar.Ringing.BandGain   = simu.ringing.gain;
+    end
   end
 
   meta = struct();
@@ -2132,23 +2186,7 @@ mdef.ordering    = 'linear';
 mdef.centre      = 1;
 motion = cat_io_checkinopt(motion, mdef);
 
-% A phase-encoding direction given as a world axis is mapped onto the voxel
-% axis that runs closest to it, so that the same parameter describes the same
-% anatomical direction whatever orientation the image is stored in. k-space
-% is spanned by the voxel axes, thus the result has to be one of them and an
-% oblique image is served by the closest one.
-if ischar(motion.pe)
-  ax = strfind('xyz', lower(motion.pe));
-  if isempty(ax) || ~isscalar(motion.pe)
-    error('simu.motion.pe has to be 1, 2, 3 or ''x'', ''y'', ''z''.');
-  end
-  w = zeros(3,1); w(ax) = 1;
-  M = V.mat(1:3,1:3);
-  M = M ./ sqrt(sum(M.^2,1));         % world direction of every voxel axis
-  [~, motion.pe] = max(abs(M' * w));
-elseif ~isnumeric(motion.pe) || ~isscalar(motion.pe) || ~ismember(motion.pe,1:3)
-  error('simu.motion.pe has to be 1, 2, 3 or ''x'', ''y'', ''z''.');
-end
+motion.pe = resolve_pe_axis(motion.pe, V, 'simu.motion.pe');
 
 if ~ismember(lower(motion.ordering), {'linear','centric'})
   error('simu.motion.ordering has to be ''linear'' or ''centric''.');
@@ -2172,41 +2210,135 @@ if motion.continuous < 0
 end
 
 %==========================================================================
-% function frac = resolve_ringing_options(ringing)
+% function ax = resolve_pe_axis(pe, V, name)
 %
 % Purpose
-%   Translate the Gibbs ringing strength into the fraction of k-space that
-%   the acquisition keeps, and check it.
+%   Turn a phase-encoding direction into the voxel axis it runs along.
+%   k-space is spanned by the voxel axes, thus the result has to be one of
+%   them, but giving the direction as a world axis lets the same parameter
+%   describe the same anatomical direction whatever orientation the image is
+%   stored in. An oblique image is served by the closest voxel axis.
 %
 % Inputs
-%   ringing - double: strength, 0 disables it and any positive value is
-%             allowed, where 1, 2 and 3 are mild, moderate and severe.
+%   pe   - 1, 2 or 3 for a voxel axis, or 'x' (left-right), 'y'
+%          (anterior-posterior) or 'z' (inferior-superior) for a world axis.
+%   V    - spm_vol struct whose mat gives the orientation.
+%   name - name of the option, for the error message.
 %
 % Output
-%   frac    - the retained fraction of k-space along every axis, or 1 if no
-%             ringing is simulated. A fraction of 1 is what the callers test
-%             for, thus a strength of 0 never truncates anything.
+%   ax   - the voxel axis, 1, 2 or 3.
+%==========================================================================
+function ax = resolve_pe_axis(pe, V, name)
+
+if ischar(pe) && isscalar(pe)
+  w = strfind('xyz', lower(pe));
+  if isempty(w)
+    error('%s has to be 1, 2, 3 or ''x'', ''y'', ''z''.', name);
+  end
+  dir = zeros(3,1); dir(w) = 1;
+  M = V.mat(1:3,1:3);
+  M = M ./ sqrt(sum(M.^2,1));         % world direction of every voxel axis
+  [~, ax] = max(abs(M' * dir));
+elseif isnumeric(pe) && isscalar(pe) && ismember(pe, 1:3)
+  ax = pe;
+else
+  error('%s has to be 1, 2, 3 or ''x'', ''y'', ''z''.', name);
+end
+
+%==========================================================================
+% function ringing = resolve_ringing_options(ringing, V)
+%
+% Purpose
+%   Expand the ringing options into the shape of the k-space gain that
+%   produces it, and check them.
+%
+% Inputs
+%   ringing - double or struct: strength, or a struct that overrides single
+%             fields (see the help of mri_simulate).
+%   V       - spm_vol struct of the input image, to map a phase-encoding
+%             direction given as a world axis onto a voxel axis.
+%
+% Output
+%   ringing - struct with the fields strength, type, axes and the parameters
+%             of the chosen type, or [] if no ringing is simulated. An empty
+%             result is what the callers test for, thus a strength of 0 never
+%             changes anything.
 %
 % Note
-%   The fraction is 0.95 - 0.1*strength and is limited to 0.2, below which
-%   nothing but the coarsest structure of the image would be left.
+%   The two types are different artefacts and not two settings of one:
+%     'notch' damps or inverts a narrow band of k-space at |k| = k0. Narrow
+%       in k-space means far reaching in the image, so a single spatial
+%       frequency is laid over the whole image and shows as the pronounced
+%       regular ripples that read as ringing at first sight. It is what
+%       mriaug does, and it is not what a scanner does: no acquisition
+%       removes an isolated band of frequencies. Use it when the appearance
+%       of ringing is what is wanted.
+%     'gibbs' truncates k-space, which is how a finite acquisition matrix
+%       really produces ringing. Its overshoot at an edge is about 9%
+%       whatever the retained fraction is, and only the period of the ripples
+%       grows as the fraction shrinks, roughly as 2/fraction voxels.
+%       Fractions above about 0.6 therefore ripple at two to three voxels,
+%       the scale of the image texture, which reads as noise and leaves the
+%       blurring as the only visible effect. The fraction here is
+%       0.7 - 0.15*strength, i.e. periods of about four to eight voxels.
+%       Ringing and blurring cannot be separated in this type, they are two
+%       sides of the same truncation.
 %==========================================================================
-function frac = resolve_ringing_options(ringing)
+function ringing = resolve_ringing_options(ringing, V)
 
-if isempty(ringing), frac = 1; return; end
+if isempty(ringing), ringing = []; return; end
 
-if ~isnumeric(ringing) || ~isscalar(ringing)
-  error('simu.ringing has to be a scalar.');
+if ~isstruct(ringing)
+  if ~isnumeric(ringing) || ~isscalar(ringing)
+    error('simu.ringing has to be a scalar strength or a struct.');
+  end
+  ringing = struct('strength', ringing);
 end
-if ringing < 0
-  error('simu.ringing must not be negative.');
-end
-if ringing == 0, frac = 1; return; end
 
-frac = max(0.2, 0.95 - 0.1*ringing);
+if ~isfield(ringing,'strength') || isempty(ringing.strength)
+  ringing.strength = 1;
+end
+if ~isnumeric(ringing.strength) || ~isscalar(ringing.strength)
+  error('simu.ringing.strength has to be a scalar.');
+end
+if ringing.strength < 0
+  error('simu.ringing.strength must not be negative.');
+end
+if ringing.strength == 0, ringing = []; return; end
+
+rdef.strength = ringing.strength;
+rdef.type     = 'notch';
+rdef.pe       = 'y';
+rdef.k0       = 0.6;
+ringing = cat_io_checkinopt(ringing, rdef);
+
+if ~ischar(ringing.type) || ~ismember(lower(ringing.type), {'notch','gibbs'})
+  error('simu.ringing.type has to be ''notch'' or ''gibbs''.');
+end
+ringing.type = lower(ringing.type);
+
+% 'all' uses every axis, i.e. a truncation in every direction rather than a
+% shorter phase encoding, and a spherical shell rather than a flat band
+if ischar(ringing.pe) && strcmpi(ringing.pe,'all')
+  ringing.axes = 1:3;
+else
+  ringing.axes = resolve_pe_axis(ringing.pe, V, 'simu.ringing.pe');
+end
+
+switch ringing.type
+  case 'gibbs'
+    ringing.fraction = max(0.15, 0.7 - 0.15*ringing.strength);
+  case 'notch'
+    if ~isnumeric(ringing.k0) || ~isscalar(ringing.k0) || ringing.k0 <= 0 || ringing.k0 >= 1
+      error('simu.ringing.k0 has to be between 0 and 1, in units of the Nyquist frequency.');
+    end
+    % gain applied inside the band: 0 removes it, negative values invert it,
+    % which is what makes the ripples strong enough to see
+    ringing.gain = 1 - ringing.strength;
+end
 
 %==========================================================================
-% function [Y, motion] = add_motion_artefacts(Y, motion, Vout, seed, ring_frac)
+% function [Y, motion] = add_motion_artefacts(Y, motion, Vout, seed, ringing)
 %
 % Purpose
 %   Add movement artefacts by assembling k-space from rigidly moved copies of
@@ -2223,12 +2355,10 @@ frac = max(0.2, 0.95 - 0.1*ringing);
 %   Vout   - struct with the field mat of the output grid, used to convert
 %            the world motion into voxel coordinates.
 %   seed   - double: RNG seed of the simulation.
-%   ring_frac - optional fraction of k-space that the acquisition keeps, as
-%            returned by resolve_ringing_options. It is applied to the
-%            assembled k-space before the magnitude image is reconstructed,
-%            because the Gibbs ringing of the finite acquisition matrix and
-%            the motion belong to the same acquisition. Default: 1, i.e. no
-%            truncation.
+%   ringing - optional ringing options, as resolve_ringing_options returns
+%            them. The gain is applied to the assembled k-space before the
+%            magnitude image is reconstructed, because the ringing and the
+%            motion belong to the same acquisition. Default: [], i.e. none.
 %
 % Outputs
 %   Y      - the image with the movement artefacts, same class as the input.
@@ -2273,9 +2403,9 @@ frac = max(0.2, 0.95 - 0.1*ringing);
 %     time, i.e. two complex single volumes, and three when a pose without any
 %     rotation lets the transform of the unmoved volume be reused.
 %==========================================================================
-function [Y, motion] = add_motion_artefacts(Y, motion, Vout, seed, ring_frac)
+function [Y, motion] = add_motion_artefacts(Y, motion, Vout, seed, ringing)
 
-if nargin < 5 || isempty(ring_frac), ring_frac = 1; end
+if nargin < 5, ringing = []; end
 
 d   = size(Y);
 cls = class(Y);
@@ -2397,7 +2527,7 @@ motion.centre_block = centre_block;
 % Every block ended up with the same pose, thus there is nothing to splice
 % and only the truncation of k-space is left to do.
 if ~any(pose(:))
-  if ring_frac < 1, Y = add_ringing(Y, ring_frac); end
+  Y = add_ringing(Y, ringing);
   return
 end
 
@@ -2442,11 +2572,11 @@ for u = 1:size(urot,1)
 end
 clear K0 Kr Kb Ys
 
-% Gibbs ringing of the finite acquisition matrix. It belongs to the same
-% k-space as the motion and is therefore applied before the magnitude image
-% is reconstructed, which is the order in which a scanner produces the two.
-if ring_frac < 1
-  wk = kspace_window(d, ring_frac);
+% Ringing. It belongs to the same k-space as the motion and is therefore
+% applied before the magnitude image is reconstructed, which is the order in
+% which a scanner produces the two.
+if ~isempty(ringing)
+  wk = kspace_window(d, ringing);
   K  = K .* wk{1} .* wk{2} .* wk{3};
 end
 
@@ -2530,68 +2660,94 @@ for a = 1:3
 end
 
 %==========================================================================
-% function w = kspace_window(d, frac)
+% function w = kspace_window(d, ringing)
 %
 % Purpose
-%   Window of a finite acquisition matrix, i.e. the part of k-space that is
-%   sampled at all. Cutting k-space off at a finite frequency is what causes
-%   Gibbs ringing, so the window is a plain rectangle per axis and not a
-%   smooth filter, which would be a filter that a scanner may or may not
-%   apply and would damp the very ringing that is to be simulated.
+%   Gain that is multiplied onto k-space to produce the ringing. Two shapes
+%   are available, see resolve_ringing_options for what they model:
+%     'gibbs' - a plain rectangle per axis, i.e. k-space is cut off at a
+%               finite frequency. Not a smooth filter, which a scanner may or
+%               may not apply and which would damp the very ringing that is
+%               to be simulated.
+%     'notch' - a narrow band at |k| = k0 whose gain is changed, which is a
+%               flat band for a single axis and a spherical shell for all of
+%               them.
 %
 % Inputs
-%   d    - [nx ny nz]: dimensions of the volume.
-%   frac - fraction of k-space to keep along every axis, where 1 is the
-%          Nyquist frequency.
+%   d       - [nx ny nz]: dimensions of the volume.
+%   ringing - struct as resolve_ringing_options returns it.
 %
 % Output
-%   w    - 1x3 cell of the three factors of the window, each a vector along
-%          its own axis. The window is separable, thus it is returned as its
-%          factors and multiplied onto k-space one after the other, which
-%          never builds the full window.
+%   w       - 1x3 cell of the three factors of the gain, and 1 for an axis
+%             that does not take part. The gain is separable in every case
+%             but the spherical shell, thus it is returned as its factors and
+%             multiplied onto k-space one after the other, which never builds
+%             the full array. The shell is not separable and is carried whole
+%             in the first factor.
 %
 % Note
-%   The retained set of frequencies is symmetric for every frac below 1,
-%   because only the single Nyquist bin has no counterpart and that one is
-%   never kept. The reconstruction of a real image therefore stays real.
+%   Every shape is symmetric under k -> -k, because it depends on |k| alone
+%   and the single Nyquist bin that has no counterpart is never included.
+%   The reconstruction of a real image therefore stays real.
 %==========================================================================
-function w = kspace_window(d, frac)
+function w = kspace_window(d, ringing)
 
-w = cell(1,3);
+w = {1, 1, 1};
+
+% distance from the centre of k-space along each axis, 1 at Nyquist
+kax = cell(1,3);
 for a = 1:3
-  % distance from the centre of k-space along this axis, 1 at Nyquist
   k = abs(ifftshift((0:d(a)-1) - floor(d(a)/2))) / (d(a)/2);
   sz = ones(1,3); sz(a) = d(a);
-  w{a} = reshape(single(k <= frac), sz);
+  kax{a} = reshape(k, sz);
+end
+
+switch ringing.type
+  case 'gibbs'
+    for a = ringing.axes
+      w{a} = single(kax{a} <= ringing.fraction);
+    end
+
+  case 'notch'
+    lo = 0.95*ringing.k0;
+    hi = 1.05*ringing.k0;
+    if isscalar(ringing.axes)
+      a = ringing.axes;
+      w{a} = single(1 + (ringing.gain-1) * (kax{a} > lo & kax{a} < hi));
+    else
+      % A spherical shell is not separable, thus it is built as one full
+      % array and carried in the first factor.
+      r = sqrt(kax{1}.^2 + kax{2}.^2 + kax{3}.^2);
+      w{1} = single(1 + (ringing.gain-1) * (r > lo & r < hi));
+    end
 end
 
 %==========================================================================
-% function Y = add_ringing(Y, frac)
+% function Y = add_ringing(Y, ringing)
 %
 % Purpose
-%   Add Gibbs ringing alone, for a simulation without movement artefacts.
-%   With motion the truncation is applied to the k-space that the motion
-%   assembled instead, see add_motion_artefacts.
+%   Add the ringing alone, for a simulation without movement artefacts. With
+%   motion the gain is applied to the k-space that the motion assembled
+%   instead, see add_motion_artefacts.
 %
 % Inputs
-%   Y    - numeric(dims): image on the output grid, before the noise.
-%   frac - fraction of k-space to keep, as resolve_ringing_options returns it.
+%   Y       - numeric(dims): image on the output grid, before the noise.
+%   ringing - struct as resolve_ringing_options returns it, or [] for none.
 %
 % Output
-%   Y    - the image with the ringing, same class as the input.
+%   Y       - the image with the ringing, same class as the input.
 %
 % Note
-%   The window is symmetric, thus the result is real apart from rounding
-%   errors and the real part is taken explicitly, as ifftn only drops the
-%   imaginary part for an exactly conjugate symmetric input.
+%   The gain is symmetric, thus the result is real apart from rounding errors
+%   and the real part is taken explicitly, as ifftn only drops the imaginary
+%   part for an exactly conjugate symmetric input.
 %==========================================================================
-function Y = add_ringing(Y, frac)
+function Y = add_ringing(Y, ringing)
 
-if frac >= 1, return; end
+if isempty(ringing), return; end
 
 cls = class(Y);
-d   = size(Y);
-w   = kspace_window(d, frac);
+w   = kspace_window(size(Y), ringing);
 
 K = fftn(single(Y));
 Y = cast(real(ifftn(K .* w{1} .* w{2} .* w{3})), cls);

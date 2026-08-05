@@ -114,7 +114,7 @@ mri_simulate(simu, rf);
 | `resolution` | Output voxel size in mm | NaN (keep), 0.5, 1.0, [1 1 3] |
 | `contrast` | Contrast-change exponent | 0.5, 1.5, custom |
 | `motion` | Movement artefact severity, or a struct for full control | 0 (off), 1/2/3 = mild/moderate/severe |
-| `ringing` | Gibbs ringing from the finite acquisition matrix | 0 (off), 1/2/3 = mild/moderate/severe |
+| `ringing` | Ringing, `notch` (pronounced ripples) or `gibbs` (physical) | 0 (off), 1/2/3 = mild/moderate/severe |
 | `WMH` | White matter lesion strength | 0 (off), >=1 |
 | `atrophy` | Regional GM reduction | `{'atlas', [ROIs], [factors]}` |
 | `thickness` | Cortical thickness in mm | 1.5-2.5 or `[occ, mid, front]` |
@@ -208,13 +208,14 @@ All image outputs are written compressed when the input was a `.nii.gz`, and the
 - Runs on the output grid (the acquisition matrix) and before the noise
 - The label image is unaffected, so runs that differ only in motion share one ground truth
 
-**Gibbs Ringing** (`ringing`, default 0)
+**Ringing** (`ringing`, default 0) — two types, `type` selects
 
-- Severity `1`/`2`/`3` keeps the central 0.85/0.75/0.65 of k-space along every axis and reconstructs on the same grid, which is how a finite acquisition matrix produces ringing
-- Overshoots a step edge by about 9%, as a rect window should
-- A different mechanism from motion ringing: Gibbs ringing is in every image whether the head moved or not, motion ringing comes from lines acquired at different times
-- Independent of `motion` and combinable with it; the two then share one k-space, with the truncation applied before the magnitude reconstruction as a scanner does it
-- Leaves the ground truth untouched as well
+- `'notch'` (**default**) damps or inverts a narrow band of k-space at `|k| = k0` (default 0.6 Nyquist), gain `1 - strength`. Narrow in k-space is far-reaching in the image, so one spatial frequency is laid over the whole image as pronounced regular ripples — the look of ringing, **without** blurring. This is what mriaug's `ringing3d` does; it is not what a scanner does, since no acquisition removes an isolated band. Use it when the appearance is the goal
+- `'gibbs'` truncates k-space (keeps the central 0.55/0.40/0.25 for strength 1/2/3), which is how a finite acquisition matrix really rings. Overshoot is ~9% at any fraction; only the ripple *period* changes, as ~`2/fraction` voxels, so fractions above ~0.6 give a two-voxel period that reads as noise. Ringing and blurring are inseparable here — that is why `notch` exists
+- `pe` picks the axis: a single axis gives directional stripes (and is what an acquisition really shortens, the readout being oversampled), `'all'` gives a spherical shell for `notch` (concentric rings) or an isotropic softening for `gibbs`
+- A different mechanism from motion ringing, which comes from lines acquired at different times
+- Independent of `motion` and combinable with it; the two then share one k-space, with the gain applied before the magnitude reconstruction as a scanner does it
+- Leaves the ground truth untouched as well; the `desc` tag keeps the types apart (`Ringing2` vs `Ringing2Gibbs`)
 
 **Resolution Control**
 - Isotropic or anisotropic voxels
