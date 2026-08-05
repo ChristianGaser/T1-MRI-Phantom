@@ -113,6 +113,7 @@ mri_simulate(simu, rf);
 | `pn` | Gaussian noise % of WM mean (used when `snrWM<=0`) | 0-9 |
 | `resolution` | Output voxel size in mm | NaN (keep), 0.5, 1.0, [1 1 3] |
 | `contrast` | Contrast-change exponent | 0.5, 1.5, custom |
+| `motion` | Movement artefact severity, or a struct for full control | 0 (off), 1/2/3 = mild/moderate/severe |
 | `WMH` | White matter lesion strength | 0 (off), >=1 |
 | `atrophy` | Regional GM reduction | `{'atlas', [ROIs], [factors]}` |
 | `thickness` | Cortical thickness in mm | 1.5-2.5 or `[occ, mid, front]` |
@@ -196,6 +197,15 @@ All image outputs are written compressed when the input was a `.nii.gz`, and the
 - Contrast change: power-law mapping Y^x after normalizing to [0,1], then rescaled; it is applied before the noise is added
 - Reproducible with fixed RNG seed (default `rng=0`)
 
+**Movement Artifacts** (`motion`, default 0)
+
+- Severity `1`/`2`/`3` for mild/moderate/severe head motion, or a struct for full control
+- Generated in k-space: blocks of phase-encoding lines are taken from rigidly moved copies of the image, which is how motion corrupts a real acquisition, and gives the typical ringing and ghosting along the phase-encoding direction
+- Translations are applied as an exact phase ramp (Fourier shift theorem), rotations by resampling the volume, since a rotation rotates k-space itself
+- Nodding, i.e. pitch, dominates as it does for instructed head motion
+- Runs on the output grid (the acquisition matrix) and before the noise
+- The label image is unaffected, so runs that differ only in motion share one ground truth
+
 **Resolution Control**
 - Isotropic or anisotropic voxels
 - Simulates different scanner protocols
@@ -208,7 +218,7 @@ All image outputs are written compressed when the input was a `.nii.gz`, and the
 1. **Segmentation**: Uses SPM unified segmentation with the bundled Blaiotta head/neck TPM (seven tissue classes) to identify GM/WM/CSF in the input image, cached as `<name>_seg8.mat`.
 2. **Modification**: Alters tissue distributions based on your parameters (atrophy, thickness, WMH).
 3. **Synthesis**: Recreates the T1w image as the probability-weighted mixture of the tissue means taken from the segmentation, using the modified tissue maps as weights. GM and WM use the mixing-weighted mean over their Gaussians, CSF only its darkest Gaussian, because the second CSF Gaussian usually covers GM. Non-brain keeps the intensity of the bias-corrected input.
-4. **Artifacts**: Applies bias field, optional contrast change, and noise.
+4. **Artifacts**: Applies bias field, optional contrast change, optional movement artefacts, and noise.
 5. **Outputs**: Saves the simulated image, the label map, optionally the RF field, and a JSON sidecar (in derivatives by default).
 
 ---
@@ -262,7 +272,7 @@ All image outputs are written compressed when the input was a `.nii.gz`, and the
 ## Limitations
 
 - **Single modality**: Only T1w (no T2, FLAIR, etc.)
-- **No motion**: Motion artifacts not yet implemented
+- **Retrospective motion**: The motion model splices k-space blocks of a rigidly moved object. Real motion is continuous rather than piecewise constant, and the spin history and coil sensitivity effects of an inversion-recovery sequence like MPRAGE are not reproduced. Expect the appearance and the severity of the artifact to be realistic and its fine structure to be an approximation
 - **Simplified WMH**: Single intensity class
 - **Requires segmentation**: Input must be segmentable by SPM
 

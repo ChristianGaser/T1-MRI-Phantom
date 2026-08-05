@@ -81,6 +81,61 @@ function mri_simulate(simu, rf)
 %         min/max range. Use values >1 to increase contrast, <1 to reduce.
 %         Default: 1 (no change). Meaningful values to simulate contrast
 %         are 0.5 (low contrast) and 1.5 (high contrast).
+%       - 'motion' (double or struct): Simulation of movement artefacts. A
+%         scalar gives the severity: 0 disables it, and 1, 2 and 3 select
+%         mild, moderate and severe motion. Intermediate and larger values
+%         are allowed, the number of motion events and their amplitude both
+%         grow with severity^1.5, i.e. 1 event of 1mm/1deg for severity 1 and
+%         5 events of about 5mm/5deg for severity 3.
+%         The artefact is generated in k-space: the image is Fourier
+%         transformed and contiguous blocks of phase-encoding lines are
+%         replaced by the lines of a rigidly moved copy of it. A translation
+%         is applied as an exact linear phase ramp (Fourier shift theorem)
+%         and a rotation by resampling the volume before the transform, since
+%         a rotation rotates k-space itself and cannot be written as a phase.
+%         Note that shifting the samples inside k-space instead, which is
+%         what the description of such tools often suggests, only modulates
+%         the image by a phase and leaves the magnitude image unchanged.
+%         The blocks follow the acquisition order along the phase-encoding
+%         axis, so an event corrupts everything that is acquired after it,
+%         and the magnitude image of the spliced k-space shows the typical
+%         ringing and ghosting along the phase-encoding direction.
+%         Each event is modelled as an excursion of one block, i.e. a single
+%         instructed nod, followed by a residual offset of 30% of its
+%         amplitude that lasts until the end of the scan, because the head
+%         usually does not return exactly to its former position.
+%         A struct overrides the values that the severity would derive:
+%           .severity    - as above, and the base of all defaults below
+%           .events      - number of motion events. Default: round(severity^1.5)
+%           .translation - maximum translation in mm. Default: severity^1.5
+%           .rotation    - maximum rotation in degrees. Default: severity^1.5
+%           .blocks      - number of k-space blocks. This is the temporal
+%                          resolution of the motion and thus also the duration
+%                          of one excursion. Default: 32, which is 5-10s of a
+%                          typical 5min MPRAGE and therefore the time scale of
+%                          an instructed nod.
+%           .pe          - phase-encoding direction, either a voxel axis
+%                          (1, 2 or 3) or a world axis ('x' left-right, 'y'
+%                          anterior-posterior, 'z' inferior-superior), which
+%                          is mapped to the voxel axis closest to it.
+%                          Default: 'y', the usual in-plane phase-encoding
+%                          direction of a sagittal MPRAGE.
+%           .ordering    - 'linear' (default) fills k-space from -kmax to
+%                          +kmax, so its centre is acquired in the middle of
+%                          the scan, 'centric' starts at the centre.
+%           .centre      - place the first event in the block that samples
+%                          the centre of k-space. Default: 1. The severity of
+%                          the artefact depends far more on whether the centre
+%                          is hit than on the amplitude, thus this keeps the
+%                          severity levels comparable across images instead of
+%                          leaving them to the random position of the events.
+%         The ground truth label image is not affected, because motion does
+%         not change the anatomy, and motion therefore only enters the desc
+%         tag of the simulated image. The pose of the block that samples the
+%         centre of k-space is subtracted from all others, so that the image
+%         stays aligned with its label image and the motion shows up as an
+%         artefact and not as a displacement.
+%         Default: 0 (disabled).
 %       - 'resolution' (double or [x, y, z]): Spatial resolution of the
 %         simulated image. Default: NaN (keep original resolution). If scalar,
 %         it is applied to all three axes; if a 3-vector, each axis is set individually.
@@ -210,10 +265,18 @@ function mri_simulate(simu, rf)
 %                     'resolution', NaN, 'contrast', 2);
 %       rf = struct('percent', 20, 'type', 'A');
 %       mri_simulate(simu, rf);
+%   Example 6 - Simulate movement artefacts of moderate severity
+%       simu = struct('name', 'custom_t1.nii', 'snrWM', 40, 'motion', 2);
+%       rf = struct('percent', 20, 'type', 'A');
+%       mri_simulate(simu, rf);
 %
+%   Example 7 - Movement artefacts with full control, here 3 nods of at most
+%   4mm/4deg with the phase-encoding along the first voxel axis
+%       simu = struct('name', 'custom_t1.nii', 'snrWM', 40);
+%       simu.motion = struct('severity', 2, 'events', 3, 'translation', 4,...
+%                            'rotation', 4, 'pe', 1);
+%       mri_simulate(simu);
 %
-%
-% TODO: simulation of motion artefacts using FFT and shift of phase information
 
 % named tool_version and not version to not shadow the MATLAB builtin version()
 tool_version = '0.10.1';
@@ -232,6 +295,7 @@ def.thickness  = 0;
 def.rng        = 0;
 def.snrWM      = 40;
 def.contrast   = 1;    % power-law contrast change exponent (1 = unchanged)
+def.motion     = 0;    % severity of the movement artefacts (0 = none)
 def.derivative = 1;    % save outputs into BIDS derivatives
 def.closeWMHholes = 0; % don't close WMHs inside deep WM
 def.parpool = feature('numcores')/2; % use half of the available processors
@@ -243,8 +307,20 @@ if nargin > 0 && isstruct(simu) && isfield(simu,'rng') && isempty(simu.rng)
   simu.rng = NaN;
 end
 
+% simu.motion may be given as a struct while its default is not one, and
+% cat_io_updateStruct, which does the merging, removes such a field and only
+% tries to restore it inside a try block that swallows the failure. The field
+% is therefore kept aside and put back after the merge.
+motion_in = [];
+if nargin > 0 && isstruct(simu) && isfield(simu,'motion') && isstruct(simu.motion)
+  motion_in = simu.motion;
+  simu = rmfield(simu,'motion');
+end
+
 if nargin < 1, simu = def;
 else, simu = cat_io_checkinopt(simu, def); end
+
+if ~isempty(motion_in), simu.motion = motion_in; end
   
 % keep requested output resolution separate from internal thickness resampling
 requested_resolution = simu.resolution;
@@ -388,6 +464,14 @@ mat_name = fullfile(pth, [name '_seg8.mat']);
 
 % CAT12 template dir is later used for defining atrophy atlas
 template_dir = fullfile(spm('dir'),'toolbox','CAT','templates_MNI152NLin2009cAsym');
+
+% Resolve the movement artefact options before anything expensive runs, so
+% that a wrong parameter is reported at once and not after the segmentation.
+% The orientation of the input is needed to map a phase-encoding direction
+% that is given as a world axis onto the voxel axis it corresponds to.
+Vin = spm_vol(simu.name);
+simu.motion = resolve_motion_options(simu.motion, Vin(1));
+clear Vin
 
 % Call SPM segmentation if necessary and only keep the seg8.mat file.
 %
@@ -743,6 +827,15 @@ if simu.contrast ~= 1
   end
 end
 
+% Add movement artefacts by splicing k-space blocks of rigidly moved copies
+% of the image. It runs on the output grid, because the artefact is created
+% on the acquisition matrix and not on the internal one, and before the noise,
+% because the noise of the scanner is not part of the moving object and would
+% otherwise be spliced along with the signal.
+if ~isempty(simu.motion)
+  [volres, simu.motion] = add_motion_artefacts(volres, simu.motion, Vres, simu.rng);
+end
+
 % Add noise:
 % - If simu.snrWM>0: add Rician noise with target WM SNR
 % - Else: fall back to Gaussian noise using percentage of WM mean
@@ -810,6 +903,11 @@ if simu.contrast ~= 1
     otherwise
       desc_acq = sprintf('%sCon%g', desc_acq, simu.contrast);
   end
+end
+% Motion belongs to the acquisition and not to the anatomy, thus runs that
+% differ only in the motion still share one ground truth label image.
+if ~isempty(simu.motion)
+  desc_acq = sprintf('%sMotion%g', desc_acq, simu.motion.severity);
 end
 
 % tags describing the anatomy: atrophy, WMHs and thickness. These do not
@@ -950,6 +1048,23 @@ try
   end
   if simu.WMH
     simpar.WMHs = simu.WMH;
+  end
+  if ~isempty(simu.motion)
+    % Pose is the realized motion, one row per k-space block in acquisition
+    % order, with the translations in mm and the rotations in degrees, both
+    % in world coordinates. It is the ground truth of the movement and is
+    % therefore written out along with the parameters that produced it.
+    simpar.Motion = struct( ...
+      'Severity',          simu.motion.severity, ...
+      'Events',            simu.motion.events, ...
+      'EventBlocks',       simu.motion.event_blocks, ...
+      'MaxTranslation',    simu.motion.translation, ...
+      'MaxRotation',       simu.motion.rotation, ...
+      'Blocks',            simu.motion.blocks, ...
+      'PhaseEncodingAxis', simu.motion.pe, ...
+      'Ordering',          simu.motion.ordering, ...
+      'CentreBlock',       simu.motion.centre_block, ...
+      'Pose',              simu.motion.pose);
   end
 
   meta = struct();
@@ -1894,6 +2009,379 @@ rf_field = 1 + rf_field - mean(rf_field(:));
 % and finally apply bias field
 Ysimu = rf_field.*Ysimu;
 
+
+%==========================================================================
+% function motion = resolve_motion_options(motion, V)
+%
+% Purpose
+%   Expand the movement artefact options into the full parameter set that
+%   add_motion_artefacts works with, and check them. This runs before the
+%   simulation so that a wrong parameter is reported at once.
+%
+% Inputs
+%   motion - double or struct: severity, or a struct that overrides single
+%            fields of the parameter set the severity derives (see the help
+%            of mri_simulate for the fields and their defaults).
+%   V      - spm_vol struct of the input image, used to map a phase-encoding
+%            direction given as a world axis onto a voxel axis.
+%
+% Output
+%   motion - struct with the fields severity, events, translation, rotation,
+%            blocks, ordering, centre and a numeric pe, or [] if no motion is
+%            simulated. An empty result is what the caller tests for, thus a
+%            severity of 0 never reaches the simulation.
+%
+% Note
+%   The number of events and both amplitudes grow with severity^1.5, which
+%   maps 1, 2 and 3 onto 1, 3 and 5 events of 1, 2.8 and 5.2 mm and degrees.
+%   These are the ranges that head motion of the reported severity classes of
+%   MR-ART like datasets covers, i.e. mild, moderate and severe.
+%==========================================================================
+function motion = resolve_motion_options(motion, V)
+
+if isempty(motion), motion = []; return; end
+
+if ~isstruct(motion)
+  if ~isnumeric(motion) || ~isscalar(motion)
+    error('simu.motion has to be a scalar severity or a struct.');
+  end
+  motion = struct('severity', motion);
+end
+
+% a struct without a severity still asks for motion, and the mild level is
+% the least surprising base for the defaults it does not override
+if ~isfield(motion,'severity') || isempty(motion.severity)
+  motion.severity = 1;
+end
+
+if ~isnumeric(motion.severity) || ~isscalar(motion.severity)
+  error('simu.motion.severity has to be a scalar.');
+end
+
+% no motion at all, and the caller only has to test for an empty struct
+if motion.severity <= 0, motion = []; return; end
+
+s = motion.severity;
+mdef.severity    = s;
+mdef.events      = max(1, round(s^1.5));
+mdef.translation = s^1.5;   % mm
+mdef.rotation    = s^1.5;   % degrees
+mdef.blocks      = 32;
+mdef.pe          = 'y';
+mdef.ordering    = 'linear';
+mdef.centre      = 1;
+motion = cat_io_checkinopt(motion, mdef);
+
+% A phase-encoding direction given as a world axis is mapped onto the voxel
+% axis that runs closest to it, so that the same parameter describes the same
+% anatomical direction whatever orientation the image is stored in. k-space
+% is spanned by the voxel axes, thus the result has to be one of them and an
+% oblique image is served by the closest one.
+if ischar(motion.pe)
+  ax = strfind('xyz', lower(motion.pe));
+  if isempty(ax) || ~isscalar(motion.pe)
+    error('simu.motion.pe has to be 1, 2, 3 or ''x'', ''y'', ''z''.');
+  end
+  w = zeros(3,1); w(ax) = 1;
+  M = V.mat(1:3,1:3);
+  M = M ./ sqrt(sum(M.^2,1));         % world direction of every voxel axis
+  [~, motion.pe] = max(abs(M' * w));
+elseif ~isnumeric(motion.pe) || ~isscalar(motion.pe) || ~ismember(motion.pe,1:3)
+  error('simu.motion.pe has to be 1, 2, 3 or ''x'', ''y'', ''z''.');
+end
+
+if ~ismember(lower(motion.ordering), {'linear','centric'})
+  error('simu.motion.ordering has to be ''linear'' or ''centric''.');
+end
+motion.ordering = lower(motion.ordering);
+
+if motion.events < 1
+  error('simu.motion.events has to be at least 1.');
+end
+if motion.blocks < 2
+  error('simu.motion.blocks has to be at least 2, otherwise all of k-space shares one pose and no artefact is created.');
+end
+if motion.translation < 0 || motion.rotation < 0
+  error('simu.motion.translation and simu.motion.rotation must not be negative.');
+end
+if motion.translation == 0 && motion.rotation == 0
+  error('simu.motion.translation and simu.motion.rotation are both 0, thus nothing would move.');
+end
+
+%==========================================================================
+% function [Y, motion] = add_motion_artefacts(Y, motion, Vout, seed)
+%
+% Purpose
+%   Add movement artefacts by assembling k-space from rigidly moved copies of
+%   the image, which is how motion corrupts a real acquisition: every
+%   phase-encoding line is sampled at a different time, so a line acquired
+%   after the head has moved belongs to a displaced object, while the
+%   reconstruction treats all of them as one. The mismatch shows up as the
+%   ringing and ghosting along the phase-encoding direction that is typical
+%   for motion.
+%
+% Inputs
+%   Y      - numeric(dims): image on the output grid, before the noise.
+%   motion - struct: options as returned by resolve_motion_options.
+%   Vout   - struct with the field mat of the output grid, used to convert
+%            the world motion into voxel coordinates.
+%   seed   - double: RNG seed of the simulation.
+%
+% Outputs
+%   Y      - the image with the movement artefacts, same class as the input.
+%   motion - the options, extended by the realized motion:
+%            .pose         - blocks x 6, one pose per k-space block in
+%                            acquisition order, translations in mm and
+%                            rotations in degrees, in world coordinates
+%            .event_blocks - block index of every motion event
+%            .centre_block - block that samples the centre of k-space
+%
+% Algorithm
+%   1) Order the phase-encoding lines by the time at which they are acquired
+%      and cut that order into blocks, i.e. the temporal grid of the motion.
+%   2) Build the pose of every block from the events: an excursion during the
+%      block of the event plus a residual offset of 30% of it afterwards.
+%   3) For every distinct pose, transform the image, Fourier transform it and
+%      copy its phase-encoding lines into the composite k-space.
+%   4) Reconstruct the magnitude image of the composite k-space.
+%
+% Notes
+%   - Only the differences between the poses create the artefact, thus a
+%     common pose can be subtracted from all of them without changing the
+%     artefact. The one that is subtracted is the mean of the poses weighted
+%     by the k-space energy of their blocks, because the object appears at
+%     about that position: to first order the reconstruction is the sum of
+%     the moved copies weighted by how much each block contributes. The
+%     simulated image therefore stays where the ground truth label image is
+%     instead of being displaced by the motion. What is left is a sub-voxel
+%     displacement that grows with the severity, since the superposition is
+%     only linear for small displacements. It runs along the phase-encoding
+%     axis and stays in the order of a tenth of a voxel for mild and of half
+%     a voxel for severe motion.
+%   - Translations are applied as a linear phase ramp, which is exact and
+%     free of any interpolation error (Fourier shift theorem). Rotations
+%     rotate k-space itself and cannot be written as a phase, thus the volume
+%     is resampled before its transform. A pose that only translates
+%     therefore reuses the transform of the unmoved volume.
+%   - The composite k-space is not conjugate symmetric any more, which is why
+%     the reconstruction takes the magnitude of a complex volume, exactly as
+%     a scanner does.
+%   - Memory: the composite and one further k-space are held at the same
+%     time, i.e. two complex single volumes.
+%==========================================================================
+function [Y, motion] = add_motion_artefacts(Y, motion, Vout, seed)
+
+d   = size(Y);
+cls = class(Y);
+pe  = motion.pe;
+npe = d(pe);
+
+% more blocks than lines would leave empty blocks behind
+nb = max(2, min(round(motion.blocks), npe));
+motion.blocks = nb;
+
+% k of every phase-encoding line, and the order in which the lines are
+% acquired. Linear ordering runs from -kmax to +kmax, so the centre of
+% k-space is sampled in the middle of the scan, while centric ordering
+% starts at the centre and works outwards, alternating between +k and -k.
+kall = (0:npe-1) - floor(npe/2);
+switch motion.ordering
+  case 'linear'
+    ord = 1:npe;
+  case 'centric'
+    % the offset for negative k only breaks the tie between +k and -k
+    [~, ord] = sort(abs(kall) + 0.25*(kall < 0));
+end
+
+% index into the array that fftn returns, for every acquisition step. fftn
+% puts k=0 first and the negative frequencies into the upper half, which is
+% exactly what the modulo does.
+acq = mod(kall(ord), npe) + 1;
+
+% block of every acquisition step
+edges = round(linspace(0, npe, nb+1));
+blk   = zeros(1, npe);
+for b = 1:nb
+  blk(edges(b)+1:edges(b+1)) = b;
+end
+
+% block during which the centre of k-space is sampled
+centre_block = blk(ord == find(kall == 0, 1));
+
+% Draw the motion from its own stream, so that the noise pattern of the
+% simulation is the same with and without motion and the effect of the motion
+% can be isolated. The state of the global stream is restored afterwards. The
+% offset keeps this stream away from the noise seeds of a whole dataset,
+% which are consecutive when they are derived from the file names.
+state = rng;
+rng(mod(seed + 104729, 2^32), 'twister');
+
+ne = round(motion.events);
+b_evt = randi(nb, 1, ne);
+
+% The artefact depends far more on whether the centre of k-space is hit than
+% on the amplitude of the motion, thus the first event is placed there and
+% the severity levels stay comparable between images.
+if motion.centre, b_evt(1) = centre_block; end
+
+% Nodding, i.e. a pitch rotation around the left-right axis, dominates
+% instructed head motion, and the other axes only carry a fraction of it. The
+% translation that goes with it is mostly anterior-posterior and
+% inferior-superior.
+w_rot = [1 0.35 0.35];
+w_tra = [0.35 1 1];
+
+pose = zeros(nb, 6);
+for e = 1:ne
+  a  = 0.3 + 0.7*rand;                    % amplitude of this event
+  dr = randn(1,3) .* w_rot;
+  dt = randn(1,3) .* w_tra;
+  p  = [a * motion.translation * dt/max(norm(dt),eps), ...
+        a * motion.rotation    * dr/max(norm(dr),eps)];
+
+  % the excursion of the nod itself, and the residual offset that stays
+  % because the head does not return exactly to its former position
+  pose(b_evt(e),:)       = pose(b_evt(e),:) + p;
+  pose(b_evt(e)+1:end,:) = pose(b_evt(e)+1:end,:) + 0.3*p;
+end
+rng(state);
+
+% Keep the image aligned with its ground truth (see the notes above). The
+% position at which the object appears is the mean of its poses weighted by
+% how much each block contributes to the reconstruction, thus that mean is
+% subtracted. Only a transform along the phase-encoding axis is needed to
+% weigh the blocks: by Parseval the energy of a line does not depend on how
+% it is distributed along the two other axes.
+Ys  = single(Y);
+oth = setdiff(1:3, pe);
+Kpe = fft(Ys, [], pe);
+E   = sum(sum(abs(Kpe).^2, oth(1)), oth(2));
+E   = E(:).';
+clear Kpe
+
+w = zeros(1, nb);
+for b = 1:nb
+  w(b) = sum(E(acq(blk == b)));
+end
+w = w / sum(w);
+
+pose = pose - w * pose;
+
+motion.pose         = pose;
+motion.event_blocks = b_evt;
+motion.centre_block = centre_block;
+
+% every block ended up with the same pose, thus there is nothing to splice
+if ~any(pose(:)), return; end
+
+K   = complex(zeros(d, 'single'));
+K0  = [];                          % transform of the unmoved volume
+sub = repmat({':'}, 1, 3);
+
+% one transform per distinct pose instead of one per block
+[upose, ~, ib] = unique(pose, 'rows', 'stable');
+
+for u = 1:size(upose,1)
+  p = upose(u,:);
+  sub{pe} = acq(ismember(blk, find(ib == u)));
+
+  if any(p(4:6))
+    Kb = fftn(rotate_volume(Ys, p(4:6), Vout));
+  else
+    if isempty(K0), K0 = fftn(Ys); end
+    Kb = K0;
+  end
+
+  % only the lines of this pose are needed from here on
+  Kb = Kb(sub{:});
+
+  if any(p(1:3))
+    r  = translation_ramp(d, p(1:3), Vout, pe, sub{pe});
+    Kb = Kb .* r{1} .* r{2} .* r{3};
+  end
+
+  K(sub{:}) = Kb;
+end
+clear K0 Kb Ys
+
+Y = cast(abs(ifftn(K)), cls);
+
+%==========================================================================
+% function Yt = rotate_volume(Y, rot_deg, Vout)
+%
+% Purpose
+%   Rotate a volume around its own centre. The rotation is defined in world
+%   coordinates, so that the same parameter describes the same anatomical
+%   rotation whatever orientation the image is stored in.
+%
+% Inputs
+%   Y       - single(dims): volume to rotate.
+%   rot_deg - [rx ry rz]: rotation around the world axes in degrees.
+%   Vout    - struct with the field mat of the grid of Y.
+%
+% Output
+%   Yt      - single(dims): the rotated volume, with everything that was
+%             rotated in from outside the field of view set to 0.
+%==========================================================================
+function Yt = rotate_volume(Y, rot_deg, Vout)
+
+d = size(Y);
+
+% rotation around the centre of the volume, in world coordinates
+c  = Vout.mat * [(d(:)+1)/2; 1];
+Tc = spm_matrix(-c(1:3)');                    % world centre to the origin
+Mw = (Tc \ spm_matrix([0 0 0 rot_deg*pi/180])) * Tc;
+
+% the same transform between voxel coordinates
+Mv = Vout.mat \ Mw * Vout.mat;
+
+% Sinc interpolation as for the resampling of the simulated image, so that
+% the rotation does not blur the volume more than the simulation itself does.
+% spm_slice_vol needs the map from the output grid back into the input
+% volume, thus every slice is solved for and not transformed.
+Yt = zeros(d, 'single');
+for sl = 1:d(3)
+  Yt(:,:,sl) = spm_slice_vol(Y, Mv\spm_matrix([0 0 sl 0 0 0 1 1 1]), d(1:2), -5);
+end
+
+% outside the field of view spm_slice_vol may return NaN, which one single
+% voxel of would be enough to turn the whole Fourier transform into NaN
+Yt(~isfinite(Yt)) = 0;
+
+%==========================================================================
+% function r = translation_ramp(d, t_mm, Vout, pe, lines)
+%
+% Purpose
+%   Phase ramp of a translation. By the Fourier shift theorem a translation
+%   of the object multiplies its k-space by exp(-2*pi*i*k*dr), thus it is
+%   applied exactly and without any interpolation.
+%
+% Inputs
+%   d     - [nx ny nz]: dimensions of the volume.
+%   t_mm  - [tx ty tz]: translation along the world axes in mm.
+%   Vout  - struct with the field mat of the grid.
+%   pe    - phase-encoding axis, i.e. the axis that lines indexes.
+%   lines - indices of the phase-encoding lines the ramp is needed for.
+%
+% Output
+%   r     - 1x3 cell of the three factors of the ramp, each of them a vector
+%           oriented along its own axis. The ramp is separable, thus it is
+%           returned as its factors and multiplied onto k-space one after the
+%           other, which never builds the full ramp.
+%==========================================================================
+function r = translation_ramp(d, t_mm, Vout, pe, lines)
+
+% voxel displacement of a world translation
+dv = Vout.mat(1:3,1:3) \ t_mm(:);
+
+r = cell(1,3);
+for a = 1:3
+  % frequency of every index of the fftn output, in cycles per voxel
+  k = ifftshift((0:d(a)-1) - floor(d(a)/2)) / d(a);
+  if a == pe, k = k(lines); end
+  sz = ones(1,3); sz(a) = numel(k);
+  r{a} = reshape(exp(-2i*pi*k*dv(a)), sz);
+end
 
 %==========================================================================
 % function [WMH, res, label_pve] = simulate_WMHs(simu, res, label_pve, template_dir, idef_name)

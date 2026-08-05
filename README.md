@@ -84,6 +84,44 @@ The geometric bias of about −0.017 mm is independent of the thickness and shri
 
 Against that, `cat_vol_pbtsimple` underestimates, and how much depends on the thickness in a way that is not monotonic. Its core algorithm is not the reason — with `pbtopt.supersimple = 1`, which switches the brain-specific refinements off, the bias is a near-constant −0.27 to −0.31 mm across the whole range. The jumps come from those refinements (myelin correction, sulcus/gyrus enhancement, sharpening, blood-vessel and topology correction), which sometimes recover about 0.2 mm of it and sometimes do not.
 
+## Movement artefacts
+
+`simu.motion` simulates head movement the way it actually corrupts an acquisition. Every phase-encoding line of k-space is sampled at a different time, so a line acquired after the head has moved belongs to a displaced object while the reconstruction treats all of them as one. The simulation therefore transforms the image, Fourier transforms it, and assembles k-space from contiguous blocks of lines taken from differently posed copies. The mismatch between the blocks produces the ringing and ghosting along the phase-encoding direction that is typical for motion.
+
+Note that shifting the samples *inside* k-space, which descriptions of such tools often suggest, is not the same thing: a circular shift of k-space by Δk multiplies the image by `exp(2πi·Δk·r)` and leaves the magnitude image unchanged. What motion does is the dual of that — a translation by Δr multiplies k-space by `exp(-2πi·k·Δr)`. Translations are therefore applied as an exact linear phase ramp with no interpolation, while rotations rotate k-space itself and cannot be written as a phase, so the volume is resampled before its transform.
+
+A scalar gives the severity, and the number of events and both amplitudes grow with `severity^1.5`:
+
+Severity | Events | Max translation | Max rotation
+---------|--------|-----------------|-------------
+1 (mild) | 1 | 1.0 mm | 1.0°
+2 (moderate) | 3 | 2.8 mm | 2.8°
+3 (severe) | 5 | 5.2 mm | 5.2°
+
+Each event is one instructed nod: an excursion lasting a single block plus a residual offset of 30% of its amplitude that persists to the end of the scan, since the head rarely returns exactly to its former position. Pitch dominates, as it does for real nodding.
+
+A struct overrides single values:
+
+Field | Meaning (Default)
+------|------------------
+severity | Base of all the defaults below (required, or `1` if a struct is given without it)
+events | Number of motion events (`round(severity^1.5)`)
+translation | Maximum translation in mm (`severity^1.5`)
+rotation | Maximum rotation in degrees (`severity^1.5`)
+blocks | Number of k-space blocks. This is the temporal resolution of the motion and therefore also the duration of one excursion (`32`, about 5–10 s of a typical 5 min MPRAGE, i.e. the time scale of a nod)
+pe | Phase-encoding direction, a voxel axis (`1`,`2`,`3`) or a world axis (`'x'` left-right, `'y'` anterior-posterior, `'z'` inferior-superior) mapped to the closest voxel axis (`'y'`, the usual in-plane direction of a sagittal MPRAGE)
+ordering | `'linear'` fills k-space from −kmax to +kmax, so its centre is sampled in the middle of the scan; `'centric'` starts at the centre (`'linear'`)
+centre | Place the first event in the block that samples the centre of k-space (`1`)
+
+Two properties are worth knowing when using this for validation:
+
+- **The severity depends far more on whether the centre of k-space is hit than on the amplitude**, because the centre carries most of the energy. `centre=1` therefore forces the first event there, which keeps the severity levels comparable between images instead of leaving them to the random position of the events. Set it to `0` for a purely random time course.
+- **The ground truth is unaffected**, since motion does not change the anatomy. `motion` only enters the `desc` tag of the simulated image, so runs that differ only in the motion share one label file. The pose that is subtracted from all blocks is the mean weighted by their k-space energy, which is where the object appears, so the simulated image stays where its label image is. A sub-voxel displacement along the phase-encoding axis is left over and grows with the severity, from about a tenth of a voxel for mild to about half a voxel for severe motion.
+
+The realized motion is written to the JSON sidecar under `SimulationParameters.Motion`, including `Pose`, the full pose time course with one row per k-space block in acquisition order (translations in mm, rotations in degrees, both in world coordinates), which is the ground truth of the movement itself.
+
+The model is retrospective and piecewise constant, so real continuous motion and the spin-history and coil-sensitivity effects of an inversion-recovery sequence are approximations. The appearance and severity of the artefact are realistic; its fine structure is not a substitute for a real motion-corrupted acquisition.
+
 ## Requirements
 - MATLAB with SPM12 (or SPM25) and CAT >= 26 in the path (`cat_main_LASsimple` is required and is checked for at startup)
 - A T1-weighted NIfTI image, `.nii` or `.nii.gz` (default examples use `colin27_t1_tal_hires.nii`)
@@ -101,6 +139,7 @@ snrWM | add Rician magnitude noise with target SNR for white matter. Uses WM mea
 pn | If `>0`,add Gaussian noise as percent of the WM peak. (Default: `0`)
 rng | RNG seed for reproducible noise. A fixed number gives every image the same noise pattern; `NaN` or `[]` derive the seed from the filename instead, so each image gets its own reproducible noise. (Default: `0`)
 contrast | Power-law exponent for contrast change. Image is normalized to [0,1], transformed as Y.^contrast, then rescaled to original min/max. Meaningful values to simulate contrast are 0.5 (low contrast) and 1.5 (high contrast). (Default: `1`)
+motion | Movement artefacts. Scalar severity (`0`=off, `1`/`2`/`3` = mild/moderate/severe, intermediate and larger values allowed), or a struct with `severity`, `events`, `translation` (mm), `rotation` (deg), `blocks`, `pe`, `ordering` and `centre` to override single values. See [Movement artefacts](#movement-artefacts). (Default: `0`)
 derivative | If `1`, save outputs into BIDS derivatives at the dataset root: `derivatives/mri_simulate-<version>/sub-*/ses-*/...`, mirroring the subject/session path. Thickness simulations use `mri_simulate_thickness-<version>`. (Default: `1`)
 resolution | Output voxel size: scalar (applied to x,y,z) or `[x y z]`. `NaN` keeps the original resolution. (Default: `NaN`)
 WMH | Strength of white matter hyperintensities. `0`=off; `1`=mild; `2`=medium; `3`=strong; values `>=1` allowed. Larger values broaden the WMH prior via exponent `1/(WMH-0.8)` and scale the label contribution by `~1/WMH^0.75`. Constrained to (eroded) WM and modulated by a random field. (Default: `0`)
@@ -121,7 +160,7 @@ save | Save the simulated bias field only when `type` is numeric; ignored for `'
 If `simu` and/or `rf` are omitted or partially specified, missing fields are filled with defaults. If `simu.name` is empty, a file selection dialog opens.
 
 ```matlab
-simu = struct('name', '', 'snrWM', 40, 'pn', 0, 'contrast', 1, ...
+simu = struct('name', '', 'snrWM', 40, 'pn', 0, 'contrast', 1, 'motion', 0, ...
               'resolution', NaN, 'WMH', 0, 'atrophy', [], 'thickness', 0, ...
               'rng', 0, 'derivative', 1, 'closeWMHholes', 0, ...
               'parpool', feature('numcores')/2);
@@ -144,7 +183,7 @@ For a `.nii.gz` input all image outputs are written as `.nii.gz`; the JSON sidec
 If the input name ends in `_T1w`, its entities are preserved and the new `res`/`desc` entities are inserted before the suffix (an existing `desc` entity of the input is replaced). For a non-BIDS input the basename is kept unchanged, so the result cannot be fully BIDS-valid — only the entities and the suffix added here follow the specification.
 
 Notes:
-- `{opts}` combines the noise tag (`snr30`, or `pn3` when `pn>0` and `snrWM=0`), the bias field (`Rf20A`, `Rf20T2`, `RfNeg20A` for an inverted field), the contrast (`ConLow`/`ConHigh`/`Con1p3`) and the anatomical tags.
+- `{opts}` combines the noise tag (`snr30`, or `pn3` when `pn>0` and `snrWM=0`), the bias field (`Rf20A`, `Rf20T2`, `RfNeg20A` for an inverted field), the contrast (`ConLow`/`ConHigh`/`Con1p3`), the movement artefacts (`Motion2`) and the anatomical tags.
 - `{anatOpts}` covers only the anatomical options (`hammersRoi28F2`, `hammersMulti`, `Wmh2`, `Thickness25mm`, `Thickness15to25mm`). The label file omits the noise tag, since the ground truth does not depend on the noise level, so runs that differ only in SNR share one label file.
 - Decimal points become `p` (`Con1.3` → `Con1p3`), since BIDS labels must be alphanumeric.
 - `res` gives the voxel size in mm with the same `p` convention (`res-0p5mm`, `res-1mm`). Anisotropic voxels are listed per axis (`res-0p5x0p5x1p5mm`) rather than averaged — the previous mean-based `res-08mm` form was both unreadable and lossy, mapping `[0.75 0.75 0.75]` and `[0.5 0.5 1.5]` onto the same name.
@@ -227,6 +266,31 @@ rf = struct('percent', 20, 'type', 'A', 'save', 0);
 mri_simulate(simu, rf);
 ```
 
+### 8) Movement artefacts of moderate severity
+```matlab
+simu = struct('name', 'colin27_t1_tal_hires.nii', 'snrWM', 40, 'motion', 2);
+rf = struct('percent', 20, 'type', 'A');
+mri_simulate(simu, rf);
+```
+
+### 9) Movement artefacts with full control
+```matlab
+simu = struct('name', 'colin27_t1_tal_hires.nii', 'snrWM', 40);
+simu.motion = struct('severity', 2, 'events', 3, 'translation', 4, ...
+                     'rotation', 4, 'pe', 'y', 'ordering', 'linear');
+mri_simulate(simu);
+```
+
+A series that differs only in the severity shares one ground truth label file, which makes it a graded test set for the robustness of a morphometry pipeline against motion:
+
+```matlab
+simu = struct('name', 'colin27_t1_tal_hires.nii', 'snrWM', 40);
+for severity = [0 1 2 3]
+  simu.motion = severity;
+  mri_simulate(simu, struct('percent', 0));
+end
+```
+
 ## File Naming Examples
 
 For a BIDS input named `sub-01_T1w.nii`:
@@ -238,6 +302,8 @@ sub-01_res-1mm_desc-snr30Rf20A_T1w.nii              % Resampled to 1.0mm
 sub-01_res-0p5x0p5x1p5mm_desc-snr30Rf20A_T1w.nii    % Anisotropic voxels
 sub-01_res-1mm_desc-snr30RfNeg20A_T1w.nii           % Inverted bias field
 sub-01_desc-snr30Rf20T2Con1p3_T1w.nii               % Simulated field, strength 2, contrast 1.3
+sub-01_desc-snr30Rf20AMotion2_T1w.nii               % Moderate movement artefacts
+sub-01_dseg.nii                                     % Shared by every motion severity
 sub-01_desc-snr30Rf20AThickness25mm_T1w.nii         % 2.5mm constant thickness
 sub-01_desc-Thickness25mm_dseg.nii                  % Label for that thickness run
 sub-01_desc-hammersRoi28F2_dseg.nii                 % Label for a single-ROI atrophy run
