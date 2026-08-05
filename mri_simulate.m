@@ -114,6 +114,19 @@ function mri_simulate(simu, rf)
 %                          of one excursion. Default: 32, which is 5-10s of a
 %                          typical 5min MPRAGE and therefore the time scale of
 %                          an instructed nod.
+%           .continuous  - amplitude of a continuous drift and tremor between
+%                          the events, as a fraction of .translation.
+%                          Default: 0.2, and 0 leaves the pose piecewise
+%                          constant. Real motion is never piecewise constant,
+%                          and every further pose change adds one more
+%                          discontinuity to k-space, which is what produces
+%                          the dense ripple texture of a real motion
+%                          corrupted image instead of edge ringing alone.
+%                          It enters as a translation only, because a
+%                          translation is free in k-space while a rotation
+%                          needs the volume resampled once more, so that the
+%                          runtime keeps following the number of events and
+%                          not the number of blocks.
 %           .pe          - phase-encoding direction, either a voxel axis
 %                          (1, 2 or 3) or a world axis ('x' left-right, 'y'
 %                          anterior-posterior, 'z' inferior-superior), which
@@ -131,10 +144,32 @@ function mri_simulate(simu, rf)
 %                          leaving them to the random position of the events.
 %         The ground truth label image is not affected, because motion does
 %         not change the anatomy, and motion therefore only enters the desc
-%         tag of the simulated image. The pose of the block that samples the
-%         centre of k-space is subtracted from all others, so that the image
-%         stays aligned with its label image and the motion shows up as an
-%         artefact and not as a displacement.
+%         tag of the simulated image. The mean of the poses weighted by the
+%         k-space energy of their blocks is subtracted from all of them, which
+%         is where the object appears, so that the image stays where its label
+%         image is and the motion shows up as an artefact and not as a
+%         displacement. A sub-voxel displacement along the phase-encoding
+%         axis is left over and grows with the severity, from about a tenth of
+%         a voxel for mild to about half a voxel for severe motion.
+%         Default: 0 (disabled).
+%       - 'ringing' (double): Strength of Gibbs ringing, the ripples that a
+%         finite acquisition matrix produces along every sharp edge. It is
+%         simulated the way it arises, by keeping only the central part of
+%         k-space and reconstructing on the same grid, which both adds the
+%         ripples and slightly blurs the image. The retained fraction of
+%         k-space is 0.95 - 0.1*ringing along every axis, i.e. 0.85 for 1,
+%         0.75 for 2 and 0.65 for 3, and any positive value is allowed.
+%         Ringing is independent of the motion and the two can be combined.
+%         They then share one k-space, i.e. the truncation is applied to the
+%         k-space that the motion assembled and before the magnitude image is
+%         reconstructed, which is the order in which a scanner produces them.
+%         Note that Gibbs ringing and the ringing of motion are two different
+%         things: motion ringing comes from the mismatch between k-space lines
+%         that were acquired at different times, Gibbs ringing from k-space
+%         ending at a finite frequency, and only the latter is there in every
+%         image whether the head moved or not.
+%         Like motion, ringing does not change the anatomy and thus leaves the
+%         ground truth label image untouched.
 %         Default: 0 (disabled).
 %       - 'resolution' (double or [x, y, z]): Spatial resolution of the
 %         simulated image. Default: NaN (keep original resolution). If scalar,
@@ -265,6 +300,7 @@ function mri_simulate(simu, rf)
 %                     'resolution', NaN, 'contrast', 2);
 %       rf = struct('percent', 20, 'type', 'A');
 %       mri_simulate(simu, rf);
+%
 %   Example 6 - Simulate movement artefacts of moderate severity
 %       simu = struct('name', 'custom_t1.nii', 'snrWM', 40, 'motion', 2);
 %       rf = struct('percent', 20, 'type', 'A');
@@ -275,6 +311,13 @@ function mri_simulate(simu, rf)
 %       simu = struct('name', 'custom_t1.nii', 'snrWM', 40);
 %       simu.motion = struct('severity', 2, 'events', 3, 'translation', 4,...
 %                            'rotation', 4, 'pe', 1);
+%       mri_simulate(simu);
+%
+%   Example 8 - Gibbs ringing alone, and combined with movement artefacts.
+%   Both leave the anatomy alone, thus all of these runs share one label image.
+%       simu = struct('name', 'custom_t1.nii', 'snrWM', 40, 'ringing', 2);
+%       mri_simulate(simu);
+%       simu.motion = 2;
 %       mri_simulate(simu);
 %
 
@@ -296,6 +339,7 @@ def.rng        = 0;
 def.snrWM      = 40;
 def.contrast   = 1;    % power-law contrast change exponent (1 = unchanged)
 def.motion     = 0;    % severity of the movement artefacts (0 = none)
+def.ringing    = 0;    % strength of the Gibbs ringing (0 = none)
 def.derivative = 1;    % save outputs into BIDS derivatives
 def.closeWMHholes = 0; % don't close WMHs inside deep WM
 def.parpool = feature('numcores')/2; % use half of the available processors
@@ -472,6 +516,9 @@ template_dir = fullfile(spm('dir'),'toolbox','CAT','templates_MNI152NLin2009cAsy
 Vin = spm_vol(simu.name);
 simu.motion = resolve_motion_options(simu.motion, Vin(1));
 clear Vin
+
+% fraction of k-space that the acquisition keeps, 1 for no Gibbs ringing
+ring_frac = resolve_ringing_options(simu.ringing);
 
 % Call SPM segmentation if necessary and only keep the seg8.mat file.
 %
@@ -827,13 +874,18 @@ if simu.contrast ~= 1
   end
 end
 
-% Add movement artefacts by splicing k-space blocks of rigidly moved copies
-% of the image. It runs on the output grid, because the artefact is created
-% on the acquisition matrix and not on the internal one, and before the noise,
+% Add the movement artefacts and the Gibbs ringing, both of which live in
+% k-space. They run on the output grid, because they are created on the
+% acquisition matrix and not on the internal one, and before the noise,
 % because the noise of the scanner is not part of the moving object and would
-% otherwise be spliced along with the signal.
+% otherwise be spliced along with the signal. The motion assembles k-space
+% and therefore takes the truncation along, so that the two share one k-space
+% as they do in a scanner.
 if ~isempty(simu.motion)
-  [volres, simu.motion] = add_motion_artefacts(volres, simu.motion, Vres, simu.rng);
+  [volres, simu.motion] = add_motion_artefacts(volres, simu.motion, Vres, ...
+                                               simu.rng, ring_frac);
+elseif ring_frac < 1
+  volres = add_ringing(volres, ring_frac);
 end
 
 % Add noise:
@@ -904,10 +956,13 @@ if simu.contrast ~= 1
       desc_acq = sprintf('%sCon%g', desc_acq, simu.contrast);
   end
 end
-% Motion belongs to the acquisition and not to the anatomy, thus runs that
-% differ only in the motion still share one ground truth label image.
+% Motion and ringing belong to the acquisition and not to the anatomy, thus
+% runs that differ only in them still share one ground truth label image.
 if ~isempty(simu.motion)
   desc_acq = sprintf('%sMotion%g', desc_acq, simu.motion.severity);
+end
+if ring_frac < 1
+  desc_acq = sprintf('%sRinging%g', desc_acq, simu.ringing);
 end
 
 % tags describing the anatomy: atrophy, WMHs and thickness. These do not
@@ -1064,7 +1119,11 @@ try
       'PhaseEncodingAxis', simu.motion.pe, ...
       'Ordering',          simu.motion.ordering, ...
       'CentreBlock',       simu.motion.centre_block, ...
+      'Continuous',        simu.motion.continuous, ...
       'Pose',              simu.motion.pose);
+  end
+  if ring_frac < 1
+    simpar.Ringing = struct('Strength', simu.ringing, 'KSpaceFraction', ring_frac);
   end
 
   meta = struct();
@@ -2067,6 +2126,7 @@ mdef.events      = max(1, round(s^1.5));
 mdef.translation = s^1.5;   % mm
 mdef.rotation    = s^1.5;   % degrees
 mdef.blocks      = 32;
+mdef.continuous  = 0.2;
 mdef.pe          = 'y';
 mdef.ordering    = 'linear';
 mdef.centre      = 1;
@@ -2107,9 +2167,46 @@ end
 if motion.translation == 0 && motion.rotation == 0
   error('simu.motion.translation and simu.motion.rotation are both 0, thus nothing would move.');
 end
+if motion.continuous < 0
+  error('simu.motion.continuous must not be negative.');
+end
 
 %==========================================================================
-% function [Y, motion] = add_motion_artefacts(Y, motion, Vout, seed)
+% function frac = resolve_ringing_options(ringing)
+%
+% Purpose
+%   Translate the Gibbs ringing strength into the fraction of k-space that
+%   the acquisition keeps, and check it.
+%
+% Inputs
+%   ringing - double: strength, 0 disables it and any positive value is
+%             allowed, where 1, 2 and 3 are mild, moderate and severe.
+%
+% Output
+%   frac    - the retained fraction of k-space along every axis, or 1 if no
+%             ringing is simulated. A fraction of 1 is what the callers test
+%             for, thus a strength of 0 never truncates anything.
+%
+% Note
+%   The fraction is 0.95 - 0.1*strength and is limited to 0.2, below which
+%   nothing but the coarsest structure of the image would be left.
+%==========================================================================
+function frac = resolve_ringing_options(ringing)
+
+if isempty(ringing), frac = 1; return; end
+
+if ~isnumeric(ringing) || ~isscalar(ringing)
+  error('simu.ringing has to be a scalar.');
+end
+if ringing < 0
+  error('simu.ringing must not be negative.');
+end
+if ringing == 0, frac = 1; return; end
+
+frac = max(0.2, 0.95 - 0.1*ringing);
+
+%==========================================================================
+% function [Y, motion] = add_motion_artefacts(Y, motion, Vout, seed, ring_frac)
 %
 % Purpose
 %   Add movement artefacts by assembling k-space from rigidly moved copies of
@@ -2126,6 +2223,12 @@ end
 %   Vout   - struct with the field mat of the output grid, used to convert
 %            the world motion into voxel coordinates.
 %   seed   - double: RNG seed of the simulation.
+%   ring_frac - optional fraction of k-space that the acquisition keeps, as
+%            returned by resolve_ringing_options. It is applied to the
+%            assembled k-space before the magnitude image is reconstructed,
+%            because the Gibbs ringing of the finite acquisition matrix and
+%            the motion belong to the same acquisition. Default: 1, i.e. no
+%            truncation.
 %
 % Outputs
 %   Y      - the image with the movement artefacts, same class as the input.
@@ -2167,9 +2270,12 @@ end
 %     the reconstruction takes the magnitude of a complex volume, exactly as
 %     a scanner does.
 %   - Memory: the composite and one further k-space are held at the same
-%     time, i.e. two complex single volumes.
+%     time, i.e. two complex single volumes, and three when a pose without any
+%     rotation lets the transform of the unmoved volume be reused.
 %==========================================================================
-function [Y, motion] = add_motion_artefacts(Y, motion, Vout, seed)
+function [Y, motion] = add_motion_artefacts(Y, motion, Vout, seed, ring_frac)
+
+if nargin < 5 || isempty(ring_frac), ring_frac = 1; end
 
 d   = size(Y);
 cls = class(Y);
@@ -2244,6 +2350,23 @@ for e = 1:ne
   pose(b_evt(e),:)       = pose(b_evt(e),:) + p;
   pose(b_evt(e)+1:end,:) = pose(b_evt(e)+1:end,:) + 0.3*p;
 end
+
+% Drift and tremor between the events. A pose that is piecewise constant with
+% a handful of steps gives a handful of discontinuities in k-space and thus
+% ringing along the edges alone, while a real motion corrupted image carries
+% the dense ripple texture of many small ones. This adds a slow drift and two
+% slow oscillations, and only as a translation: a translation is free in
+% k-space, whereas a rotation per block would need the volume resampled once
+% per block instead of once per event (see the notes of the function).
+if motion.continuous > 0
+  tb  = (0:nb-1)'/nb;
+  amp = motion.continuous * motion.translation;
+  for j = 1:3
+    pose(:,j) = pose(:,j) + amp * ( 0.5*tb ...
+              + 0.3*sin(2*pi*(1.5 + rand)*tb + 2*pi*rand) ...
+              + 0.2*sin(2*pi*(4 + 2*rand)*tb + 2*pi*rand) );
+  end
+end
 rng(state);
 
 % Keep the image aligned with its ground truth (see the notes above). The
@@ -2271,38 +2394,61 @@ motion.pose         = pose;
 motion.event_blocks = b_evt;
 motion.centre_block = centre_block;
 
-% every block ended up with the same pose, thus there is nothing to splice
-if ~any(pose(:)), return; end
+% Every block ended up with the same pose, thus there is nothing to splice
+% and only the truncation of k-space is left to do.
+if ~any(pose(:))
+  if ring_frac < 1, Y = add_ringing(Y, ring_frac); end
+  return
+end
 
 K   = complex(zeros(d, 'single'));
 K0  = [];                          % transform of the unmoved volume
 sub = repmat({':'}, 1, 3);
 
-% one transform per distinct pose instead of one per block
-[upose, ~, ib] = unique(pose, 'rows', 'stable');
+% One resampling per distinct rotation, and the translations inside it as
+% phase ramps. A rotation costs a resampling of the whole volume while a
+% translation is free, thus the runtime follows the number of rotations, i.e.
+% the number of motion events, and not the number of blocks. This is what
+% lets the continuous component give every block its own pose for free.
+[urot, ~, ir] = unique(pose(:,4:6), 'rows', 'stable');
 
-for u = 1:size(upose,1)
-  p = upose(u,:);
-  sub{pe} = acq(ismember(blk, find(ib == u)));
-
-  if any(p(4:6))
-    Kb = fftn(rotate_volume(Ys, p(4:6), Vout));
+for u = 1:size(urot,1)
+  rot = urot(u,:);
+  if any(rot)
+    Kr = fftn(rotate_volume(Ys, rot, Vout));
   else
     if isempty(K0), K0 = fftn(Ys); end
-    Kb = K0;
+    Kr = K0;
   end
 
-  % only the lines of this pose are needed from here on
-  Kb = Kb(sub{:});
+  % the blocks that share this rotation, grouped by their translation
+  grp = find(ir == u);
+  [utra, ~, it] = unique(pose(grp,1:3), 'rows', 'stable');
 
-  if any(p(1:3))
-    r  = translation_ramp(d, p(1:3), Vout, pe, sub{pe});
-    Kb = Kb .* r{1} .* r{2} .* r{3};
+  for v = 1:size(utra,1)
+    tra = utra(v,:);
+    sub{pe} = acq(ismember(blk, grp(it == v)));
+
+    % only the lines of this pose are needed from here on
+    Kb = Kr(sub{:});
+
+    if any(tra)
+      r  = translation_ramp(d, tra, Vout, pe, sub{pe});
+      Kb = Kb .* r{1} .* r{2} .* r{3};
+    end
+
+    K(sub{:}) = Kb;
   end
-
-  K(sub{:}) = Kb;
 end
-clear K0 Kb Ys
+clear K0 Kr Kb Ys
+
+% Gibbs ringing of the finite acquisition matrix. It belongs to the same
+% k-space as the motion and is therefore applied before the magnitude image
+% is reconstructed, which is the order in which a scanner produces the two.
+if ring_frac < 1
+  wk = kspace_window(d, ring_frac);
+  K  = K .* wk{1} .* wk{2} .* wk{3};
+end
 
 Y = cast(abs(ifftn(K)), cls);
 
@@ -2382,6 +2528,73 @@ for a = 1:3
   sz = ones(1,3); sz(a) = numel(k);
   r{a} = reshape(exp(-2i*pi*k*dv(a)), sz);
 end
+
+%==========================================================================
+% function w = kspace_window(d, frac)
+%
+% Purpose
+%   Window of a finite acquisition matrix, i.e. the part of k-space that is
+%   sampled at all. Cutting k-space off at a finite frequency is what causes
+%   Gibbs ringing, so the window is a plain rectangle per axis and not a
+%   smooth filter, which would be a filter that a scanner may or may not
+%   apply and would damp the very ringing that is to be simulated.
+%
+% Inputs
+%   d    - [nx ny nz]: dimensions of the volume.
+%   frac - fraction of k-space to keep along every axis, where 1 is the
+%          Nyquist frequency.
+%
+% Output
+%   w    - 1x3 cell of the three factors of the window, each a vector along
+%          its own axis. The window is separable, thus it is returned as its
+%          factors and multiplied onto k-space one after the other, which
+%          never builds the full window.
+%
+% Note
+%   The retained set of frequencies is symmetric for every frac below 1,
+%   because only the single Nyquist bin has no counterpart and that one is
+%   never kept. The reconstruction of a real image therefore stays real.
+%==========================================================================
+function w = kspace_window(d, frac)
+
+w = cell(1,3);
+for a = 1:3
+  % distance from the centre of k-space along this axis, 1 at Nyquist
+  k = abs(ifftshift((0:d(a)-1) - floor(d(a)/2))) / (d(a)/2);
+  sz = ones(1,3); sz(a) = d(a);
+  w{a} = reshape(single(k <= frac), sz);
+end
+
+%==========================================================================
+% function Y = add_ringing(Y, frac)
+%
+% Purpose
+%   Add Gibbs ringing alone, for a simulation without movement artefacts.
+%   With motion the truncation is applied to the k-space that the motion
+%   assembled instead, see add_motion_artefacts.
+%
+% Inputs
+%   Y    - numeric(dims): image on the output grid, before the noise.
+%   frac - fraction of k-space to keep, as resolve_ringing_options returns it.
+%
+% Output
+%   Y    - the image with the ringing, same class as the input.
+%
+% Note
+%   The window is symmetric, thus the result is real apart from rounding
+%   errors and the real part is taken explicitly, as ifftn only drops the
+%   imaginary part for an exactly conjugate symmetric input.
+%==========================================================================
+function Y = add_ringing(Y, frac)
+
+if frac >= 1, return; end
+
+cls = class(Y);
+d   = size(Y);
+w   = kspace_window(d, frac);
+
+K = fftn(single(Y));
+Y = cast(real(ifftn(K .* w{1} .* w{2} .* w{3})), cls);
 
 %==========================================================================
 % function [WMH, res, label_pve] = simulate_WMHs(simu, res, label_pve, template_dir, idef_name)

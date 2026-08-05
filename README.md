@@ -84,7 +84,7 @@ The geometric bias of about −0.017 mm is independent of the thickness and shri
 
 Against that, `cat_vol_pbtsimple` underestimates, and how much depends on the thickness in a way that is not monotonic. Its core algorithm is not the reason — with `pbtopt.supersimple = 1`, which switches the brain-specific refinements off, the bias is a near-constant −0.27 to −0.31 mm across the whole range. The jumps come from those refinements (myelin correction, sulcus/gyrus enhancement, sharpening, blood-vessel and topology correction), which sometimes recover about 0.2 mm of it and sometimes do not.
 
-## Movement artefacts
+## Movement artefacts and ringing
 
 `simu.motion` simulates head movement the way it actually corrupts an acquisition. Every phase-encoding line of k-space is sampled at a different time, so a line acquired after the head has moved belongs to a displaced object while the reconstruction treats all of them as one. The simulation therefore transforms the image, Fourier transforms it, and assembles k-space from contiguous blocks of lines taken from differently posed copies. The mismatch between the blocks produces the ringing and ghosting along the phase-encoding direction that is typical for motion.
 
@@ -109,6 +109,7 @@ events | Number of motion events (`round(severity^1.5)`)
 translation | Maximum translation in mm (`severity^1.5`)
 rotation | Maximum rotation in degrees (`severity^1.5`)
 blocks | Number of k-space blocks. This is the temporal resolution of the motion and therefore also the duration of one excursion (`32`, about 5–10 s of a typical 5 min MPRAGE, i.e. the time scale of a nod)
+continuous | Amplitude of a continuous drift and tremor between the events, as a fraction of `translation` (`0.2`; `0` leaves the pose piecewise constant)
 pe | Phase-encoding direction, a voxel axis (`1`,`2`,`3`) or a world axis (`'x'` left-right, `'y'` anterior-posterior, `'z'` inferior-superior) mapped to the closest voxel axis (`'y'`, the usual in-plane direction of a sagittal MPRAGE)
 ordering | `'linear'` fills k-space from −kmax to +kmax, so its centre is sampled in the middle of the scan; `'centric'` starts at the centre (`'linear'`)
 centre | Place the first event in the block that samples the centre of k-space (`1`)
@@ -120,7 +121,42 @@ Two properties are worth knowing when using this for validation:
 
 The realized motion is written to the JSON sidecar under `SimulationParameters.Motion`, including `Pose`, the full pose time course with one row per k-space block in acquisition order (translations in mm, rotations in degrees, both in world coordinates), which is the ground truth of the movement itself.
 
-The model is retrospective and piecewise constant, so real continuous motion and the spin-history and coil-sensitivity effects of an inversion-recovery sequence are approximations. The appearance and severity of the artefact are realistic; its fine structure is not a substitute for a real motion-corrupted acquisition.
+### The continuous component
+
+A pose that is piecewise constant with a handful of steps gives a handful of discontinuities in k-space, and therefore ringing along the edges alone. A real motion-corrupted image carries the dense ripple texture of many small ones, because real motion always has drift and tremor between the deliberate movements. `continuous` adds a slow drift and two slow oscillations on top of the events, which is what makes the result look like a rejected scan rather than a blurred one.
+
+It enters as a translation only. A translation is free in k-space (a phase ramp), while a rotation needs the volume resampled once more, and the assembly is grouped so that one resampling serves all the blocks sharing a rotation. The runtime therefore follows the number of *events*, not the number of blocks: measured on a 1 mm volume, a rotation resampling costs 2.9 s, so ~11 distinct rotations are ~30 s whether or not every block has its own translation. Giving the continuous component its own rotations would have made it 32 resamplings, i.e. ~90 s at 1 mm and ~12 min at 0.5 mm.
+
+## Gibbs ringing
+
+`simu.ringing` is a separate artefact and can be combined with `motion`. It is the ripple that every finite acquisition matrix produces along a sharp edge, and it is simulated the way it arises: keep only the central `0.95 - 0.1*ringing` of k-space along each axis and reconstruct on the same grid. That both adds the ripples and blurs slightly, and it overshoots a step edge by about 9%, as a rect window should.
+
+Ringing | k-space kept
+--------|-------------
+1 | 0.85
+2 | 0.75
+3 | 0.65
+
+**Gibbs ringing and motion ringing are two different things.** Motion ringing comes from the mismatch between k-space lines acquired at different times; Gibbs ringing from k-space ending at a finite frequency. Only the latter is in every image whether the head moved or not. When both are requested they share one k-space: the truncation is applied to the k-space the motion assembled, before the magnitude image is reconstructed, which is the order a scanner produces them in — and that is measurably not the same as applying one after the other.
+
+### Comparison with mriaug
+
+[mriaug](https://github.com/codingfisch/mriaug) is a natural reference, since it also works in k-space. Its `motion3d` is
+
+```python
+offset = intensity * fft.fftn(translate3d(x, translate=translate))
+return modify_k_space(x, gain=1 - intensity, offset=offset)   # k*gain + offset
+```
+
+i.e. `K = (1-α)·FFT(x) + α·FFT(shift(x))`. That gain and offset are uniform over all of k-space, so by linearity it equals `(1-α)·x + α·shift(x)` — a plain alpha blend of the image with a translated copy. Checked numerically on a 1 mm T1, the two agree to `6.7e-16`, i.e. the FFT round-trip does nothing. There is no k-space segmentation, hence no discontinuity and no ringing: of the residual energy only 11% lies in the outer half of k-space, against 48% for the block model here. Visually it is a double exposure rather than a motion artefact.
+
+mriaug's `ringing3d` is not Gibbs ringing either — it damps a narrow annular band of k-space by `1 - 10*intensity`, which at its documented default `intensity=0.5` is a factor of **−4**, and the image does not survive it (relative difference 1.12, i.e. larger than the image itself).
+
+So mriaug is not a better starting point for the motion model, but it is right that ringing deserves its own operator, which is why `simu.ringing` exists.
+
+## Limitations of the artefact models
+
+The motion model is retrospective: it splices k-space blocks of a rigidly moved object. Real motion is continuous rather than piecewise constant (which `continuous` mitigates but does not remove), and the spin-history and coil-sensitivity effects of an inversion-recovery sequence like MPRAGE are not reproduced. The appearance and severity of the artefact are realistic; its fine structure is not a substitute for a real motion-corrupted acquisition.
 
 ## Requirements
 - MATLAB with SPM12 (or SPM25) and CAT >= 26 in the path (`cat_main_LASsimple` is required and is checked for at startup)
@@ -139,7 +175,8 @@ snrWM | add Rician magnitude noise with target SNR for white matter. Uses WM mea
 pn | If `>0`,add Gaussian noise as percent of the WM peak. (Default: `0`)
 rng | RNG seed for reproducible noise. A fixed number gives every image the same noise pattern; `NaN` or `[]` derive the seed from the filename instead, so each image gets its own reproducible noise. (Default: `0`)
 contrast | Power-law exponent for contrast change. Image is normalized to [0,1], transformed as Y.^contrast, then rescaled to original min/max. Meaningful values to simulate contrast are 0.5 (low contrast) and 1.5 (high contrast). (Default: `1`)
-motion | Movement artefacts. Scalar severity (`0`=off, `1`/`2`/`3` = mild/moderate/severe, intermediate and larger values allowed), or a struct with `severity`, `events`, `translation` (mm), `rotation` (deg), `blocks`, `pe`, `ordering` and `centre` to override single values. See [Movement artefacts](#movement-artefacts). (Default: `0`)
+motion | Movement artefacts. Scalar severity (`0`=off, `1`/`2`/`3` = mild/moderate/severe, intermediate and larger values allowed), or a struct with `severity`, `events`, `translation` (mm), `rotation` (deg), `blocks`, `continuous`, `pe`, `ordering` and `centre` to override single values. See [Movement artefacts and ringing](#movement-artefacts-and-ringing). (Default: `0`)
+ringing | Gibbs ringing from the finite acquisition matrix, simulated by keeping only the central `0.95 - 0.1*ringing` of k-space along every axis. `0`=off, `1`/`2`/`3` = mild/moderate/severe. Independent of `motion` and combinable with it. (Default: `0`)
 derivative | If `1`, save outputs into BIDS derivatives at the dataset root: `derivatives/mri_simulate-<version>/sub-*/ses-*/...`, mirroring the subject/session path. Thickness simulations use `mri_simulate_thickness-<version>`. (Default: `1`)
 resolution | Output voxel size: scalar (applied to x,y,z) or `[x y z]`. `NaN` keeps the original resolution. (Default: `NaN`)
 WMH | Strength of white matter hyperintensities. `0`=off; `1`=mild; `2`=medium; `3`=strong; values `>=1` allowed. Larger values broaden the WMH prior via exponent `1/(WMH-0.8)` and scale the label contribution by `~1/WMH^0.75`. Constrained to (eroded) WM and modulated by a random field. (Default: `0`)
@@ -160,7 +197,8 @@ save | Save the simulated bias field only when `type` is numeric; ignored for `'
 If `simu` and/or `rf` are omitted or partially specified, missing fields are filled with defaults. If `simu.name` is empty, a file selection dialog opens.
 
 ```matlab
-simu = struct('name', '', 'snrWM', 40, 'pn', 0, 'contrast', 1, 'motion', 0, ...
+simu = struct('name', '', 'snrWM', 40, 'pn', 0, 'contrast', 1, ...
+              'motion', 0, 'ringing', 0, ...
               'resolution', NaN, 'WMH', 0, 'atrophy', [], 'thickness', 0, ...
               'rng', 0, 'derivative', 1, 'closeWMHholes', 0, ...
               'parpool', feature('numcores')/2);
@@ -183,7 +221,7 @@ For a `.nii.gz` input all image outputs are written as `.nii.gz`; the JSON sidec
 If the input name ends in `_T1w`, its entities are preserved and the new `res`/`desc` entities are inserted before the suffix (an existing `desc` entity of the input is replaced). For a non-BIDS input the basename is kept unchanged, so the result cannot be fully BIDS-valid — only the entities and the suffix added here follow the specification.
 
 Notes:
-- `{opts}` combines the noise tag (`snr30`, or `pn3` when `pn>0` and `snrWM=0`), the bias field (`Rf20A`, `Rf20T2`, `RfNeg20A` for an inverted field), the contrast (`ConLow`/`ConHigh`/`Con1p3`), the movement artefacts (`Motion2`) and the anatomical tags.
+- `{opts}` combines the noise tag (`snr30`, or `pn3` when `pn>0` and `snrWM=0`), the bias field (`Rf20A`, `Rf20T2`, `RfNeg20A` for an inverted field), the contrast (`ConLow`/`ConHigh`/`Con1p3`), the movement artefacts (`Motion2`), the ringing (`Ringing2`) and the anatomical tags.
 - `{anatOpts}` covers only the anatomical options (`hammersRoi28F2`, `hammersMulti`, `Wmh2`, `Thickness25mm`, `Thickness15to25mm`). The label file omits the noise tag, since the ground truth does not depend on the noise level, so runs that differ only in SNR share one label file.
 - Decimal points become `p` (`Con1.3` → `Con1p3`), since BIDS labels must be alphanumeric.
 - `res` gives the voxel size in mm with the same `p` convention (`res-0p5mm`, `res-1mm`). Anisotropic voxels are listed per axis (`res-0p5x0p5x1p5mm`) rather than averaged — the previous mean-based `res-08mm` form was both unreadable and lossy, mapping `[0.75 0.75 0.75]` and `[0.5 0.5 1.5]` onto the same name.
@@ -281,6 +319,14 @@ simu.motion = struct('severity', 2, 'events', 3, 'translation', 4, ...
 mri_simulate(simu);
 ```
 
+### 10) Gibbs ringing, alone and combined with movement
+```matlab
+simu = struct('name', 'colin27_t1_tal_hires.nii', 'snrWM', 40, 'ringing', 2);
+mri_simulate(simu, struct('percent', 0));
+simu.motion = 2;
+mri_simulate(simu, struct('percent', 0));
+```
+
 A series that differs only in the severity shares one ground truth label file, which makes it a graded test set for the robustness of a morphometry pipeline against motion:
 
 ```matlab
@@ -303,7 +349,8 @@ sub-01_res-0p5x0p5x1p5mm_desc-snr30Rf20A_T1w.nii    % Anisotropic voxels
 sub-01_res-1mm_desc-snr30RfNeg20A_T1w.nii           % Inverted bias field
 sub-01_desc-snr30Rf20T2Con1p3_T1w.nii               % Simulated field, strength 2, contrast 1.3
 sub-01_desc-snr30Rf20AMotion2_T1w.nii               % Moderate movement artefacts
-sub-01_dseg.nii                                     % Shared by every motion severity
+sub-01_desc-snr30Rf20AMotion2Ringing2_T1w.nii       % Movement and Gibbs ringing
+sub-01_dseg.nii                                     % Shared by every motion/ringing run
 sub-01_desc-snr30Rf20AThickness25mm_T1w.nii         % 2.5mm constant thickness
 sub-01_desc-Thickness25mm_dseg.nii                  % Label for that thickness run
 sub-01_desc-hammersRoi28F2_dseg.nii                 % Label for a single-ROI atrophy run
