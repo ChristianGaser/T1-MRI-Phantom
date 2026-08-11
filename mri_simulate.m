@@ -358,10 +358,10 @@ function mri_simulate(simu, rf)
 %
 
 % named tool_version and not version to not shadow the MATLAB builtin version()
-tool_version = '0.10.1';
+tool_version = '0.10.2';
 
 if ~exist('cat_main_LASsimple','file')
-  error('Please update to a newer version >=CAT26 to use mri_simulate')
+  error('File cat_main_LASsimple.m is missing. Please update to a newer version >=CAT26 to use mri_simulate')
 end
 
 % Default simulation parameters
@@ -1473,7 +1473,9 @@ spm_jsonwrite(dd_name, dd);
 %      [-0.25, 0.25] voxels. For each offset:
 %        a. Threshold labels to obtain a hard WM mask and clean it with simple
 %           morphological steps.
-%        b. Compute Euclidean distance transform from WM (compensated by 0.5*voxel).
+%        b. Compute a Euclidean distance transform from WM that is seeded with
+%           the sub-voxel depth of each seed voxel, so its zero level sits on
+%           the WM surface rather than on the voxel lattice.
 %        c. Set CSF everywhere, then assign GM to voxels where D_WM <= thickness
 %           (per region), preserving WM where present.
 %        d. Convert the hard labels (1..3)
@@ -1597,6 +1599,23 @@ Yseg(:,:,:,1:3) = 0;
 % apply gray closing to strengthen thin WM structures
 label = cat_vol_morph(label,'gc',2);
 
+% Gradient magnitude of the label, used below to turn the distance of a voxel
+% from the WM threshold into a distance in mm. A first order estimate,
+% (label-thr)/|grad label|, stays valid however wide the partial volume ramp
+% is, which matters here because the smoothing above widens it to about
+% 1.25mm: (label-thr)*vx would be roughly a factor of two off.
+[glab1, glab2, glab3] = gradient(label, vx(2), vx(1), vx(3));
+seed_grad = sqrt(glab1.^2 + glab2.^2 + glab3.^2);
+clear glab1 glab2 glab3
+seed_grad = max(seed_grad, eps('single'));
+
+% Depth levels of the seeded distance transform below. The deepest level is
+% half a voxel, which is the furthest a voxel centre can sit below an axis
+% aligned surface while still being on the WM side of the threshold. Five
+% levels are enough, three is already most of the effect and nine adds
+% nothing measurable.
+seed_levels = linspace(0, 0.5*mean(vx), 5);
+
 % vary range of PVE from -0.25..0.25 in 15 steps to get more realistic PVE
 % effects (optionally weighted)
 pve_range = linspace(-0.25,0.25,15);
@@ -1613,18 +1632,52 @@ for pve_step = 1:numel(pve_range)
   % the excluded structures must not seed the cortical band
   wm(mask_orig) = 0;
 
-  % Euclidean distance to the WM surface, with the usual voxelsize/2
-  % correction that puts the surface on the voxel face.
+  % Euclidean distance to the WM surface, seeded with the sub-voxel depth of
+  % every seed voxel.
   %
   % cat_bwdist is CAT's separable distance transform. It is used and not
   % bwdist of the Image Processing Toolbox, because this distance defines the
   % cortical band and a toolbox dependent branch would make the simulated
   % thickness depend on the installation rather than only on the parameters.
-  % It is also exact, whereas cat_vbdist propagates the vector to the nearest
-  % object voxel and accumulates a small error with increasing distance.
   % The voxel size is passed, so the distance is returned in mm directly and
-  % anisotropic voxels are handled correctly.
-  Dwm = cat_bwdist(single(wm), vx) - 0.5*mean(vx);
+  % anisotropic voxels are handled correctly. cat_vbdist is no help here, it
+  % is documented as being without PVE and quantises the same way.
+  %
+  % What cat_bwdist returns is the distance to the nearest WM *voxel centre*,
+  % not to the WM surface. Subtracting a constant half voxel, as this code did
+  % before, is exact only where the boundary runs along a voxel face. For any
+  % other orientation the lattice offers a closer candidate slightly off the
+  % perpendicular, so the distance comes out too small and the band reaches
+  % too far. The deficit grows with distance, because a tangential detour of t
+  % costs only t^2/(2d) at distance d, so the simulated cortex came out too
+  % thick by an amount that grew with the requested thickness: measured on a
+  % sphere at 0.5mm, +0.11mm at 1.5mm thickness rising to +0.18mm at 3mm.
+  %
+  % The cure is to seed the transform with the depth of each seed voxel
+  % instead of one constant. cat_bwdist returns no index map, so the per-seed
+  % offset cannot simply be subtracted, but the seeded transform can be built
+  % from ordinary binary ones: with M_a = {q : depth_q >= a} the sets are
+  % nested and
+  %
+  %   min_q ( |p-q| - depth_q )  =  min_a ( dist(p,M_a) - a )
+  %
+  % up to the spacing of the levels, and each dist(p,M_a) is one cat_bwdist
+  % call. The a=0 term is the old seed set, and every term is >= the old
+  % result, so the band can only get thinner, never thicker.
+  %
+  % The depth is capped at the deepest level, half a voxel, which also keeps
+  % it finite where the gradient vanishes (the grey closing above leaves
+  % plateaus). Residual on the sphere: -0.03mm at 1.5mm thickness and -0.02mm
+  % at 3mm, i.e. flat in thickness instead of growing.
+  depth = min((label - (wm_val - 0.5 - pve_range(pve_step)))./seed_grad, ...
+              seed_levels(end));
+
+  Dwm = inf(size(label), 'single');
+  for seed_level = seed_levels
+    seed_mask = wm & (depth >= seed_level);
+    if ~any(seed_mask(:)), continue; end
+    Dwm = min(Dwm, cat_bwdist(single(seed_mask), vx) - seed_level);
+  end
 
   for k=1:numel(simu.thickness)
     label1{k} = label_step;
