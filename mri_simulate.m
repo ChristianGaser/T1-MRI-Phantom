@@ -68,6 +68,39 @@ function mri_simulate(simu, rf)
 %         noise pattern. NaN or [] derive the seed from the filename instead,
 %         so that every image gets its own reproducible noise.
 %         Default: 0.
+%       - 'affine' (scalar, char or struct): Write the simulated image and
+%         its ground truth label affinely registered onto a common grid
+%         instead of the grid of the input. 0 (default) keeps the input
+%         grid, 1 switches it on with all defaults, a char selects the
+%         method and a struct overrides single fields:
+%           .method - 'deformation' (default) fits an affine to the overall
+%                     deformation field of the segmentation, 'spm' uses
+%                     res.Affine as it is. The fit is the more robust of the
+%                     two: res.Affine only initialises the unified
+%                     segmentation, and when it fails the nonlinear stage
+%                     compensates for a part of the error, so the composed
+%                     field is aligned while its affine part is not.
+%           .mask   - region the fit is restricted to: 'brain' (default),
+%                     'nonbrain', 'head' or 'all'.
+%           .grid   - 'deepmriprep' (default), i.e. 336x384x336 voxels of
+%                     0.5mm, the grid the deepmriprep training scripts use,
+%                     or 'custom' through .dim/.mat or .bb/.vx.
+%           .dim    - [1x3] dimensions of a custom grid.
+%           .mat    - [4x4] voxel-to-mm matrix of a custom grid (one based).
+%           .bb     - [2x3] bounding box in mm, with .vx instead of dim/mat.
+%           .vx     - scalar or [1x3] voxel size in mm belonging to .bb.
+%           .interp - interpolation degree for spm_slice_vol, -5 (default)
+%                     for sinc, a positive value for a b-spline.
+%           .space  - label of the BIDS space entity ('MNI152').
+%         The registration is applied after all anatomical modifications and
+%         before the synthesis, so the T1w image is generated from the
+%         resampled label and the two are consistent by construction. The
+%         label is interpolated as the scalar PVE image and clamped back into
+%         its valid range afterwards, because sinc interpolation overshoots
+%         at its edges, and the tissue fractions are rebuilt from the clamped
+%         label rather than interpolated on their own, which cannot produce a
+%         CSF/WM mixture without GM. simu.resolution is ignored while this is
+%         active, since the grid already defines the voxel size.
 %       - 'derivative' (logical): If true, save outputs under a BIDS-style
 %         derivatives folder at the dataset root, using the pipeline name
 %         'mri_simulate-<version>' ('mri_simulate_thickness-<version>' for
@@ -376,6 +409,7 @@ def.snrWM      = 40;
 def.contrast   = 1;    % power-law contrast change exponent (1 = unchanged)
 def.motion     = 0;    % severity of the movement artefacts (0 = none)
 def.ringing    = 0;    % strength of the Gibbs ringing (0 = none)
+def.affine     = 0;    % affine registration of the output (0 = keep native)
 def.derivative = 1;    % save outputs into BIDS derivatives
 def.closeWMHholes = 0; % don't close WMHs inside deep WM
 def.parpool = feature('numcores')/2; % use half of the available processors
@@ -391,7 +425,7 @@ end
 % is not one, and cat_io_updateStruct, which does the merging, removes such a
 % field and only tries to restore it inside a try block that swallows the
 % failure. Those fields are therefore kept aside and put back after the merge.
-struct_fields = {'motion','ringing'};
+struct_fields = {'motion','ringing','affine'};
 kept = struct();
 if nargin > 0 && isstruct(simu)
   for i = 1:numel(struct_fields)
@@ -846,13 +880,137 @@ if any(simu.thickness)
         template_dir, idef_name, vx, V, order);
 end
 
-Ysimu = synthesize_from_segmentation(Yseg, name, res, mn, dim, WMH);
+% Affinely register the simulation onto a common grid.
+%
+% This runs after all anatomical modifications and before the synthesis, so
+% that the T1w image is generated from the resampled label and the two stay
+% exactly consistent: the image is a function of the label it ships with.
+% Only the label, the bias corrected image and the WMH map are transformed,
+% everything that pulls a template through the deformation field has already
+% run on the native grid.
+aff = resolve_affine_options(simu.affine);
+do_affine = ~isempty(aff);
+Ybias_aff = [];
+A = [];
+if do_affine
+  % Voxel-to-mm matrix of the tissue priors, needed to turn the deformation
+  % field, which holds template voxel coordinates, into template mm.
+  if isstruct(res.tpm) && isfield(res.tpm,'M')
+    Mtpm = res.tpm.M;                      % priors loaded by spm_load_priors8
+  elseif isstruct(res.tpm) && isfield(res.tpm,'mat')
+    Mtpm = res.tpm(1).mat;                 % plain spm_vol array
+  elseif ischar(res.tpm) || iscellstr(res.tpm)
+    Vtpm = spm_vol(char(res.tpm));         % only the filename was stored
+    Mtpm = Vtpm(1).mat;
+  else
+    error('Cannot determine the voxel-to-mm matrix of the tissue priors.');
+  end
+
+  switch lower(aff.method)
+    case 'deformation'
+      % The mask is defined on the native grid, which is the grid of Yy,
+      % brainmask and Ysrc, and is therefore independent of an internal
+      % resampling that the thickness simulation may have done.
+      switch lower(aff.mask)
+        case 'brain'
+          fit_mask = brainmask > 0.5;
+        case 'nonbrain'
+          fit_mask = ~(brainmask > 0.5) & isfinite(Ysrc) & Ysrc ~= 0;
+        case 'head'
+          fit_mask = isfinite(Ysrc) & Ysrc > 0;
+        otherwise
+          fit_mask = true(V_native.dim(1:3));
+      end
+      A = fit_affine_from_deformation(Yy, V_native.mat, Mtpm, fit_mask);
+    case 'spm'
+      A = res.Affine;
+  end
+  fprintf('Affine registration of the output (%s, %s grid).\n', aff.method, aff.grid);
+
+  % The bias corrected image is needed on the current grid, which differs
+  % from the native one after an internal resampling for the thickness.
+  if ~isequal(size(Ysrc), dim)
+    Ysrc_cur = zeros(dim, 'single');
+    Mb = V_native.mat \ V.mat;
+    for sl = 1:dim(3)
+      Ysrc_cur(:,:,sl) = spm_slice_vol(Ysrc, Mb*spm_matrix([0 0 sl 0 0 0 1 1 1]), ...
+                                       dim(1:2), aff.interp);
+    end
+  else
+    Ysrc_cur = Ysrc;
+  end
+
+  % Output voxel -> output mm (aff.mat) -> native mm (A\) -> current voxel.
+  MA = V.mat \ (A \ aff.mat);
+  label_aff = zeros(aff.dim, 'single');
+  Ybias_aff = zeros(aff.dim, 'single');
+  if ~isempty(WMH), WMH_aff = zeros(aff.dim, 'single'); end
+  for sl = 1:aff.dim(3)
+    Ms = MA * spm_matrix([0 0 sl 0 0 0 1 1 1]);
+    label_aff(:,:,sl) = spm_slice_vol(label_pve, Ms, aff.dim(1:2), aff.interp);
+    Ybias_aff(:,:,sl) = spm_slice_vol(Ysrc_cur,  Ms, aff.dim(1:2), aff.interp);
+    if ~isempty(WMH)
+      WMH_aff(:,:,sl) = spm_slice_vol(WMH, Ms, aff.dim(1:2), aff.interp);
+    end
+  end
+  clear Ysrc_cur
+
+  % Sinc interpolation overshoots at the hard edges of the label, thus the
+  % result is clamped back into the valid range before the tissue fractions
+  % are derived from it. The WMH class extends the range to 4.
+  if isempty(WMH), lab_max = 3; else, lab_max = 4; end
+  label_aff = min(max(label_aff, 0), lab_max);
+  if ~isempty(WMH), WMH = min(max(WMH_aff, 0), 1); clear WMH_aff; end
+
+  % Rebuilding Yseg from the resampled label, instead of interpolating the
+  % three fractions on their own, keeps them consistent: they sum to at most
+  % one by construction and no voxel can become a CSF/WM mixture without GM,
+  % which is what an independent interpolation of the three volumes produces
+  % at a ventricle border.
+  lab3 = min(label_aff, 3);
+  Yseg = zeros([aff.dim 3], 'single');
+  for i = 1:3
+    Yseg(:,:,:,i) = Yp0toC(lab3, seg_order(i));
+  end
+  % Only ever scale down, never up. The triangular decomposition already sums
+  % to one for a label in [1,3], and below one it describes the fade from the
+  % background into the CSF, where a normalization to one would snap the whole
+  % ramp to full CSF and dilate the brain by half a voxel. Keeping the sum
+  % there lets synthesize_from_segmentation blend into the bias corrected
+  % image, which is what it does at the brain boundary anyway.
+  Ysum = max(sum(Yseg,4), 1);
+  for i = 1:3
+    Yseg(:,:,:,i) = Yseg(:,:,:,i)./Ysum;
+  end
+  clear Ysum lab3
+
+  % Keep the invariant that the label is the weighted sum of the fractions
+  % that the synthesis uses, and add the WMH part back on top of it.
+  label_pve = zeros(aff.dim, 'single');
+  for k = 1:3
+    label_pve = label_pve + k*Yseg(:,:,:,order(k));
+  end
+  label_pve = label_pve + (label_aff - min(label_aff, 3));
+  clear label_aff
+
+  % from here on everything happens on the new grid
+  V = struct('dim', aff.dim, 'mat', aff.mat, 'fname', '', ...
+             'dt', [spm_type('float32') 0], 'pinfo', [1 0 0]');
+  dim = aff.dim;
+  vx  = sqrt(sum(aff.mat(1:3,1:3).^2));
+  simu.resolution = vx;
+  % the output already has the requested grid, so the resampling further down
+  % has nothing left to do
+  change_resolution = 0;
+end
+
+Ysimu = synthesize_from_segmentation(Yseg, name, res, mn, dim, WMH, Ybias_aff);
 
 % apply either predefined MNI bias field or simulated bias field before resizing
 % to defined output resolution
 if rf.percent ~= 0
   if ischar(rf.type)
-    [Ysimu, rf_field] = add_bias_field(Ysimu, rf, idef_name, pth_root); % add predefined MNI field
+    [Ysimu, rf_field] = add_bias_field(Ysimu, rf, idef_name, pth_root, V); % add predefined MNI field
   else
     [Ysimu, rf_field] = add_simulated_bias_field(Ysimu, rf, vx);
   end
@@ -874,6 +1032,14 @@ P = spm_imatrix(Vout.mat);
 P(7:9) = P(7:9)./vx_out.*simu.resolution;
 P(1:3) = P(1:3) + vx_out - simu.resolution;
 Vres.mat = spm_matrix(P);
+
+% An affinely registered output is written on exactly the grid that was
+% requested for the registration, so it is taken over unchanged instead of
+% being derived from the input grid and the target resolution.
+if do_affine
+  Vres.dim = V.dim(1:3);
+  Vres.mat = V.mat;
+end
 
 % output in defined resolution
 volres   = zeros(Vres.dim);
@@ -1061,7 +1227,7 @@ end
 % alphanumeric (0.5mm -> res-0p5mm). Anisotropic voxels are listed per axis
 % instead of being averaged, which would both hide the anisotropy and report
 % a size that no axis actually has.
-if change_resolution
+if change_resolution || do_affine
   res_lab = arrayfun(@(x) bids_label(sprintf('%g',x)), simu.resolution(:)', ...
                      'UniformOutput', false);
   if all(abs(simu.resolution - simu.resolution(1)) < 1e-6)
@@ -1071,6 +1237,14 @@ if change_resolution
   end
 else
   ent_res = '';
+end
+
+% space is a standard BIDS entity and precedes res. It names the space that
+% an affinely registered output was resampled into.
+if do_affine && ~isempty(aff.space)
+  ent_space = ['_space-' bids_label(aff.space)];
+else
+  ent_space = '';
 end
 
 if isempty(desc_main), ent_main = ''; else, ent_main = ['_desc-' desc_main]; end
@@ -1084,9 +1258,9 @@ else
   ent_bias = ['_desc-' desc_anat 'Biasfield'];
 end
 
-new_name       = [bids_prefix ent_res ent_main '_T1w'];
-new_name_label = [bids_prefix ent_res ent_anat '_dseg'];
-new_name_bias  = [bids_prefix ent_res ent_bias '_T1w'];
+new_name       = [bids_prefix ent_space ent_res ent_main '_T1w'];
+new_name_label = [bids_prefix ent_space ent_res ent_anat '_dseg'];
+new_name_bias  = [bids_prefix ent_space ent_res ent_bias '_T1w'];
 
 % write simulated image (optionally to derivatives folder)
 simu_name = fullfile(out_pth, [new_name '.nii']); simu_name_main = simu_name;
@@ -1178,6 +1352,21 @@ try
       simpar.Ringing.BandCentre = simu.ringing.k0;
       simpar.Ringing.BandGain   = simu.ringing.gain;
     end
+  end
+
+  if do_affine
+    % Affine is the fitted native mm -> template mm transform, and Mat the
+    % voxel-to-mm matrix of the grid the output was written on, so that the
+    % registration can be reproduced or inverted from the sidecar alone.
+    simpar.AffineRegistration = struct( ...
+      'Method',        aff.method, ...
+      'Mask',          aff.mask, ...
+      'Grid',          aff.grid, ...
+      'Space',         aff.space, ...
+      'Interpolation', aff.interp, ...
+      'Dim',           aff.dim, ...
+      'Mat',           aff.mat, ...
+      'Affine',        A);
   end
 
   meta = struct();
@@ -1900,22 +2089,31 @@ end
 %   - WMHs are added on top of the WM class, so Pbrain can reach 2 there and
 %     the result is the mean of the WM and the WMH intensity.
 %==========================================================================
-function Ysimu = synthesize_from_segmentation(vol_seg, name, res, mn, d, WMH)
+function Ysimu = synthesize_from_segmentation(vol_seg, name, res, mn, d, WMH, Ybias)
 % go through all peaks that are defined
 % mainly copied from spm_preproc_write8.m
+
+if nargin < 7, Ybias = []; end
 
 K = size(res.mn,2);
 
 [x1,x2,o] = ndgrid(1:d(1),1:d(2),1);
 x3 = 1:d(3);
 
-% prepare DCT parameters for bias correction
-chan = struct('B1',[],'B2',[],'B3',[],'T',[],'Nc',[],'Nf',[],'ind',[]);
-d3      = [size(res.Tbias{1}) 1];
-chan.B3 = spm_dctmtx(d(3),d3(3),x3);
-chan.B2 = spm_dctmtx(d(2),d3(2),x2(1,:)');
-chan.B1 = spm_dctmtx(d(1),d3(1),x1(:,1));
-chan.T  = res.Tbias{1};
+% Prepare DCT parameters for bias correction. They are only needed when the
+% bias corrected image still has to be built from res.image(1), i.e. when it
+% is not handed over. The DCT basis is defined over the field of view of the
+% input, so it must not be re-evaluated on a grid that is not a resampling of
+% that same box, which is why an affinely registered output passes the
+% already corrected image instead.
+if isempty(Ybias)
+  chan = struct('B1',[],'B2',[],'B3',[],'T',[],'Nc',[],'Nf',[],'ind',[]);
+  d3      = [size(res.Tbias{1}) 1];
+  chan.B3 = spm_dctmtx(d(3),d3(3),x3);
+  chan.B2 = spm_dctmtx(d(2),d3(2),x2(1,:)');
+  chan.B1 = spm_dctmtx(d(1),d3(1),x1(:,1));
+  chan.T  = res.Tbias{1};
+end
 
 % output image
 Ysimu = zeros(d, 'single');
@@ -1931,11 +2129,15 @@ for z = 1:length(x3)
 
   % Bias corrected image. It provides the intensities of everything that is
   % not GM/WM/CSF, i.e. skull, soft tissue and background.
-  f  = spm_sample_vol(res.image(1),x1,x2,o*x3(z),0);
-  bf = exp(transf(chan.B1,chan.B2,chan.B3(z,:),chan.T));
-  cr = bf.*f;
+  if isempty(Ybias)
+    f  = spm_sample_vol(res.image(1),x1,x2,o*x3(z),0);
+    bf = exp(transf(chan.B1,chan.B2,chan.B3(z,:),chan.T));
+    cr = bf.*f;
+  else
+    cr = double(Ybias(:,:,z));
+  end
 
-  msk = (f==0) | ~isfinite(f);
+  msk = (cr==0) | ~isfinite(cr);
 
   % The expected intensity is the probability weighted mixture of the tissue
   % means, where the probabilities are given by the external segmentation.
@@ -2030,13 +2232,30 @@ end
 %   Ysimu     - modulated image.
 %   rf_field  - applied RF field in native space.
 %==========================================================================
-function [Ysimu, rf_field] = add_bias_field(Ysimu, rf, idef_name, pth)
+function [Ysimu, rf_field] = add_bias_field(Ysimu, rf, idef_name, pth, Vref)
+
+if nargin < 5, Vref = []; end
 
 fprintf('Transform RF field to native space.\n');
 % warp defined rf field to native space
 rf_name = fullfile(pth,['rf100_' rf.type '.nii']);
 rf_field = cat_vol_defs(struct('field1',{{idef_name}},'images',{{rf_name}},'interp',1,'modulate',0));
 rf_field = single(rf_field{1}{1});
+
+% The deformation field is always defined for the original image, thus the
+% warped field has to be resampled if the current grid differs, which is the
+% case for an affinely registered output.
+if ~isempty(Vref) && ~isequal(size(rf_field), Vref.dim(1:3))
+  Vdef = spm_vol(idef_name);
+  Vdef = Vdef(1);
+  dref = Vref.dim(1:3);
+  rf_res = zeros(dref, 'single');
+  Mr = Vdef.mat \ Vref.mat;
+  for sl = 1:dref(3)
+    rf_res(:,:,sl) = spm_slice_vol(rf_field, Mr*spm_matrix([0 0 sl 0 0 0 1 1 1]), dref(1:2), 1);
+  end
+  rf_field = rf_res;
+end
 
 % apply defined percent and strength
 rf_field = abs(rf.percent)/100 * (single(rf_field));
@@ -2174,6 +2393,174 @@ rf_field = 1 + rf_field - mean(rf_field(:));
 
 % and finally apply bias field
 Ysimu = rf_field.*Ysimu;
+
+
+%==========================================================================
+% function aff = resolve_affine_options(affine)
+%
+% Purpose
+%   Turn simu.affine into a full option struct, or into [] when the output
+%   stays in the space of the input.
+%
+% Accepted forms
+%   0, [], false            off, the output keeps the grid of the input
+%   1, true                 on, with all defaults
+%   'deformation' | 'spm'   on, selecting the method
+%   struct                  any of the fields below, the rest are defaults
+%
+% Fields
+%   method  'deformation' (default) fits an affine to the overall deformation
+%           field of the segmentation, 'spm' takes res.Affine as it is.
+%   mask    region the fit is restricted to: 'brain' (default), 'nonbrain',
+%           'head' or 'all'. Only used by the 'deformation' method.
+%   grid    'deepmriprep' (default) for the grid of the deepmriprep training
+%           scripts, or 'custom' via dim/mat or bb/vx.
+%   dim     [1x3] dimensions of a custom output grid.
+%   mat     [4x4] voxel-to-mm matrix of a custom output grid, one based as
+%           every SPM matrix is.
+%   bb      [2x3] bounding box in mm, an alternative to dim/mat, together
+%           with vx.
+%   vx      scalar or [1x3] voxel size in mm that belongs to bb (1mm).
+%   interp  interpolation degree passed on to spm_slice_vol. -5 (default) is
+%           sinc interpolation, a positive value selects a b-spline.
+%   space   label written into the BIDS space entity ('MNI152').
+%==========================================================================
+function aff = resolve_affine_options(affine)
+
+if isempty(affine), aff = []; return; end
+
+if isnumeric(affine) || islogical(affine)
+  if ~any(affine(:)), aff = []; return; end
+  affine = struct();
+elseif ischar(affine)
+  affine = struct('method', affine);
+elseif ~isstruct(affine)
+  error('simu.affine must be a scalar, a method name or a struct.');
+end
+
+aff = affine;
+if ~isfield(aff,'method') || isempty(aff.method), aff.method = 'deformation'; end
+if ~isfield(aff,'mask')   || isempty(aff.mask),   aff.mask   = 'brain';       end
+if ~isfield(aff,'interp') || isempty(aff.interp), aff.interp = -5;            end
+if ~isfield(aff,'space')  || isempty(aff.space),  aff.space  = 'MNI152';      end
+if ~isfield(aff,'dim'), aff.dim = []; end
+if ~isfield(aff,'mat'), aff.mat = []; end
+
+if ~any(strcmpi(aff.method,{'deformation','spm'}))
+  error('simu.affine.method must be ''deformation'' or ''spm''.');
+end
+if ~any(strcmpi(aff.mask,{'brain','nonbrain','head','all'}))
+  error('simu.affine.mask must be ''brain'', ''nonbrain'', ''head'' or ''all''.');
+end
+
+if ~isempty(aff.dim) && ~isempty(aff.mat)
+  aff.grid = 'custom';
+elseif isfield(aff,'bb') && ~isempty(aff.bb)
+  if ~isfield(aff,'vx') || isempty(aff.vx), aff.vx = 1; end
+  if isscalar(aff.vx), aff.vx = aff.vx*ones(1,3); end
+  bb0 = min(aff.bb,[],1);
+  aff.dim = round(abs(diff(aff.bb,1,1))./aff.vx) + 1;
+  aff.mat = [aff.vx(1) 0 0 bb0(1)-aff.vx(1); ...
+             0 aff.vx(2) 0 bb0(2)-aff.vx(2); ...
+             0 0 aff.vx(3) bb0(3)-aff.vx(3); ...
+             0 0 0 1];
+  aff.grid = 'custom';
+else
+  if ~isfield(aff,'grid') || isempty(aff.grid), aff.grid = 'deepmriprep'; end
+  switch lower(aff.grid)
+    case 'deepmriprep'
+      % The grid that the deepmriprep training scripts work on: 336x384x336
+      % voxels of 0.5mm, which is what 2_prep_segment.py ends up with after
+      % it has cropped its 339x411x339 sampling grid. Its nibabel affine puts
+      % the zero based voxel index 0 at (-84,-120,-72)mm, and an SPM matrix
+      % is one based, so the origin moves out by one voxel.
+      vx      = [0.5 0.5 0.5];
+      aff.dim = [336 384 336];
+      aff.mat = [vx(1) 0 0 -84-vx(1); ...
+                 0 vx(2) 0 -120-vx(2); ...
+                 0 0 vx(3) -72-vx(3); ...
+                 0 0 0 1];
+    otherwise
+      error(['Unknown simu.affine.grid ''%s''. Use ''deepmriprep'', or give ' ...
+             'dim and mat, or bb and vx.'], aff.grid);
+  end
+end
+
+aff.dim = round(aff.dim(:)');
+if numel(aff.dim) ~= 3 || any(aff.dim < 1)
+  error('simu.affine.dim must be three positive integers.');
+end
+if ~isequal(size(aff.mat),[4 4])
+  error('simu.affine.mat must be a 4x4 matrix.');
+end
+
+
+%==========================================================================
+% function A = fit_affine_from_deformation(Yy, Mimg, Mtpm, mask)
+%
+% Purpose
+%   Least squares affine describing the overall deformation field of the
+%   segmentation, returned as a native mm -> template mm transform and thus
+%   directly comparable to res.Affine.
+%
+% Why not res.Affine itself
+%   res.Affine is the affine registration that initialises the unified
+%   segmentation. It sometimes fails, for an unusual field of view or a
+%   strong tilt, and the subsequent nonlinear stage then compensates for a
+%   part of that error. The composed deformation is aligned in such a case
+%   while its affine part is not, so fitting an affine to the composed field
+%   recovers the global alignment that the segmentation actually converged
+%   to, which is what a common output grid has to be built on.
+%
+% Inputs
+%   Yy   - single(dims,3): deformation field holding, for every native voxel,
+%          the voxel coordinate of the tissue priors it maps to.
+%   Mimg - 4x4: voxel-to-mm matrix of the native image.
+%   Mtpm - 4x4: voxel-to-mm matrix of the tissue priors.
+%   mask - logical(dims): voxels the fit is restricted to.
+%
+% Output
+%   A    - 4x4: affine mapping native mm to template mm.
+%
+% Notes
+%   - The mask decides what the affine is optimal for. 'brain' aligns the
+%     brains, which is what a training grid for brain segmentation needs.
+%     'nonbrain' reproduces the convention of the deepmriprep preprocessing,
+%     which fits outside the brain, where the deformation is closer to affine
+%     already.
+%==========================================================================
+function A = fit_affine_from_deformation(Yy, Mimg, Mtpm, mask)
+
+d  = [size(Yy,1) size(Yy,2) size(Yy,3)];
+np = prod(d);
+ind = find(mask(:));
+
+% An affine has twelve parameters, so a few hundred thousand samples are far
+% more than it needs and keep the normal equations small.
+n_max = 200000;
+if numel(ind) > n_max
+  ind = ind(round(linspace(1, numel(ind), n_max)));
+end
+if numel(ind) < 100
+  error('Only %d voxels in the mask, too few to fit an affine.', numel(ind));
+end
+
+[i1,i2,i3] = ind2sub(d, ind);
+X = [double(i1) double(i2) double(i3) ones(numel(ind),1)];
+X = [X * Mimg(1:3,:)' ones(numel(ind),1)];   % native mm, homogeneous
+
+Y = [double(Yy(ind)) double(Yy(ind+np)) double(Yy(ind+2*np)) ones(numel(ind),1)];
+Y = Y * Mtpm(1:3,:)';                        % template mm
+
+ok = all(isfinite(X),2) & all(isfinite(Y),2);
+X  = X(ok,:);
+Y  = Y(ok,:);
+if size(X,1) < 100
+  error('Only %d finite deformation samples, too few to fit an affine.', size(X,1));
+end
+
+A = eye(4);
+A(1:3,:) = (X\Y)';
 
 
 %==========================================================================
