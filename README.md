@@ -184,6 +184,88 @@ mriaug's `ringing3d` is not Gibbs ringing either — it damps a narrow band of k
 
 So mriaug is not a better starting point for the motion model, but its ringing operator is worth having, which is why `simu.ringing` offers both types.
 
+## Cleaning the ground truth
+
+`simu.clean` removes from the **label** what is not the tissue it looks like,
+and deliberately leaves it in the **image**.
+
+```matlab
+simu = struct('name','sub-01_T1w.nii', 'snrWM',40, 'affine',1, 'clean',1);
+mri_simulate(simu, struct('percent',0));
+% -> sub-01_space-MNI152_res-0p5mm_desc-snr40_T1w.nii        (vessel still bright)
+%    sub-01_space-MNI152_res-0p5mm_desc-Clean_dseg.nii       (vessel labelled CSF)
+%    sub-01_space-MNI152_res-0p5mm_desc-Clean_label-GM_probseg.nii
+```
+
+### Why the image is not cleaned too
+
+The simulated image is `sum_k mn_k * Yp0toC(label,k)`, so removing a vessel
+from the label would remove it from the image as well, and the result would be
+cleaner than any real scan. Worse, a synthesis whose label describes every
+structure of its own image is related to it by a known one-dimensional curve:
+the task is invertible, and a network trained on it learns to invert a lookup
+table rather than to segment.
+
+Rendering from the uncorrected fractions and writing the corrected ones breaks
+that. The T1w still shows the vessel at its true intensity while the ground
+truth calls it CSF, which is exactly the "looks like GM but is not GM" signal
+that a segmentation has to learn and that a self-consistent synthesis cannot
+provide.
+
+### Blood vessels and dura
+
+`cat_vol_partvol` already detects them and writes them into its region label as
+`LAB.BV`, using a prior built from the MRA scans of IXI and ICBM
+(`cat_bloodvessels.nii`) together with the divergence and the gradient of the
+image and a region growing. Nothing is detected again here, the label is only
+read out, so the result is CAT12's own and not a second opinion.
+
+A Hessian **sheetness** filter was considered instead and rejected. The
+cortical ribbon is itself a sheet of 2-3mm, so such a filter fires on the
+cortex as hard as it does on the dura, and at 0.5mm the dura is one to two
+voxels and sits at the noise floor. Frangi vesselness is better posed for the
+vessels, a tube being separable from a sheet, but the large pial vessels lie
+inside the sulcal CSF touching the cortex and merge with it. What separates the
+two is not the shape but the position relative to the WM and the anatomical
+prior, which is what CAT12 uses and what the divergence terms of
+`cat_vol_partvol` already contribute.
+
+### Periventricular CSF/WM partial volume
+
+A voxel that mixes CSF and WM has an intensity between the two, i.e. the
+intensity of GM, so a label built from the intensity calls it GM. This is a
+port of the level 3 cleanup of `cat_main_cleanup`: the voxel has to lie next to
+the ventricle, the brainstem or the corpus callosum, must not be in the basal
+ganglia or the thalamus, must sit between pure WM and pure CSF, and must belong
+to a thin structure rather than to a real band of GM.
+
+The correction sets the GM fraction to zero and re-decomposes the voxel as a
+pure CSF/WM mixture. With `1*c + 3*(1-c) = label` the CSF fraction is
+`c = (3-label)/2`, so **the label comes out exactly as it went in** and only
+the fractions change. That is precisely why a scalar label cannot express this
+correction, and why the fractions are written as `_probseg` files.
+
+On a phantom with a ventricle rim that reads as GM and a genuine cortical band
+of the same label value, the detection puts 100% of its voxels on the rim and
+none on the cortex, at 100% rim coverage.
+
+Two deviations from `cat_main_cleanup`: its `Yp0` comes from quantized uint8
+posteriors so it can test `Yp0==3` and `Yp0==1`, while the label here is
+continuous and thresholds are used instead; and its radii are partly in voxels,
+which would silently halve them for a 0.5mm image, so the radii here are in mm
+with the voxel size passed to `cat_vol_morph`.
+
+### Cost and notes
+
+- It needs the atlas partitioning of `cat_vol_partvol`, which costs minutes.
+  It is computed once and shared with `closeWMHholes` when both are used.
+- The label gains a `Clean` tag in its `desc` entity. The simulated image does
+  not, because it is bit for bit the same with and without the option.
+- `_probseg` files are `uint8` with a scale of 1/255, like CAT12's `p1`/`p2`/`p3`.
+- The GM fraction is what a nogm-style correction model needs: the voxels where
+  the triangular decomposition of the label overestimates GM are exactly
+  `Yp0toC(label,2) - probseg_GM`.
+
 ## Affine registration of the output
 
 `simu.affine` writes the simulated image and its ground truth onto one common
@@ -284,6 +366,7 @@ motion | Movement artefacts. Scalar severity (`0`=off, `1`/`2`/`3` = mild/modera
 ringing | Ringing. `0`=off, `1`/`2`/`3` = mild/moderate/severe, or a struct with `strength`, `type` (`'notch'` default, or `'gibbs'`), `pe` and `k0`. Independent of `motion` and combinable with it. See [Ringing](#ringing). (Default: `0`)
 derivative | If `1`, save outputs into BIDS derivatives at the dataset root: `derivatives/mri_simulate-<version>/sub-*/ses-*/...`, mirroring the subject/session path. Thickness simulations use `mri_simulate_thickness-<version>`. (Default: `1`)
 resolution | Output voxel size: scalar (applied to x,y,z) or `[x y z]`. `NaN` keeps the original resolution. Ignored when `affine` is active, since the target grid already fixes the voxel size. (Default: `NaN`)
+clean | Clean the ground truth label of blood vessels, dura and the periventricular CSF/WM partial volume, while the simulated image keeps them. `0`=off, `1`=on with defaults, or a struct with `bv`, `pve` and `probseg`. See [Cleaning the ground truth](#cleaning-the-ground-truth). (Default: `0`)
 affine | Write the outputs affinely registered onto a common grid instead of the grid of the input. `0`=off, `1`=on with defaults, `'deformation'`/`'spm'` to pick the method, or a struct with `method`, `mask`, `grid`, `dim`, `mat`, `bb`, `vx`, `interp` and `space`. See [Affine registration of the output](#affine-registration-of-the-output). (Default: `0`)
 WMH | Strength of white matter hyperintensities. `0`=off; `1`=mild; `2`=medium; `3`=strong; values `>=1` allowed. Larger values broaden the WMH prior via exponent `1/(WMH-0.8)` and scale the label contribution by `~1/WMH^0.75`. Constrained to (eroded) WM and modulated by a random field. (Default: `0`)
 atrophy | Atrophy specification: `{atlasName, roiIds[], factors[]}`; factors >1 increase CSF (reduce GM) within ROIs. Either thickness or atrophy can be simulated. (Default: `[]`)
@@ -304,7 +387,7 @@ If `simu` and/or `rf` are omitted or partially specified, missing fields are fil
 
 ```matlab
 simu = struct('name', '', 'snrWM', 40, 'pn', 0, 'contrast', 1, ...
-              'motion', 0, 'ringing', 0, 'affine', 0, ...
+              'motion', 0, 'ringing', 0, 'affine', 0, 'clean', 0, ...
               'resolution', NaN, 'WMH', 0, 'atrophy', [], 'thickness', 0, ...
               'rng', 0, 'derivative', 1, 'closeWMHholes', 0, ...
               'parpool', feature('numcores')/2);

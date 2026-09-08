@@ -101,6 +101,34 @@ function mri_simulate(simu, rf)
 %         label rather than interpolated on their own, which cannot produce a
 %         CSF/WM mixture without GM. simu.resolution is ignored while this is
 %         active, since the grid already defines the voxel size.
+%       - 'clean' (scalar or struct): Clean the ground truth label of the
+%         structures that are not the tissue they look like. 0 (default)
+%         writes the label exactly as it was segmented, 1 switches it on with
+%         all defaults, a struct overrides single fields:
+%           .bv      - strength of the blood vessel correction of
+%                      cat_vol_partvol, in [0,1]; 0 switches that part off
+%                      (0.5). cat_vol_partvol detects the vessels itself, with
+%                      a prior built from the MRA scans of IXI and ICBM
+%                      combined with the divergence of the image and a region
+%                      growing, so nothing is detected again here.
+%           .pve     - correct the partial volume between WM and CSF around
+%                      the ventricles, where a mixture of the two has the
+%                      intensity of GM and an intensity based label therefore
+%                      calls it GM (1). Ported from the level 3 cleanup of
+%                      cat_main_cleanup.
+%           .probseg - write the corrected tissue fractions as
+%                      _label-{GM,WM,CSF}_probseg next to the label (1).
+%         The simulated image is deliberately NOT cleaned: it is rendered from
+%         the uncorrected fractions, so a blood vessel keeps its bright
+%         intensity in the T1w while the label no longer calls it GM. That is
+%         the point of the option. A synthesis whose label describes every
+%         structure of its own image poses an invertible problem and teaches a
+%         network nothing about the structures a segmentation has to reject.
+%         The periventricular correction changes only the fractions and not
+%         the label, because a CSF/WM mixture and a pure GM voxel are the same
+%         number, which is why the fractions are written out as well.
+%         Costs minutes: it needs the atlas partitioning of cat_vol_partvol,
+%         which is shared with closeWMHholes when both are used.
 %       - 'derivative' (logical): If true, save outputs under a BIDS-style
 %         derivatives folder at the dataset root, using the pipeline name
 %         'mri_simulate-<version>' ('mri_simulate_thickness-<version>' for
@@ -410,6 +438,7 @@ def.contrast   = 1;    % power-law contrast change exponent (1 = unchanged)
 def.motion     = 0;    % severity of the movement artefacts (0 = none)
 def.ringing    = 0;    % strength of the Gibbs ringing (0 = none)
 def.affine     = 0;    % affine registration of the output (0 = keep native)
+def.clean      = 0;    % clean the ground truth label (0 = keep it as segmented)
 def.derivative = 1;    % save outputs into BIDS derivatives
 def.closeWMHholes = 0; % don't close WMHs inside deep WM
 def.parpool = feature('numcores')/2; % use half of the available processors
@@ -425,7 +454,7 @@ end
 % is not one, and cat_io_updateStruct, which does the merging, removes such a
 % field and only tries to restore it inside a try block that swallows the
 % failure. Those fields are therefore kept aside and put back after the merge.
-struct_fields = {'motion','ringing','affine'};
+struct_fields = {'motion','ringing','affine','clean'};
 kept = struct();
 if nargin > 0 && isstruct(simu)
   for i = 1:numel(struct_fields)
@@ -780,11 +809,24 @@ for i = 1:3
 end
 clear Ysum
 
+% Ground truth cleanup and WMH closing both need the CAT12 atlas partitioning,
+% which costs minutes, so it runs once here while the tissue posteriors and the
+% LAS corrected image are still available. Only Yl1 is carried further, the
+% detection itself runs at the very end on the final grid.
+clean = resolve_clean_options(simu.clean);
+do_clean = ~isempty(clean);
+Yl1 = []; LABc = []; NSc = []; Ycls_pv = []; Yb_pv = [];
+if do_clean || (isfield(simu,'closeWMHholes') && simu.closeWMHholes)
+  bvcstr = [];
+  if do_clean, bvcstr = clean.bv; end
+  [Yl1, Ycls_pv, Yb_pv, LABc, NSc] = cat_partitioning(Ysrc, Ycorr, Ycls, Yy, res, vx, bvcstr);
+end
+
 % optionally close WMHs within deep WM using CAT12 approach
 if isfield(simu,'closeWMHholes') && simu.closeWMHholes
-  Yseg = close_WM_GM_holes(Yseg, Ysrc, Ycorr, Ycls, Yy, res, vx);
+  Yseg = close_WM_GM_holes(Yseg, Ysrc, Ycorr, Ycls, Yy, res, vx, Yl1, Ycls_pv, Yb_pv, LABc, NSc);
 end
-clear Ycls Ycorr
+clear Ycls Ycorr Ycls_pv Yb_pv
 
 % For thickness simulation, resample to 0.5mm before atrophy/thickness
 if any(simu.thickness)
@@ -827,6 +869,18 @@ if any(simu.thickness)
       end
     end
     Yseg = Yseg_res;
+
+    % the region label follows on the same grid, nearest neighbour keeps it
+    % categorical
+    if ~isempty(Yl1)
+      Yl1_res = zeros(Vres_tmp.dim, 'single');
+      for sl = 1:Vres_tmp.dim(3)
+        M = spm_matrix([0 0 sl 0 0 0 1 1 1]);
+        M1 = Vres_tmp.mat\V0.mat\M;
+        Yl1_res(:,:,sl) = spm_slice_vol(single(Yl1), M1, Vres_tmp.dim(1:2), 0);
+      end
+      Yl1 = Yl1_res;
+    end
 
     thickness_resampled = true;
   end
@@ -945,6 +999,7 @@ if do_affine
   label_aff = zeros(aff.dim, 'single');
   Ybias_aff = zeros(aff.dim, 'single');
   if ~isempty(WMH), WMH_aff = zeros(aff.dim, 'single'); end
+  if ~isempty(Yl1), Yl1_aff = zeros(aff.dim, 'single'); end
   for sl = 1:aff.dim(3)
     Ms = MA * spm_matrix([0 0 sl 0 0 0 1 1 1]);
     label_aff(:,:,sl) = spm_slice_vol(label_pve, Ms, aff.dim(1:2), aff.interp);
@@ -952,8 +1007,13 @@ if do_affine
     if ~isempty(WMH)
       WMH_aff(:,:,sl) = spm_slice_vol(WMH, Ms, aff.dim(1:2), aff.interp);
     end
+    % nearest neighbour, the region label is categorical
+    if ~isempty(Yl1)
+      Yl1_aff(:,:,sl) = spm_slice_vol(single(Yl1), Ms, aff.dim(1:2), 0);
+    end
   end
   clear Ysrc_cur
+  if ~isempty(Yl1), Yl1 = Yl1_aff; clear Yl1_aff; end
 
   % Sinc interpolation overshoots at the hard edges of the label, thus the
   % result is clamped back into the valid range before the tissue fractions
@@ -1006,6 +1066,23 @@ end
 
 Ysimu = synthesize_from_segmentation(Yseg, name, res, mn, dim, WMH, Ybias_aff);
 
+% Ground truth cleanup, deliberately after the synthesis.
+%
+% The image above was rendered from the uncorrected fractions, so a blood
+% vessel keeps its bright intensity in the T1w while the label no longer calls
+% it GM. The image thereby stops being a function of the label, which is what a
+% network has to learn from: a synthesis whose label describes every structure
+% of its image poses an invertible problem and teaches nothing about the
+% structures that a segmentation has to reject.
+Yseg_gt = Yseg;
+if do_clean
+  [Ybv, Ypve] = detect_label_artefacts(Yl1, label_pve, LABc, NSc, vx, clean);
+  [Yseg_gt, label_pve] = apply_label_cleanup(Yseg_gt, label_pve, Ybv, Ypve, order);
+  fprintf('Ground truth cleanup: %d blood vessel and %d periventricular voxels.\n', ...
+          sum(Ybv(:)), sum(Ypve(:)));
+  clear Ybv Ypve Yl1
+end
+
 % apply either predefined MNI bias field or simulated bias field before resizing
 % to defined output resolution
 if rf.percent ~= 0
@@ -1044,6 +1121,11 @@ end
 % output in defined resolution
 volres   = zeros(Vres.dim);
 labelres_pve = zeros(Vres.dim);
+if do_clean && clean.probseg
+  segres = zeros([Vres.dim 3]);
+else
+  segres = [];
+end
 
 if change_resolution
   if rf.save, rfres = zeros(Vres.dim); end
@@ -1059,11 +1141,18 @@ if change_resolution
     if rf.save
       rfres(:,:,sl) = spm_slice_vol(rf_field,M1,Vres.dim(1:2),1);
     end
+    % the corrected tissue fractions follow the label
+    if ~isempty(segres)
+      for j = 1:3
+        segres(:,:,sl,j) = spm_slice_vol(Yseg_gt(:,:,:,j),M1,Vres.dim(1:2),1);
+      end
+    end
   end
 else % we can skip interpolation if voxels size is the same
   volres = Ysimu;
   labelres_pve = label_pve;
   if rf.save, rfres = rf_field; end
+  if do_clean && clean.probseg, segres = Yseg_gt; end
 end
 
 volres = volres / mx_vol;
@@ -1203,6 +1292,11 @@ end
 
 % the simulated image is described by both groups of tags
 desc_main = bids_label([desc_acq desc_anat]);
+
+% The cleanup only changes the ground truth, the simulated image is rendered
+% from the uncorrected fractions and is bit for bit the same with and without
+% it. The tag therefore belongs to the label alone.
+if do_clean, desc_anat = [desc_anat 'Clean']; end
 desc_anat = bids_label(desc_anat);
 
 % Without any option (no noise, no bias field, no contrast change and no
@@ -1354,6 +1448,14 @@ try
     end
   end
 
+  if do_clean
+    simpar.LabelCleanup = struct( ...
+      'BloodVessels',    clean.bv, ...
+      'PeriventricularPVE', clean.pve, ...
+      'TissueFractions', clean.probseg, ...
+      'Note', ['the simulated image is rendered from the uncorrected ' ...
+               'fractions, so it still shows what the label rejects']);
+  end
   if do_affine
     % Affine is the fitted native mm -> template mm transform, and Mat the
     % voxel-to-mm matrix of the grid the output was written on, so that the
@@ -1388,6 +1490,26 @@ Vres.fname = label_pve_name;
 Vres.pinfo = [1/255/3 0 352]';
 Vres.dt    = [4 0];
 spm_write_vol(Vres, labelres_pve);
+
+% Corrected tissue fractions. They carry what the scalar label cannot: a
+% periventricular voxel keeps its label value, because a CSF/WM mixture and a
+% pure GM voxel are the same number, and only the fractions tell them apart.
+if ~isempty(segres)
+  Vp = Vres;
+  Vp.pinfo = [1/255 0 352]';
+  Vp.dt    = [spm_type('uint8') 0];
+  probseg_labels = {'GM','WM','CSF'};   % Yseg is in SPM class order
+  for j = 1:3
+    Vp.fname = fullfile(out_pth, [bids_prefix ent_space ent_res ent_anat ...
+                                  '_label-' probseg_labels{j} '_probseg.nii']);
+    fprintf('Save %s\n', Vp.fname);
+    spm_write_vol(Vp, max(0, min(1, segres(:,:,:,j))));
+    if is_gz
+      gzip(Vp.fname);
+      spm_unlink(Vp.fname);
+    end
+  end
+end
 
 % sidecar for the label image: the dseg suffix normally implies integer
 % labels, so the partial volume encoding has to be documented here
@@ -2396,6 +2518,247 @@ Ysimu = rf_field.*Ysimu;
 
 
 %==========================================================================
+% function opt = resolve_clean_options(clean)
+%
+% Purpose
+%   Turn simu.clean into a full option struct, or into [] when the ground
+%   truth is written exactly as it was segmented.
+%
+% Accepted forms
+%   0, [], false   off
+%   1, true        on with all defaults
+%   struct         any of the fields below, the rest are defaults
+%
+% Fields
+%   bv       strength of the blood vessel correction of cat_vol_partvol, in
+%            [0,1]; 0 switches the vessel part off (0.5).
+%   pve      correct the CSF/WM partial volume around the ventricles (1).
+%   probseg  write the corrected tissue fractions next to the label (1).
+%==========================================================================
+function opt = resolve_clean_options(clean)
+
+if isempty(clean), opt = []; return; end
+
+if isnumeric(clean) || islogical(clean)
+  if ~any(clean(:)), opt = []; return; end
+  clean = struct();
+elseif ~isstruct(clean)
+  error('simu.clean must be a scalar or a struct.');
+end
+
+opt = clean;
+if ~isfield(opt,'bv')      || isempty(opt.bv),      opt.bv      = 0.5; end
+if ~isfield(opt,'pve')     || isempty(opt.pve),     opt.pve     = 1;   end
+if ~isfield(opt,'probseg') || isempty(opt.probseg), opt.probseg = 1;   end
+
+if ~isscalar(opt.bv) || opt.bv < 0 || opt.bv > 1
+  error('simu.clean.bv must be a scalar in [0,1].');
+end
+
+
+%==========================================================================
+% function [Ybv, Ypve] = detect_label_artefacts(Yl1, label, LAB, NS, vx, opt)
+%
+% Purpose
+%   Find the two places where the ground truth label describes GM that is not
+%   GM: blood vessels and dura, and the partial volume between WM and CSF
+%   around the ventricles.
+%
+% Blood vessels
+%   cat_vol_partvol detects them itself, with a prior built from the MRA scans
+%   of IXI and ICBM (cat_bloodvessels.nii) combined with the divergence and
+%   the gradient of the image and a region growing, and writes the result into
+%   Yl1 as LAB.BV. Nothing is detected again here, only read out.
+%
+%   A Hessian sheetness filter was considered instead and rejected: the
+%   cortical ribbon is itself a sheet of 2-3mm, so such a filter fires on the
+%   cortex as hard as on the dura, and at 0.5mm the dura is one to two voxels
+%   and sits at the noise floor. What separates the two is not the shape but
+%   the position relative to WM and the anatomical prior, which is what CAT12
+%   uses.
+%
+% Periventricular partial volume
+%   A voxel that mixes CSF and WM has an intensity between the two, i.e. the
+%   intensity of GM, and a label built from the intensity therefore calls it
+%   GM. This ports the level 3 cleanup of cat_main_cleanup: the region has to
+%   lie next to the ventricle, the brainstem or the corpus callosum, must not
+%   be in the basal ganglia or the thalamus, must sit between pure WM and pure
+%   CSF, and must be a thin structure rather than a real band of GM.
+%
+%   Two deviations from cat_main_cleanup. Its Yp0 comes from quantized uint8
+%   posteriors, so it can test Yp0==3 and Yp0==1; here the label is continuous
+%   and thresholds are used instead. And its radii are partly in voxels, which
+%   silently halves them for a 0.5mm image, so the radii here are in mm and
+%   the voxel size is passed to cat_vol_morph.
+%
+% Inputs
+%   Yl1   - single(dims): region label from cat_partitioning.
+%   label - single(dims): current PVE label, 0..3 (4 with WMHs).
+%   LAB   - struct of region ids.
+%   NS    - handle testing a region id and its right hemisphere counterpart.
+%   vx    - voxel size in mm.
+%   opt   - option struct from resolve_clean_options.
+%
+% Outputs
+%   Ybv   - logical(dims): blood vessel and dura voxels.
+%   Ypve  - logical(dims): periventricular CSF/WM voxels labelled as GM.
+%==========================================================================
+function [Ybv, Ypve] = detect_label_artefacts(Yl1, label, LAB, NS, vx, opt)
+
+Ybv  = false(size(label));
+Ypve = false(size(label));
+
+if isempty(Yl1), return; end
+
+if opt.bv > 0
+  % a vessel that the label already calls CSF needs no correction
+  Ybv = NS(Yl1, LAB.BV) & label > 1.5;
+end
+
+if opt.pve
+  Ybs    = NS(Yl1,LAB.BS) & label > 2;
+  YpveVB = cat_vol_morph(NS(Yl1,LAB.VT) | Ybs, 'dd', 2, vx);
+  % the corpus callosum lies between the two hemispheres and next to the
+  % ventricle; LAB.CT is the cortex, its id and id+1 are left and right
+  YpveCC = cat_vol_morph(Yl1==LAB.CT,  'dd', 3, vx) & ...
+           cat_vol_morph(Yl1==LAB.CT+1,'dd', 3, vx) & ...
+           cat_vol_morph(NS(Yl1,LAB.VT),'dd', 2, vx);
+  Ynpve  = smooth3(NS(Yl1,LAB.BG) | NS(Yl1,LAB.TH)) > 0.3;
+  Ymid   = label > 1 & label < 3;
+  Ypve   = (YpveVB | YpveCC) & ~Ynpve & ...
+           cat_vol_morph(label > 2.9, 'dd', 2, vx) & ...
+           cat_vol_morph(label < 1.1, 'dd', 2, vx) & ...
+           Ymid & smooth3(Ymid & ~cat_vol_morph(Ymid, 'do', 1.5, vx)) > 0.1;
+end
+
+
+%==========================================================================
+% function [Yseg, label] = apply_label_cleanup(Yseg, label, Ybv, Ypve, order)
+%
+% Purpose
+%   Rewrite the tissue fractions of the ground truth in the detected regions,
+%   and the label wherever the label can express the correction.
+%
+% What changes and what does not
+%   A blood vessel or a piece of dura is set to CSF, which does change the
+%   label. A periventricular voxel is re-decomposed as a pure CSF/WM mixture:
+%   with a GM fraction of zero and 1*c + 3*(1-c) = label, the CSF fraction is
+%   c = (3-label)/2, so the label comes out exactly as it went in. Only the
+%   fractions carry that correction, which is precisely why a scalar label
+%   cannot express it and why the fractions are written out as well.
+%
+% Inputs
+%   Yseg  - single(dims,3): tissue fractions in GM/WM/CSF order.
+%   label - single(dims): PVE label.
+%   Ybv   - logical(dims): blood vessel and dura voxels.
+%   Ypve  - logical(dims): periventricular CSF/WM voxels.
+%   order - [1x3]: maps the label value k=1,2,3 onto the Yseg index, [3 1 2].
+%
+% Outputs
+%   Yseg  - corrected fractions.
+%   label - label, changed only where Ybv is set.
+%==========================================================================
+function [Yseg, label] = apply_label_cleanup(Yseg, label, Ybv, Ypve, order)
+
+iCSF = order(1);
+iGM  = order(2);
+iWM  = order(3);
+
+if any(Ypve(:))
+  c = (3 - label) / 2;
+  t = Yseg(:,:,:,iGM);  t(Ypve) = 0;            Yseg(:,:,:,iGM)  = t;
+  t = Yseg(:,:,:,iWM);  t(Ypve) = 1 - c(Ypve);  Yseg(:,:,:,iWM)  = t;
+  t = Yseg(:,:,:,iCSF); t(Ypve) = c(Ypve);      Yseg(:,:,:,iCSF) = t;
+end
+
+if any(Ybv(:))
+  t = Yseg(:,:,:,iGM);  t(Ybv) = 0; Yseg(:,:,:,iGM)  = t;
+  t = Yseg(:,:,:,iWM);  t(Ybv) = 0; Yseg(:,:,:,iWM)  = t;
+  t = Yseg(:,:,:,iCSF); t(Ybv) = 1; Yseg(:,:,:,iCSF) = t;
+end
+
+% Only the corrected voxels are rewritten. Recomputing the whole label from
+% the fractions would also touch the WMH class, which lives above 3 and is not
+% part of them.
+m = Ybv | Ypve;
+if any(m(:))
+  newlabel = Yseg(:,:,:,iCSF) + 2*Yseg(:,:,:,iGM) + 3*Yseg(:,:,:,iWM);
+  label(m) = newlabel(m);
+end
+
+
+%==========================================================================
+% function [Yl1, Ycls, Yb, LAB, NS] = cat_partitioning(Ysrc, Ycorr, Ycls, Yy, res, vx_vol, BVCstr)
+%
+% Purpose
+%   Run the CAT12 atlas partitioning and return its region label Yl1 together
+%   with the updated tissue classes and the brain mask.
+%
+% Why it is its own function
+%   Both the WMH closing and the ground truth cleanup need Yl1, and
+%   cat_vol_partvol costs minutes, so it must not run twice for one image.
+%
+% Inputs
+%   Ysrc   - single(dims): bias corrected image.
+%   Ycorr  - single(dims): LAS corrected image used by cat_vol_partvol.
+%   Ycls   - cell of uint8(dims): SPM tissue posteriors (0..255).
+%   Yy     - deformation field to the TPM.
+%   res    - segmentation structure from SPM segmentation.
+%   vx_vol - voxel size in mm.
+%   BVCstr - optional blood vessel correction strength in [0,1]. Left out, the
+%            CAT12 default is used.
+%
+% Outputs
+%   Yl1    - single(dims): region label, see the LAB fields.
+%   Ycls   - tissue classes as cat_vol_partvol left them.
+%   Yb     - brain mask.
+%   LAB    - struct of the region ids.
+%   NS     - handle testing a region id and its right hemisphere counterpart.
+%==========================================================================
+function [Yl1, Ycls, Yb, LAB, NS] = cat_partitioning(Ysrc, Ycorr, Ycls, Yy, res, vx_vol, BVCstr)
+
+% we have to prepare some parameters for cat_main_updateSPM1639
+global cat; cat_defaults;
+job = cat;
+job.extopts.inv_weighting = 0; job.extopts.verb = 0;
+
+% Blood vessel correction strength of cat_vol_partvol. It decides how eagerly
+% the LAB.BV label is assigned, and is only passed on when the caller asks for
+% it, so the WMH path keeps the CAT12 default.
+if nargin > 6 && ~isempty(BVCstr), job.extopts.BVCstr = BVCstr; end
+
+% Internal working resolution of cat_vol_partvol. It defaults to 0.7mm, which
+% for a 0.5mm phantom means that the iterative region growing in
+% cat_vol_laplace3R (the dominating cost of this step, marked as bottleneck in
+% cat_vol_partvol itself) runs on ~12 million voxels and takes minutes.
+% Only Yl1 and the WMH class are used below, both as coarse masks that are
+% afterwards dilated by 8mm and closed by 12mm, so a finer grid brings nothing
+% here. cat_vol_partvol restores the native resolution of its outputs, thus
+% this only affects the internal computation. Lowering it towards 0.7 gives a
+% more detailed WMH mask at a steeply increasing cost (roughly linear in the
+% number of voxels, i.e. ~3x from 1.0 to 0.7 and ~12x from 1.5 to 0.7).
+job.extopts.uhrlim = max(1.0, max(vx_vol));
+P = zeros([size(Ycls{1}) numel(Ycls)],'uint8');
+for i=1:numel(Ycls), P(:,:,:,i) = Ycls{i}; end
+clear Ycls;
+tpm.dat = cell(numel(res.tpm),1);
+tpm.V = res.tpm;
+for i=1:numel(res.tpm)
+  tpm.dat{i} = spm_read_vols(res.tpm(i));
+end
+noise = 0.03;
+res.image0 = res.image; res.ppe.affreg.skullstripped = 0; res.ppe.affreg.highBG = 0;
+stime  = cat_io_cmd('');
+stime2 = cat_io_cmd('');
+
+[~,Ycls,Yb] = cat_main_updateSPM1639(Ysrc,P,Yy,tpm,job,res,stime,stime2);
+[Yl1,Ycls] = cat_vol_partvol(Ycorr,Ycls,Yb,Yy,vx_vol,job.extopts,tpm.V,noise,job,false(size(Yb)));
+
+NS  = @(Ys,s) Ys==s | Ys==s+1;
+LAB = job.extopts.LAB;
+
+
+%==========================================================================
 % function aff = resolve_affine_options(affine)
 %
 % Purpose
@@ -3378,7 +3741,7 @@ res.isMP2RAGE = 0;
 Yb = cat_main_APRG(Ysrc, P, res, T3th);
 
 
-function Yseg = close_WM_GM_holes(Yseg, Ysrc, Ycorr, Ycls, Yy, res, vx_vol)
+function Yseg = close_WM_GM_holes(Yseg, Ysrc, Ycorr, Ycls, Yy, res, vx_vol, Yl1, Ycls_pv, Yb, LAB, NS)
 % CLOSE_WM_GM_HOLES - Fill WMHs in WM and correct WM and GM segmentation
 %
 % Purpose
@@ -3413,40 +3776,16 @@ function Yseg = close_WM_GM_holes(Yseg, Ysrc, Ycorr, Ycls, Yy, res, vx_vol)
 %   simu.closeWMHholes = 0 to skip this step for inputs known to be free of
 %   WMHs, such as the Colin27 template.
 
-% we have to prepare some parameters for cat_main_updateSPM1639
-global cat; cat_defaults;
-job = cat;
-job.extopts.inv_weighting = 0; job.extopts.verb = 0;
-
-% Internal working resolution of cat_vol_partvol. It defaults to 0.7mm, which
-% for a 0.5mm phantom means that the iterative region growing in
-% cat_vol_laplace3R (the dominating cost of this step, marked as bottleneck in
-% cat_vol_partvol itself) runs on ~12 million voxels and takes minutes.
-% Only Yl1 and the WMH class are used below, both as coarse masks that are
-% afterwards dilated by 8mm and closed by 12mm, so a finer grid brings nothing
-% here. cat_vol_partvol restores the native resolution of its outputs, thus
-% this only affects the internal computation. Lowering it towards 0.7 gives a
-% more detailed WMH mask at a steeply increasing cost (roughly linear in the
-% number of voxels, i.e. ~3x from 1.0 to 0.7 and ~12x from 1.5 to 0.7).
-job.extopts.uhrlim = max(1.0, max(vx_vol));
-P = zeros([size(Ycls{1}) numel(Ycls)],'uint8');
-for i=1:numel(Ycls), P(:,:,:,i) = Ycls{i}; end
-clear Ycls;
-tpm.dat = cell(numel(res.tpm),1);
-tpm.V = res.tpm;
-for i=1:numel(res.tpm)
-  tpm.dat{i} = spm_read_vols(res.tpm(i));
+% Atlas partitioning of CAT12. Yl1 carries the anatomical regions and is
+% shared with the ground truth cleanup, so it is computed once by the caller
+% when both are active.
+if nargin < 8 || isempty(Yl1)
+  [Yl1, Ycls, Yb, LAB, NS] = cat_partitioning(Ysrc, Ycorr, Ycls, Yy, res, vx_vol);
+else
+  % cat_vol_partvol adds the WMH class to Ycls, so the updated copy is the one
+  % to use here and not the posteriors the caller started from
+  Ycls = Ycls_pv;
 end
-noise = 0.03;
-res.image0 = res.image; res.ppe.affreg.skullstripped = 0; res.ppe.affreg.highBG = 0;
-stime  = cat_io_cmd('');
-stime2 = cat_io_cmd('');
-
-[~,Ycls,Yb] = cat_main_updateSPM1639(Ysrc,P,Yy,tpm,job,res,stime,stime2);
-[Yl1,Ycls] = cat_vol_partvol(Ycorr,Ycls,Yb,Yy,vx_vol,job.extopts,tpm.V,noise,job,false(size(Yb)));
-
-NS = @(Ys,s) Ys==s | Ys==s+1;
-LAB = job.extopts.LAB;
 
 % Mask of structures where WMHs must not be corrected. The dilation by 8mm and
 % the closing by 12mm are deliberately coarse, but at native resolution they
