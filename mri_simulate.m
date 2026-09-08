@@ -2879,16 +2879,26 @@ else
   if ~isfield(aff,'grid') || isempty(aff.grid), aff.grid = 'deepmriprep'; end
   switch lower(aff.grid)
     case 'deepmriprep'
-      % The grid that the deepmriprep training scripts work on: 336x384x336
-      % voxels of 0.5mm, which is what 2_prep_segment.py ends up with after
-      % it has cropped its 339x411x339 sampling grid. Its nibabel affine puts
-      % the zero based voxel index 0 at (-84,-120,-72)mm, and an SPM matrix
-      % is one based, so the origin moves out by one voxel.
+      % The grid that the deepmriprep training scripts work on.
+      %
+      % 2_prep_segment.py samples the 339x411x339 grid of deepmriprep's
+      % Template_05mm_bet.nii.gz, whose origin is (-84,-120,-72)mm, and then
+      % crops it with [1:-2, 15:-12, :336] to 336x384x336. The crop starts at
+      % the voxels (1,15,0), so the origin of the training grid is that of the
+      % template shifted by (0.5,7.5,0)mm.
+      %
+      % The nibabel matrix that 2_prep_segment.py attaches to the cropped
+      % volume still carries the uncropped origin, and its last row is
+      % [0 0 0 0], so it cannot be used to define the space. The template and
+      % the crop can, and they are what the voxel content follows.
       vx      = [0.5 0.5 0.5];
       aff.dim = [336 384 336];
-      aff.mat = [vx(1) 0 0 -84-vx(1); ...
-                 0 vx(2) 0 -120-vx(2); ...
-                 0 0 vx(3) -72-vx(3); ...
+      org     = [-84 -120 -72] + [1 15 0] .* vx;   % template origin + crop
+      % a nibabel matrix is zero based and an SPM matrix is one based, so the
+      % SPM origin sits one voxel further out
+      aff.mat = [vx(1) 0 0 org(1)-vx(1); ...
+                 0 vx(2) 0 org(2)-vx(2); ...
+                 0 0 vx(3) org(3)-vx(3); ...
                  0 0 0 1];
     otherwise
       error(['Unknown simu.affine.grid ''%s''. Use ''deepmriprep'', or give ' ...

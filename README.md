@@ -326,11 +326,25 @@ Field | Meaning (Default)
 ------|------------------
 method | `'deformation'` fits an affine to the overall deformation field of the segmentation, `'spm'` takes `res.Affine` as it is (`'deformation'`)
 mask | Region the fit is restricted to: `'brain'`, `'nonbrain'`, `'head'` or `'all'` (`'brain'`)
-grid | `'deepmriprep'` for 336x384x336 voxels of 0.5mm, or `'custom'` through `dim`/`mat` or `bb`/`vx` (`'deepmriprep'`)
+grid | `'deepmriprep'` for 336x384x336 voxels of 0.5mm on the grid its training scripts use, or `'custom'` through `dim`/`mat` or `bb`/`vx` (`'deepmriprep'`)
 dim, mat | Dimensions and voxel-to-mm matrix of a custom grid, the matrix one based as every SPM matrix is
 bb, vx | Bounding box in mm and voxel size, as an alternative to `dim`/`mat` (`vx` defaults to 1mm)
 interp | Interpolation degree passed to `spm_slice_vol`: `-5` is sinc, a positive value a b-spline (`-5`)
 space | Label of the BIDS `space` entity (`'MNI152'`)
+
+### The deepmriprep grid
+
+`2_prep_segment.py` samples the 339x411x339 grid of deepmriprep's
+`Template_05mm_bet.nii.gz`, whose origin is (-84,-120,-72)mm, and crops it with
+`[1:-2, 15:-12, :336]` to 336x384x336. The crop starts at the voxels (1,15,0),
+so the origin of the training grid is that of the template shifted by
+(0.5,7.5,0)mm, i.e. (-83.5,-112.5,-72)mm.
+
+The nibabel matrix that `2_prep_segment.py` attaches to the cropped volume still
+carries the uncropped origin and has `[0 0 0 0]` as its last row, so it cannot
+be used to define the space; the template plus the crop can, and that is what
+the voxel content follows. Getting this wrong puts the simulation 7.5mm off
+along the anterior-posterior axis, which is 15 voxels.
 
 ### Why the affine is fitted to the deformation field
 
