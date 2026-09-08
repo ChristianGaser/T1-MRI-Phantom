@@ -111,6 +111,13 @@ function mri_simulate(simu, rf)
 %                      a prior built from the MRA scans of IXI and ICBM
 %                      combined with the divergence of the image and a region
 %                      growing, so nothing is detected again here.
+%           .dura    - distance in mm from the WM, measured through the
+%                      tissue with cat_vbdist, beyond which a GM labelled
+%                      voxel is taken for dura (4). Lower removes more, 0
+%                      switches it off. Dura and cortex cannot be told apart
+%                      by their plain distance to the WM, only by the fact
+%                      that a path from the WM to the dura has to cross the
+%                      subarachnoid CSF.
 %           .pve     - correct the partial volume between WM and CSF around
 %                      the ventricles, where a mixture of the two has the
 %                      intensity of GM and an intensity based label therefore
@@ -1076,11 +1083,15 @@ Ysimu = synthesize_from_segmentation(Yseg, name, res, mn, dim, WMH, Ybias_aff);
 % structures that a segmentation has to reject.
 Yseg_gt = Yseg;
 if do_clean
-  [Ybv, Ypve] = detect_label_artefacts(Yl1, label_pve, LABc, NSc, vx, clean);
-  [Yseg_gt, label_pve] = apply_label_cleanup(Yseg_gt, label_pve, Ybv, Ypve, order);
-  fprintf('Ground truth cleanup: %d blood vessel and %d periventricular voxels.\n', ...
-          sum(Ybv(:)), sum(Ypve(:)));
-  clear Ybv Ypve Yl1
+  [Ybv, Ypve, Ydura] = detect_label_artefacts(Yl1, label_pve, LABc, NSc, vx, clean);
+  % dura is treated like a vessel: it becomes CSF
+  [Yseg_gt, label_pve] = apply_label_cleanup(Yseg_gt, label_pve, Ybv | Ydura, Ypve, order);
+  vol = prod(vx)/1000;
+  fprintf(['Ground truth cleanup: %d blood vessel (%.1f cm3), %d dura (%.1f cm3) ' ...
+           'and %d periventricular voxels (%.1f cm3).\n'], ...
+          sum(Ybv(:)), sum(Ybv(:))*vol, sum(Ydura(:)), sum(Ydura(:))*vol, ...
+          sum(Ypve(:)), sum(Ypve(:))*vol);
+  clear Ybv Ypve Ydura Yl1
 end
 
 % apply either predefined MNI bias field or simulated bias field before resizing
@@ -1451,6 +1462,7 @@ try
   if do_clean
     simpar.LabelCleanup = struct( ...
       'BloodVessels',    clean.bv, ...
+      'DuraDistance',    clean.dura, ...
       'PeriventricularPVE', clean.pve, ...
       'TissueFractions', clean.probseg, ...
       'Note', ['the simulated image is rendered from the uncorrected ' ...
@@ -2532,6 +2544,9 @@ Ysimu = rf_field.*Ysimu;
 % Fields
 %   bv       strength of the blood vessel correction of cat_vol_partvol, in
 %            [0,1]; 0 switches the vessel part off (0.5).
+%   dura     distance in mm from the WM, measured through the tissue, beyond
+%            which a GM labelled voxel is taken for dura; 0 switches it off
+%            (4). Lower removes more.
 %   pve      correct the CSF/WM partial volume around the ventricles (1).
 %   probseg  write the corrected tissue fractions next to the label (1).
 %==========================================================================
@@ -2548,11 +2563,15 @@ end
 
 opt = clean;
 if ~isfield(opt,'bv')      || isempty(opt.bv),      opt.bv      = 0.5; end
+if ~isfield(opt,'dura')    || isempty(opt.dura),    opt.dura    = 4;   end
 if ~isfield(opt,'pve')     || isempty(opt.pve),     opt.pve     = 1;   end
 if ~isfield(opt,'probseg') || isempty(opt.probseg), opt.probseg = 1;   end
 
 if ~isscalar(opt.bv) || opt.bv < 0 || opt.bv > 1
   error('simu.clean.bv must be a scalar in [0,1].');
+end
+if ~isscalar(opt.dura) || opt.dura < 0
+  error('simu.clean.dura must be a non-negative scalar (a distance in mm).');
 end
 
 
@@ -2603,16 +2622,44 @@ end
 %   Ybv   - logical(dims): blood vessel and dura voxels.
 %   Ypve  - logical(dims): periventricular CSF/WM voxels labelled as GM.
 %==========================================================================
-function [Ybv, Ypve] = detect_label_artefacts(Yl1, label, LAB, NS, vx, opt)
+function [Ybv, Ypve, Ydura] = detect_label_artefacts(Yl1, label, LAB, NS, vx, opt)
 
-Ybv  = false(size(label));
-Ypve = false(size(label));
+Ybv   = false(size(label));
+Ypve  = false(size(label));
+Ydura = false(size(label));
 
 if isempty(Yl1), return; end
 
 if opt.bv > 0
   % a vessel that the label already calls CSF needs no correction
   Ybv = NS(Yl1, LAB.BV) & label > 1.5;
+end
+
+if opt.dura > 0
+  % Dura and cortex look the same locally, both are a thin sheet of GM
+  % intensity, and they are not separable by their distance to the WM either:
+  % on this data 99.5% of all GM labelled voxels lie within 5.3mm of the WM,
+  % dura included, because the dura over a gyral crown is as close to the WM
+  % as the cortex there.
+  %
+  % What separates them is that the cortex hangs on the WM while the dura sits
+  % on the far side of the subarachnoid CSF, so a path from the WM to the dura
+  % has to leave the tissue. cat_vbdist measures the distance inside a mask,
+  % and with the mask set to the tissue the dura ends up far away or
+  % unreachable while the cortex stays within a few mm. That is the same
+  % construction cat_vol_partvol uses for its distant blood vessels, where it
+  % compares a constrained against a free distance.
+  Ytis = label > 1.5;
+  Dw   = cat_vbdist(single(label > 2.5), Ytis) * mean(vx);
+
+  % Structures whose geometry makes a long path through the tissue normal.
+  % The cerebellum is the important one: its WM is a thin branched tree and
+  % the folia are far from it along the tissue. It is not dilated, so the
+  % tentorium, which lies outside it, stays detectable.
+  Yprot = cat_vol_morph(NS(Yl1,LAB.BG) | NS(Yl1,LAB.TH) | NS(Yl1,LAB.HC) | ...
+                        NS(Yl1,LAB.BS), 'dd', 2, vx) | NS(Yl1,LAB.CB);
+
+  Ydura = Ytis & label < 2.5 & (~isfinite(Dw) | Dw > opt.dura) & ~Yprot;
 end
 
 if opt.pve

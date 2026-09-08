@@ -230,6 +230,45 @@ two is not the shape but the position relative to the WM and the anatomical
 prior, which is what CAT12 uses and what the divergence terms of
 `cat_vol_partvol` already contribute.
 
+### Dura
+
+`clean.dura` is a distance in mm and removes what `clean.bv` does not: the
+dural membranes along the inner skull, the falx and the tentorium, which are
+sheets of GM intensity that no vessel prior covers.
+
+They cannot be separated from the cortex by their distance to the WM. Measured
+on a 0.5mm simulation, 99.5% of all GM labelled voxels lie within 5.3mm of the
+WM and the dura is among them, because the dura over a gyral crown is as close
+to the WM as the cortex underneath it.
+
+What separates them is that the cortex hangs on the WM while the dura sits on
+the far side of the subarachnoid CSF, so a path from the WM to the dura has to
+leave the tissue. `cat_vbdist` measures a distance *inside a mask*, and with the
+mask set to the tissue the dura ends up far away or unreachable while the
+cortex stays within a few mm. It is the same construction `cat_vol_partvol`
+uses for its distant blood vessels, where it compares a constrained against a
+free distance, and it costs about 1.5s on a 0.5mm volume.
+
+Measured on the same subject, with the threshold in mm and the volume it
+removes:
+
+`dura` | removed | comment
+-------|---------|--------
+3 | 81 cm³ | too much, eats into the cortex
+4 | 23 cm³ | default, the fullest coverage of the dural band and the falx
+5 | 10 cm³ | matches a true geodesic reference at 96% precision
+0 | - | off
+
+Lower is more aggressive. The cerebellum is protected because its WM is a thin
+branched tree and its folia are legitimately far from it along the tissue; it
+is not dilated, so the tentorium outside it stays detectable. Basal ganglia,
+thalamus, hippocampus and brainstem are protected with a 2mm dilation.
+
+Note that this only relabels tissue that the label calls GM. The broad mantle
+of subarachnoid space between the cortex and the inner skull is already CSF in
+the label, and how much of it is kept at all is decided by the APRG
+skull-stripping, not here.
+
 ### Periventricular CSF/WM partial volume
 
 A voxel that mixes CSF and WM has an intensity between the two, i.e. the
@@ -366,7 +405,7 @@ motion | Movement artefacts. Scalar severity (`0`=off, `1`/`2`/`3` = mild/modera
 ringing | Ringing. `0`=off, `1`/`2`/`3` = mild/moderate/severe, or a struct with `strength`, `type` (`'notch'` default, or `'gibbs'`), `pe` and `k0`. Independent of `motion` and combinable with it. See [Ringing](#ringing). (Default: `0`)
 derivative | If `1`, save outputs into BIDS derivatives at the dataset root: `derivatives/mri_simulate-<version>/sub-*/ses-*/...`, mirroring the subject/session path. Thickness simulations use `mri_simulate_thickness-<version>`. (Default: `1`)
 resolution | Output voxel size: scalar (applied to x,y,z) or `[x y z]`. `NaN` keeps the original resolution. Ignored when `affine` is active, since the target grid already fixes the voxel size. (Default: `NaN`)
-clean | Clean the ground truth label of blood vessels, dura and the periventricular CSF/WM partial volume, while the simulated image keeps them. `0`=off, `1`=on with defaults, or a struct with `bv`, `pve` and `probseg`. See [Cleaning the ground truth](#cleaning-the-ground-truth). (Default: `0`)
+clean | Clean the ground truth label of blood vessels, dura and the periventricular CSF/WM partial volume, while the simulated image keeps them. `0`=off, `1`=on with defaults, or a struct with `bv`, `dura`, `pve` and `probseg`. See [Cleaning the ground truth](#cleaning-the-ground-truth). (Default: `0`)
 affine | Write the outputs affinely registered onto a common grid instead of the grid of the input. `0`=off, `1`=on with defaults, `'deformation'`/`'spm'` to pick the method, or a struct with `method`, `mask`, `grid`, `dim`, `mat`, `bb`, `vx`, `interp` and `space`. See [Affine registration of the output](#affine-registration-of-the-output). (Default: `0`)
 WMH | Strength of white matter hyperintensities. `0`=off; `1`=mild; `2`=medium; `3`=strong; values `>=1` allowed. Larger values broaden the WMH prior via exponent `1/(WMH-0.8)` and scale the label contribution by `~1/WMH^0.75`. Constrained to (eroded) WM and modulated by a random field. (Default: `0`)
 atrophy | Atrophy specification: `{atlasName, roiIds[], factors[]}`; factors >1 increase CSF (reduce GM) within ROIs. Either thickness or atrophy can be simulated. (Default: `[]`)
