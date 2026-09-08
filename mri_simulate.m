@@ -445,7 +445,7 @@ def.contrast   = 1;    % power-law contrast change exponent (1 = unchanged)
 def.motion     = 0;    % severity of the movement artefacts (0 = none)
 def.ringing    = 0;    % strength of the Gibbs ringing (0 = none)
 def.affine     = 0;    % affine registration of the output (0 = keep native)
-def.clean      = 0;    % clean the ground truth label (0 = keep it as segmented)
+def.clean      = 1;    % clean the ground truth label (0 = keep it as segmented)
 def.derivative = 1;    % save outputs into BIDS derivatives
 def.closeWMHholes = 0; % don't close WMHs inside deep WM
 def.parpool = feature('numcores')/2; % use half of the available processors
