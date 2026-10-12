@@ -16,7 +16,7 @@ function mri_simulate(simu, rf)
 %   BlaiottaSegmentJob.m, both stored next to this file, and is cached in
 %   <name>_seg8.mat. An existing seg8.mat is reused as it is, thus delete it
 %   to segment data again that were segmented with another TPM.
-%   Requirements: SPM12 or SPM25 with CAT >= 26 installed (cat_main_LASsimple
+%   Requirements: SPM12 or SPM26 with CAT >= 26 installed (cat_main_LASsimple
 %   is required and is checked for at startup). No MATLAB toolboxes beyond
 %   base MATLAB are needed: distances use CAT's cat_bwdist (and cat_vbdist
 %   where the index of the nearest voxel is needed) so that the result does
