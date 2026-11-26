@@ -1,4 +1,6 @@
-# T1-MRI Simulator - Quick Overview
+# mri_simulate: quick reference
+
+Part of the [documentation of the MATLAB tools](../README.md).
 
 ## What is it?
 
@@ -6,11 +8,7 @@
 
 ## Requirements
 
-- MATLAB with SPM12 (or SPM25) and CAT >= 26 on the MATLAB path (`cat_main_LASsimple` is required and is checked for at startup)
-- The `matlab` folder of this repository on the MATLAB path; it holds `mri_simulate.m`, the thickness phantom and the files they load
-- No MATLAB toolboxes beyond base MATLAB. Distances use CAT's `cat_bwdist` (and `cat_vbdist` where the index of the nearest voxel is needed) rather than the Image Processing Toolbox, so results do not depend on the installed toolboxes; `parpool` (Parallel Computing Toolbox) is used only for multiple input images
-- A T1-weighted NIfTI image, `.nii` or `.nii.gz` (example: `colin27_t1_tal_hires.nii`)
-- `BlaiottaTPM.nii` and `BlaiottaSegmentJob.m` next to `mri_simulate.m`, which the segmentation uses; the run stops with an error if either is missing
+MATLAB with SPM12 (or SPM26) and CAT >= 26, and the folder `matlab` of the repository on the MATLAB path. The full list is in the [README](../README.md#requirements).
 
 ---
 
@@ -235,15 +233,6 @@ All image outputs are written compressed when the input was a `.nii.gz`, and the
 
 ---
 
-## Requirements
-
-- **MATLAB** (R2017b or later recommended)
-- **SPM12** or SPM25 (in MATLAB path)
-- **CAT >= 26** (in MATLAB path; `cat_main_LASsimple`, `cat_main_APRG`, `cat_bwdist` and `cat_vbdist` are used)
-- **Input**: High-quality T1w image, `.nii` or `.nii.gz` (e.g., 0.5mm Colin27 template provided)
-
----
-
 ## Tips & Tricks
 
 ### Getting Started
@@ -344,7 +333,7 @@ A file browser will open, and you can select any T1w image, compressed or not.
 
 ## Further Reading
 
-- **Detailed documentation**: See `README.md` for the full parameter and output description
+- **Detailed documentation**: [Usage](usage.md) for all parameters and outputs, and the other documents listed in the [README](../README.md#documentation)
 - **Code comments**: `mri_simulate.m` has extensive inline documentation
 - **SPM12 manual**: https://www.fil.ion.ucl.ac.uk/spm/doc/
 - **CAT12 manual**: http://www.neuro.uni-jena.de/cat12-help/
@@ -378,7 +367,7 @@ mri_simulate(simu, rf);
 
 ---
 
-**Version**: 0.10.1  
+**Version**: 0.10.2  
 **Author**: Christian Gaser  
 **Repository**: github.com/ChristianGaser/T1-MRI-Phantom  
 **License**: See LICENSE file
