@@ -5,12 +5,13 @@ Part of the [documentation of t1sim](../README.md#documentation).
 ## Requirements
 
 - Python 3.9 or newer.
-- For the package itself: numpy, nibabel and requests, which pip installs with it.
-- For the front end, in addition:
-  - [cat-surf](https://pypi.org/project/cat-surf/) 1.2.0 or newer, for the unified segmentation and the SANLM filter.
-  - [T1Prep](https://github.com/ChristianGaser/T1Prep) 0.9.2 or newer. This is the first version in which the segmentation on the working grid (`t1prep.unified_seg`) and LAS with given tissue intensities (`t1prep.apply_LAS(..., peaks=...)`) are public.
+- For the package itself: numpy, scipy, nibabel and requests, which pip installs with it. This is enough for the geometric phantom, the image-domain artefacts and the model download.
+- For everything that starts from a real scan (the extra `frontend`):
+  - [cat-surf](https://pypi.org/project/cat-surf/) 1.2.0 or newer, for the unified segmentation, the SANLM filter and the growth through the tissue.
+  - [T1Prep](https://github.com/ChristianGaser/T1Prep) 0.9.3 or newer. It provides the segmentation on the working grid with its deformation (`t1prep.unified_seg.segment(..., deformation=True)`), LAS with given tissue intensities (`t1prep.apply_LAS(..., peaks=...)`), the atlases and the vessel detection.
+  - torch, which T1Prep needs as well; it runs the movement artefacts and the deformations.
 
-Without the two packages of the front end, `t1sim` can be imported and the model files can be downloaded, but `frontend.segment` stops with an error that names what is missing.
+Without them `t1sim` can be imported, but `frontend.segment` stops with an error that names what is missing.
 
 ## Installing
 
@@ -23,7 +24,7 @@ pip install -e ".[frontend]"     # with the front end
 pip install -e .                 # or without it
 ```
 
-If pip finds no T1Prep 0.9.2, PyPI does not have that version yet. Install T1Prep from its repository first and repeat the command:
+If pip finds no T1Prep 0.9.3, PyPI does not have that version yet. Install T1Prep from its repository first and repeat the command:
 
 ```bash
 pip install "git+https://github.com/ChristianGaser/T1Prep.git"

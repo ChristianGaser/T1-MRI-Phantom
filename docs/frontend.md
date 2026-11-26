@@ -9,7 +9,7 @@ Part of the [documentation of t1sim](../README.md#documentation).
 - [How the ground truth is made](#how-the-ground-truth-is-made)
 - [Where the intensities come from](#where-the-intensities-come-from)
 - [The working grid](#the-working-grid)
-- [What it does not do yet](#what-it-does-not-do-yet)
+- [What comes after it](#what-comes-after-it)
 
 ## Usage
 
@@ -24,8 +24,9 @@ seg = frontend.segment("sub-01_T1w.nii.gz")
 | `t1` | The scan: a file name or a nibabel image, in any storage order. A single 3-D volume |
 | `template_dir` | Folder with the six-class shooting templates (the [model files](installation.md#model-files), downloaded on the first run) |
 | `verbose` | Print the stages of the segmentation (`False`) |
+| `deformation` | Also return the deformation to the templates, which the atlases need (`False`) |
 
-A run takes about 100 s on an M2 MacBook Air for a 0.75 mm scan: 21 s for the denoising, 59 s for the segmentation and 8 s for LAS.
+A run takes 90 to 100 s on an M2 MacBook Air for a 0.75 mm scan: 21 s for the denoising, 59 s for the segmentation and 8 s for LAS. The deformation costs no extra time.
 
 ## What is returned
 
@@ -46,6 +47,7 @@ A dict. All volumes lie on the [working grid](#the-working-grid) and are indexed
 | `affine` | 4 x 4 | The same registration in the normalised coordinates T1Prep resamples with (`t1prep.unified_seg.grid_affine`) |
 | `native_mat`, `native_shape` | 4 x 4, tuple | Voxel-to-world matrix and shape of the scan in RAS order |
 | `params` | dict | Everything the segmentation estimated: the mixture of Gaussians, the bias field, volumes, timings |
+| `iy`, `template_mat` | (X, Y, Z, 3) float32, 4 x 4 | With `deformation=True`: for every voxel the voxel of the segmentation's templates it maps to, and the voxel-to-world matrix of those templates. `t1sim.atlas.to_grid` brings an atlas onto the grid with them |
 
 A voxel of the working grid lies in the scan at
 
@@ -92,8 +94,6 @@ All results lie on T1Prep's working grid (`t1prep.unified_seg.default_working_gr
 
 The scan is resampled onto it once, after the denoising, and segmented there. The 336 x 384 x 336 grid on which the deepmriprep networks are trained is a crop of it.
 
-## What it does not do yet
+## What comes after it
 
-- **No cleanup of the label.** Blood vessels and dura that are as bright as GM are GM in the label. `matlab/mri_simulate.m` relabels them ([Cleaning the ground truth](../matlab/docs/cleanup.md)).
-- **No output on the grid of the scan.** Everything stays on the working grid.
-- **No files.** The result is a dict; nothing is written.
+The front end returns the ground truth as segmented and writes nothing. [Cleaning the ground truth](cleanup.md), [changing the anatomy](anatomy.md), the synthesis, the [artefacts](artefacts.md) and the files are the steps of [`t1sim.simulate`](simulation.md). Everything stays on the working grid; an output on the grid of the scan does not exist yet.

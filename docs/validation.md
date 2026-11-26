@@ -1,13 +1,15 @@
-# Agreement with the MATLAB tool
+# Agreement with the MATLAB tools
 
 Part of the [documentation of t1sim](../README.md#documentation).
 
-`matlab/mri_simulate.m` makes its ground truth by the same steps as `t1sim`, with SPM's unified segmentation and CAT12's LAS in place of CAT-Surface's and T1Prep's. This page compares the two labels on one scan. It is a comparison of two implementations of one idea, not a test against a truth.
+`t1sim` was ported from `matlab/mri_simulate.m`. This page compares the ground truth the two make of one scan, and lists where the other steps agree and where `t1sim` differs on purpose. The comparison of the ground truth is one of two implementations of one idea, not a test against a truth: `mri_simulate.m` uses SPM's unified segmentation and CAT12's LAS, `t1sim` CAT-Surface's and T1Prep's.
 
 - [What was compared](#what-was-compared)
 - [Result](#result)
 - [The intensity of pure GM](#the-intensity-of-pure-gm)
 - [Limits](#limits)
+- [The other steps](#the-other-steps)
+- [Where t1sim differs on purpose](#where-t1sim-differs-on-purpose)
 
 ## What was compared
 
@@ -70,5 +72,30 @@ For the peak to hold, it has to be used twice in LAS: the global mapping runs th
 
 - **One scan.** Nothing here says how the numbers vary between scans, scanners or field strengths.
 - **No truth.** The MATLAB label is a second implementation. Where the two agree, both may be wrong in the same way.
-- **Before the cleanup.** `t1sim` has no cleanup of vessels and dura yet, so the labels were compared without it.
+- **Before the cleanup.** The labels were compared before the cleanup of either tool; the two cleanups are compared in [Cleaning the ground truth](cleanup.md#measured).
 - **Not reproducible from the repository.** The scan and the scripts of this comparison are not part of it.
+
+## The other steps
+
+| Step | Compared how | Result | Details |
+| --- | --- | --- | --- |
+| Simulated bias field | Same seed, three settings | The same field: largest difference 8e-8 | [Artefacts](artefacts.md#what-was-checked) |
+| Movement | MATLAB's pose fed to `t1sim`, 17 cases | Largest difference 3e-7 to 5e-7 | [Artefacts](artefacts.md#what-was-checked) |
+| Ringing | 11 cases | Largest difference 3e-7 to 7e-7 | [Artefacts](artefacts.md#what-was-checked) |
+| Cortical thickness | Not against MATLAB; against the thickness asked for | 1.50 / 2.49 / 3.49 mm for 1.5 / 2.5 / 3.5 mm on a sphere | [Anatomy](anatomy.md#cortical-thickness) |
+| Cleanup | The voxels both relabel on one scan | Dice 0.47 inside MATLAB's brain mask | [Cleanup](cleanup.md#measured) |
+| Geometric phantom | Voxel by voxel | See its page | [Phantom](phantom.md) |
+
+## Where t1sim differs on purpose
+
+| Step | `mri_simulate.m` | `t1sim` | Why |
+| --- | --- | --- | --- |
+| Noise | The noisy image is limited to the brightest voxel of the image before the noise | No upper limit | The limit cuts off the upper half of the noise in the brightest tissue. In MATLAB's output without a bias field, white matter has a noise SD of 11.8 instead of 19.5 |
+| Synthesis | Limited to the 98th percentile of the image | Limited to the 99.99th | On a whole head at 0.5 mm the 98th percentile is the intensity of white matter, so the scalp fat is cut down to it |
+| SNR after a contrast change | Refers to white matter before the change | Refers to white matter in the image that is written | Otherwise the SNR that is asked for is not the SNR of the image |
+| Voxel size | Sinc interpolation of the image, linear interpolation of the label | k-space cut at the new Nyquist frequency; fractions averaged over the box of a voxel | Interpolation at the new voxel centres aliases and samples the label at a point |
+| Atrophy | CSF fraction scaled inside the region | A deformation: thinning, or a change of volume | See [Which kind of atrophy](anatomy.md#which-kind-of-atrophy) |
+| Seeds | One noise pattern for all images by default | Every output file its own | The same pattern in every image can be learned by a network |
+| Movement | The mean pose is subtracted | The image is also brought back onto the object | The magnitude image was left 0.4 to 1.6 mm from its ground truth on a real head |
+| Output grid | The grid of the scan, or an affinely registered one | Always affinely registered at 0.5 mm | The segmentation of the front end works there |
+| Vessels | CAT12's atlas partitioning | T1Prep's detection and voxels brighter than white matter | The partitioning is not available in Python |
