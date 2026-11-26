@@ -122,6 +122,43 @@ class TestTheChain(unittest.TestCase):
         np.testing.assert_array_equal(denoised.get_fdata(), data[::-1] + 1)
         self.assertEqual(unified_seg.segment.call_args.kwargs["template_dir"], "/templates")
 
+    def test_the_deformation_is_handed_on_when_asked_for(self):
+        scan = nib.Nifti1Image(np.ones(self.shape, np.float32), np.eye(4))
+        grid = nib.Nifti1Image(np.zeros(self.shape, np.float32), np.eye(4))
+        mask = np.ones(self.shape, bool)
+        calls = {}
+
+        def segment(denoised, raw, template_dir=None, verbose=False, deformation=False):
+            calls["deformation"] = deformation
+            return {"prob": None, "label": None, "corrected": np.ones(self.shape, np.float32), "grid": grid,
+                    "affine": np.eye(4), "world": np.eye(4), "native_mat": np.eye(4), "native_shape": self.shape,
+                    "params": dict(TestTheTissueMeans.params), "iy": "iy", "template_mat": "mat"}
+
+        unified_seg = mock.Mock(segment=segment)
+        unified_seg.brain_mask.return_value = mask
+        unified_seg.working_grid_maps.return_value = (None, None, None)
+        apply_las = mock.Mock(return_value=nib.Nifti1Image(np.full(self.shape, 2 / 3, np.float32), np.eye(4)))
+        cat_surf = mock.Mock()
+        cat_surf.vol_sanlm.side_effect = lambda data: data
+        with mock.patch.object(frontend, "_t1prep", return_value=(cat_surf, apply_las, unified_seg)):
+            plain = frontend.segment(scan, template_dir="/t")
+            self.assertFalse(calls["deformation"])
+            self.assertNotIn("iy", plain)
+            out = frontend.segment(scan, template_dir="/t", deformation=True)
+        self.assertTrue(calls["deformation"])
+        self.assertEqual((out["iy"], out["template_mat"]), ("iy", "mat"))
+
+    def test_a_t1prep_without_the_deformation_is_named(self):
+        scan = nib.Nifti1Image(np.ones(self.shape, np.float32), np.eye(4))
+
+        def segment(denoised, raw, template_dir=None, verbose=False):
+            return {}
+
+        unified_seg = mock.Mock(segment=segment)
+        with mock.patch.object(frontend, "_t1prep", return_value=(mock.Mock(vol_sanlm=lambda d: d), None, unified_seg)):
+            with self.assertRaisesRegex(RuntimeError, "deformation"):
+                frontend.segment(scan, template_dir="/t", deformation=True)
+
     def test_a_series_is_refused(self):
         scan = nib.Nifti1Image(np.ones(self.shape + (2,), np.float32), np.eye(4))
         with self.assertRaisesRegex(ValueError, "single 3-D volume"):
