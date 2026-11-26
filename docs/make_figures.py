@@ -2,10 +2,11 @@
 
     python docs/make_figures.py --scan sub-01_T1w.nii.gz [--cache FILE]
 
-- ``t1sim-scheme.png``: the path from the scan to the simulated image.
+- ``t1sim-scheme.png``: the path from the scan to the simulated image and
+  its ground truth.
 - ``t1sim-frontend.png``: what :func:`t1sim.frontend.segment` returns.
-- ``t1sim-examples.png``: one detail of the scan under every artefact and
-  with a thinner cortex.
+- ``t1sim-examples.png``: one detail of the anatomy under every artefact, a
+  bias field on the whole slice, and an atrophy.
 
 Every image is one axial slice of the working grid, and everything shown is
 made by t1sim from the scan.  ``--cache`` keeps the slices, so that a change
@@ -85,25 +86,28 @@ def collect(scan):
     }
 
     truth = simulate.ground_truth(scan, seg=seg)
-    out["sim_label"] = truth["label"][:, :, k]
+    out["sim_fractions"] = truth["fractions"][:, :, k]
     out["sim_ideal"] = truth["ideal"][:, :, k]
     plain = dict(snr=0, bias_percent=0, seed=1)
+    coarse = dict(plain, resolution=1.0, upsample=True)
     examples = {
         "sim_image": dict(snr=30, bias_percent=30, seed=1),
         "ex_noise": dict(snr=12, bias_percent=0, seed=1),
         "ex_bias": dict(snr=0, bias_percent=-60, bias_type=(3, 2), seed=1),
-        "ex_contrast": dict(plain, contrast=0.5),
-        "ex_resolution": dict(plain, resolution=(1.0, 1.0, 1.0), upsample=True),
-        "ex_motion": dict(plain, resolution=1.0, upsample=True, motion=2),
-        "ex_ringing": dict(plain, resolution=1.0, upsample=True, ringing=2),
+        "ex_contrast_low": dict(plain, contrast=0.5),
+        "ex_contrast_high": dict(plain, contrast=1.5),
+        "ex_resolution": coarse,
+        "ex_motion": dict(coarse, motion=2),
+        "ex_ringing": dict(coarse, ringing=2),
+        "ex_gibbs": dict(coarse, ringing={"strength": 2, "type": "gibbs"}),
     }
     for key, options in examples.items():
         out[key] = simulate.acquire(truth, **options)["image"][:, :, k]
     name, region, change = ATROPHY
-    thin = simulate.ground_truth(scan, seg=seg, clean=False,
-                                 atrophy={"atlas": name, "regions": [region], "change": change})
+    thin = simulate.ground_truth(scan, seg=seg, atrophy={"atlas": name, "regions": [region], "change": change})
     out["ex_atrophy"] = thin["ideal"][:, :, k]
-    out["ex_atrophy_label"] = thin["label"][:, :, k]
+    out["ex_atrophy_fractions"] = thin["fractions"][:, :, k]
+    out["ex_atrophy_reached"] = np.array([thin["parameters"]["Atrophy"][0]["Achieved"]])
     out["roi"] = anatomy.roi_from_atlas(atlas.to_grid(name, seg["iy"], seg["template_mat"]), [region])[:, :, k]
     return out
 
@@ -239,8 +243,9 @@ def figure_scheme(d, path):
     width = left * 2 + 4 * tw + 3 * (sw + 2 * gap)
     head = 1.78                    # room above the images of a row: titles of row and images
     foot = 0.50                    # room below them
+    foot_low = 1.62                # and below those of the second row, for the cleanup
     between = 1.25                 # between the two rows
-    y_low = 0.22 + foot
+    y_low = 0.22 + foot_low
     y_top = y_low + th + head + between + foot
     height = y_top + th + head + 0.22
     fig = plt.figure(figsize=(width, height), facecolor=SURFACE)
@@ -249,7 +254,7 @@ def figure_scheme(d, path):
     ax.set_ylim(0, height)
     ax.axis("off")
 
-    def panel(y, face, edge, title, note):
+    def panel(y, foot, face, edge, title, note):
         ax.add_patch(FancyBboxPatch((0.16, y - foot), width - 0.32, th + head + foot,
                                     boxstyle="round,pad=0,rounding_size=0.22",
                                     facecolor=face, edgecolor=edge, linewidth=1.2, zorder=0))
@@ -305,7 +310,7 @@ def figure_scheme(d, path):
 
     # ------------------------------------------------ first row: t1sim
     y = y_top
-    panel(y, "#f6faff", DONE_EDGE, "1  The ground truth from a real scan",
+    panel(y, foot, "#f6faff", DONE_EDGE, "1  The tissue fractions of a real scan",
           "t1sim.frontend.segment()")
     scan_style = {"cmap": "gray", "vmin": 0, "vmax": 1.25 * np.median(d["scan"][d["label"] > 2.9])}
     x = image(0, y, d["scan"], "T1w scan", "a real scan of good quality", **scan_style)
@@ -323,86 +328,135 @@ def figure_scheme(d, path):
     image(2, y, d["label"], "Label map", "CSF 1, GM 2, WM 3, mixtures in between",
           cmap="gray", vmin=0, vmax=3)
     steps(2, y, [("Decomposition", "every voxel as a mixture\nof the two tissues\nnext to its label")])
-    x = image(3, y, _composite(d["fractions"]), "Tissue fractions", "the ground truth")
+    x = image(3, y, _composite(d["fractions"]), "Tissue fractions", "what the image is made from")
     for n, tissue in enumerate(frontend.TISSUES):
         ax.add_patch(Rectangle((x + 0.10 + n * 0.68, y - 0.33), 0.17, 0.17, color=TISSUE_COLOR[tissue], zorder=3))
         ax.text(x + 0.32 + n * 0.68, y - 0.245, tissue, fontsize=9.6, color=INK, va="center")
 
-    # ------------------------------------------------ second row: from the ground truth to the image
+    # ------------------------------------------------ second row: the image and its ground truth
     y2 = y_low
-    panel(y2, "#f6faff", DONE_EDGE, "2  From the ground truth to the simulated image",
-          "t1sim.simulate.ground_truth() and acquire()")
-    image(0, y2, d["sim_label"], "Ground truth", "cleaned, or with a changed anatomy",
-          cmap="gray", vmin=0, vmax=3)
+    panel(y2, foot_low, "#f6faff", DONE_EDGE, "2  From the fractions to the simulated image and its ground truth",
+          "t1sim.simulate: ground_truth() up to the synthesised image and the ground truth, "
+          "acquire() for every simulated image")
+    x0 = image(0, y2, _composite(d["fractions"]), "Tissue fractions", "as segmented, or changed")
     steps(0, y2, [("Synthesis", "brain: fractions x\ntissue intensities;\nrest of the head:\nthe corrected scan")])
     image(1, y2, d["sim_ideal"], "Synthesised T1w", "free of noise and bias field",
           **_gray(d["sim_ideal"], d))
-    steps(1, y2, [("Acquisition", "bias field, voxel size,\ncontrast, movement,\nringing, noise")])
-    image(2, y2, d["sim_image"], "Simulated T1w", "here with a bias field and noise",
-          **_gray(d["sim_image"], d))
-    x = left + 3 * pitch
-    ax.text(x - gap - sw / 2 - 0.05, y2 + th / 2, "=", ha="center", va="center", fontsize=26, color=INK_SOFT)
-    ax.text(x + tw / 2, y2 + th / 2,
-            "A simulated image\nwhose ground truth\nis exact: the label\ngenerated the image.\n\n"
-            "For validating\nsegmentation and\nthickness methods,\nand as training data.",
-            ha="center", va="center", fontsize=10.6, color=INK, linespacing=1.4)
+    steps(1, y2, [("Acquisition", "contrast, bias field,\nvoxel size, movement,\nringing, noise")])
+    x2 = image(2, y2, d["sim_image"], "Simulated T1w", "here with a bias field and noise",
+               **_gray(d["sim_image"], d))
+    x3 = image(3, y2, _composite(d["sim_fractions"]), "Ground truth", "the fractions after the cleanup")
+    ax.text((x2 + tw + x3) / 2, y2 + th / 2, "belongs\nto", ha="center", va="center", fontsize=10.6,
+            color=INK_SOFT, linespacing=1.3)
+    for xa, xb in ((x2 + tw + 0.10, (x2 + tw + x3) / 2 - 0.42), (x3 - 0.10, (x2 + tw + x3) / 2 + 0.42)):
+        ax.plot([xa, xb], [y2 + th / 2] * 2, color=INK_SOFT, linewidth=1.5, linestyle=(0, (2, 2)), zorder=4)
+
+    # the cleanup: the same fractions, on their way to the ground truth
+    line = y2 - 0.82
+    bw = 6.3
+    bx = (x0 + tw / 2 + x3 + tw / 2) / 2 - bw / 2
+    h = step_box(bx, line + 0.465, bw, "Cleanup",
+                 "blood vessels, dura and the rims of the ventricles look like grey matter:\n"
+                 "they are corrected in the ground truth, and the image keeps them", done=True)
+    del h
+    arrow([(x0 + tw / 2, y2 - 0.04), (x0 + tw / 2, line), (bx - 0.03, line)])
+    arrow([(bx + bw + 0.03, line), (x3 + tw / 2, line), (x3 + tw / 2, y2 - 0.04)])
 
     # ------------------------------------------------ from the first row to the second
     y_gap = y2 + th + head + between / 2
     start_x = left + tw / 2
     end_x = left + 3 * pitch + tw / 2
     arrow([(end_x, y - foot), (end_x, y_gap), (start_x, y_gap), (start_x, y2 + th + head - 0.02)])
-    body = "cleanup of the ground truth (blood vessels, dura, periventricular partial volume)   |   cortical thickness, atrophy"
+    body = "cortical thickness: a band of a chosen thickness around the white matter   |   atrophy: a region deformed"
     bw = 8.1
-    step_box(width / 2 - bw / 2, y_gap + 0.385, bw, "Change the ground truth (optional)", body, done=True)
+    step_box(width / 2 - bw / 2, y_gap + 0.385, bw, "Change the anatomy (optional)", body, done=True)
     fig.savefig(path, dpi=150, facecolor=SURFACE)
     plt.close(fig)
 
 
 def figure_examples(d, path):
-    """One detail of the anatomy under every artefact, and with a thinner cortex."""
-    zoom = _zoom(d)
-    style = _gray(d["sim_ideal"], d)
-    panels = [
-        ("Reference", "no artefact", d["sim_ideal"]),
-        ("Noise", "SNR 12 in white matter", d["ex_noise"]),
-        ("Bias field", "60%, inverted, strength 3", d["ex_bias"]),
-        ("Contrast", "exponent 0.5", d["ex_contrast"]),
-        ("Resolution", "acquired at 1 mm", d["ex_resolution"]),
-        ("Movement", "severity 2, at 1 mm", d["ex_motion"]),
-        ("Ringing", "strength 2, at 1 mm", d["ex_ringing"]),
-        ("Atrophy", f"region outlined: {abs(100 * ATROPHY[2]):.0f}% less grey matter", d["ex_atrophy"]),
+    """What an acquisition and an atrophy do: a bias field on the whole slice, everything else on one detail."""
+    zoom, box = _zoom(d), _box(d)
+    gray = {"cmap": "gray", "vmin": 0, "vmax": 1.25 * float(d["means"][2])}     # one window for all images
+    gm_before, gm_after = d["sim_fractions"][..., 1], d["ex_atrophy_fractions"][..., 1]
+    change = LinearSegmentedColormap.from_list("change", [TISSUE_COLOR["CSF"], SURFACE, TISSUE_COLOR["GM"]])
+    reached = abs(100 * float(d["ex_atrophy_reached"][0]))
+    rows = [
+        ("On the 0.5 mm grid of the ground truth", [
+            ("Reference", "no artefact", d["sim_ideal"], gray),
+            ("Noise", "SNR 12 in white matter", d["ex_noise"], gray),
+            ("Contrast", "exponent 0.5: less", d["ex_contrast_low"], gray),
+            ("Contrast", "exponent 1.5: more", d["ex_contrast_high"], gray)]),
+        ("Acquired at 1 mm and brought back onto the 0.5 mm grid", [
+            ("Voxel size", "1 mm, no other artefact", d["ex_resolution"], gray),
+            ("Movement", "severity 2", d["ex_motion"], gray),
+            ("Ringing", 'strength 2, type "notch"', d["ex_ringing"], gray),
+            ("Ringing", 'strength 2, type "gibbs"', d["ex_gibbs"], gray)]),
+        (f"Atrophy: the cortex of the left middle frontal gyrus thinned until it lost {reached:.0f}% of its volume", [
+            ("Image before", "the reference", d["sim_ideal"], gray),
+            ("Image after", "rendered from the deformed fractions", d["ex_atrophy"], gray),
+            ("Ground truth after", "fraction of grey matter", gm_after,
+             {"cmap": _tissue_cmap("GM"), "vmin": 0, "vmax": 1}),
+            ("Change of the ground truth", "grey matter after minus before; region outlined", gm_after - gm_before,
+             {"cmap": change, "vmin": -0.6, "vmax": 0.6})]),
     ]
-    box = _box(d)
+
     aspect = (box[1].stop - box[1].start) / (box[0].stop - box[0].start)
-    fig = plt.figure(figsize=(15.6, 7.9), facecolor=SURFACE)
-    left = fig.add_axes([0.012, 0.30, 0.20, 0.20 * aspect * 15.6 / 7.9])
-    _show(left, d["sim_ideal"], box, **style)
-    left.add_patch(Rectangle((zoom[0].start - box[0].start - 0.5, zoom[1].start - box[1].start - 0.5),
-                             zoom[0].stop - zoom[0].start, zoom[1].stop - zoom[1].start,
-                             fill=False, edgecolor="#ffd23f", linewidth=1.5))
-    left.set_xticks([])
-    left.set_yticks([])
-    _sides(left)
-    fig.text(0.112, 0.30 + 0.20 * aspect * 15.6 / 7.9 + 0.02, "Synthesised image, with the detail",
-             ha="center", fontsize=11, color=INK_SOFT)
-    width, height, x0 = 0.184, 0.184 * 15.6 / 7.9, 0.235
-    for n, (title, sub, image) in enumerate(panels):
-        row, col = divmod(n, 4)
-        ax = fig.add_axes([x0 + col * (width + 0.008), 0.535 - row * (height + 0.105), width, height])
-        # every panel is shown in its own window, 0 to 1.25 times its white
-        # matter, so that a change of the contrast is seen as one
-        _show(ax, image, zoom, cmap="gray", vmin=0, vmax=1.25 * float(np.median(image[d["label"] > 2.9])))
-        if title == "Atrophy":
-            ax.contour(d["roi"][zoom].swapaxes(0, 1).astype(float), levels=[0.5], colors=["#ffd23f"],
-                       linewidths=1.2)
+    fw, fh = 15.6, 12.3
+    fig = plt.figure(figsize=(fw, fh), facecolor=SURFACE)
+
+    def frame(ax):
         ax.set_xticks([])
         ax.set_yticks([])
         for spine in ax.spines.values():
             spine.set_edgecolor("#c8c8c8")
-        ax.text(0.5, 1.085, title, transform=ax.transAxes, ha="center", fontsize=12.5, weight="bold", color=INK)
-        ax.text(0.5, 1.02, sub, transform=ax.transAxes, ha="center", fontsize=10, color=INK_SOFT)
-    fig.suptitle("What t1sim.simulate.acquire() and a change of the anatomy do to one detail", fontsize=15,
+            spine.set_linewidth(0.8)
+
+    def titles(ax, title, sub, size=12.5):
+        ax.text(0.5, 1.09, title, transform=ax.transAxes, ha="center", fontsize=size, weight="bold", color=INK)
+        ax.text(0.5, 1.025, sub, transform=ax.transAxes, ha="center", fontsize=9.8, color=INK_SOFT)
+
+    # the whole slice, twice: where the detail lies, and the one artefact a detail cannot show
+    wide = 0.205
+    tall = wide * aspect * fw / fh
+    for n, (title, sub, image) in enumerate((
+            ("Synthesised image", "no artefact; the detail is outlined", d["sim_ideal"]),
+            ("Bias field", "60%, inverted, strength 3", d["ex_bias"]))):
+        ax = fig.add_axes([0.012, 0.905 - tall - n * (tall + 0.075), wide, tall])
+        _show(ax, image, box, **gray)
+        if n == 0:
+            ax.add_patch(Rectangle((zoom[0].start - box[0].start - 0.5, zoom[1].start - box[1].start - 0.5),
+                                   zoom[0].stop - zoom[0].start, zoom[1].stop - zoom[1].start,
+                                   fill=False, edgecolor="#ffd23f", linewidth=1.5))
+            _sides(ax)
+        frame(ax)
+        titles(ax, title, sub)
+
+    size = 0.182
+    height = size * fw / fh
+    x0, pitch_x, pitch_y = 0.238, size + 0.008, height + 0.098
+    for r, (heading, panels) in enumerate(rows):
+        top = 0.905 - r * pitch_y
+        fig.text(x0, top + 0.046, heading, fontsize=11.5, color=INK, weight="bold", va="bottom")
+        for c, (title, sub, image, style) in enumerate(panels):
+            ax = fig.add_axes([x0 + c * pitch_x, top - height, size, height])
+            shown = _show(ax, image, zoom, **style)
+            if title.startswith("Change"):
+                ax.contour(d["roi"][zoom].swapaxes(0, 1).astype(float), levels=[0.5], colors=[INK],
+                           linewidths=0.9)
+            frame(ax)
+            titles(ax, title, sub, size=11.5)
+            if style is not gray:
+                cax = fig.add_axes([x0 + c * pitch_x + 0.15 * size, top - height - 0.022, 0.7 * size, 0.008])
+                bar = fig.colorbar(shown, cax=cax, orientation="horizontal")
+                ticks = [0, 0.5, 1] if style["vmin"] == 0 else [-0.6, 0, 0.6]
+                bar.set_ticks(ticks)
+                bar.set_ticklabels([f"{t:g}" if style["vmin"] == 0 else f"{t:+g}" if t else "0" for t in ticks])
+                bar.ax.tick_params(labelsize=8.5, colors=INK_SOFT, length=2.5)
+                bar.outline.set_edgecolor("#c8c8c8")
+    fig.text(0.012, 0.03, f"The detail is {ZOOM_MM[2]:.0f} mm wide. All images share one grey scale, "
+             "from 0 to 1.25 times the intensity of white matter.", fontsize=10, color=INK_SOFT)
+    fig.suptitle("What t1sim.simulate.acquire() and a change of the anatomy do", fontsize=15,
                  color=INK, x=0.012, ha="left", y=0.985, weight="bold")
     fig.savefig(path, dpi=150, facecolor=SURFACE)
     plt.close(fig)

@@ -11,7 +11,7 @@ Part of the [documentation of t1sim](../README.md#documentation).
   - [T1Prep](https://github.com/ChristianGaser/T1Prep) 0.9.3 or newer. It provides the segmentation on the working grid with its deformation (`t1prep.unified_seg.segment(..., deformation=True)`), LAS with given tissue intensities (`t1prep.apply_LAS(..., peaks=...)`), the atlases and the vessel detection.
   - torch, which T1Prep needs as well; it runs the movement artefacts and the deformations.
 
-Without them `t1sim` can be imported, but `frontend.segment` stops with an error that names what is missing.
+Without them `t1sim` can be imported, but `frontend.segment` stops with an error that names what is missing. `t1sim` checks T1Prep by what it can do (the two functions above), not by its version number.
 
 ## Installing
 
@@ -24,11 +24,14 @@ pip install -e ".[frontend]"     # with the front end
 pip install -e .                 # or without it
 ```
 
-If pip finds no T1Prep 0.9.3, PyPI does not have that version yet. Install T1Prep from its repository first and repeat the command:
+If pip stops because it finds no T1Prep 0.9.3, that version is not released yet. Install the three packages of the front end by hand, T1Prep from its repository, and `t1sim` without the extra:
 
 ```bash
-pip install "git+https://github.com/ChristianGaser/T1Prep.git"
+pip install "cat-surf>=1.2.0" torch "git+https://github.com/ChristianGaser/T1Prep.git"
+pip install -e .
 ```
+
+This works with any T1Prep that has the two functions, whatever version it reports.
 
 ## Model files
 

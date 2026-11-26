@@ -103,14 +103,29 @@ The two exceptions have voxels whose distance ties exactly with a shifted level;
 
 ## Where t1sim differs on purpose
 
+Two kinds of difference: where a property of the MATLAB version is wrong for the simulated image, and where `t1sim` takes another way.
+
+### Properties of the MATLAB version that were not carried over
+
+| Step | `mri_simulate.m` | `t1sim` | What was measured |
+| --- | --- | --- | --- |
+| Noise | The noisy image is limited to the brightest voxel of the image before the noise | No upper limit | The limit cuts off the upper half of the noise in the brightest tissue. In MATLAB's own output without a bias field (SNR 25), white matter has a noise SD of 11.8 instead of 19.5 and is 6.5 darker; GM and CSF are not affected (19.5) |
+| Synthesis | Limited to the 98th percentile of the image | Limited to the 99.99th | On a whole head at 0.5 mm the 98th percentile is the intensity of white matter: more than 2% of the voxels are pure white matter. The scalp fat, 1.4 to 3 times as bright in the scans this was measured on, is cut down to it, which is also what makes white matter the brightest tissue for the noise limit |
+| Contrast | A power law on the finished image, after the bias field and the change of the voxel size, scaled by the minimum and the maximum of the image | The power law on the tissue intensities, anchored at white matter, before the bias field; the image is mixed again | On the image it halved a bias field or made it 1.6 times as strong (exponent 0.5 / 1.5), and moved the apparent pial boundary by 0.07 mm, because the power law of a mixture is not the mixture of the power laws. See [Artefacts](artefacts.md#what-was-checked) |
+| SNR after a contrast change | Refers to white matter before the change | White matter keeps its intensity | Otherwise the SNR that is asked for is not the SNR of the image |
+| Movement | The mean pose is subtracted | The image is also brought back onto the object | The magnitude image was left 0.4 to 1.6 mm from its ground truth on a real head |
+| Stored bias fields | `rf100_A`, `_B`, `_C` are used as they are | Their first axial plane is replaced by the second | That plane holds half the value of the one above it. With 30% the field fell to 0.2 in the lowest 2 mm of the grid |
+| Periventricular partial volume | CSF and WM that give the label of the voxel | CSF and WM that give its intensity | GM is not half way between CSF and WM. A voxel as bright as GM is 34% CSF, not 50%, with the tissue intensities of the scan this was measured on |
+| Voxel size | Sinc interpolation of the image, linear interpolation of the label | k-space cut at the new Nyquist frequency; fractions averaged over the box of a voxel | Interpolation at the new voxel centres aliases and samples the label at a point |
+| Seeds | One noise pattern for all images by default | Every output file its own | The same pattern in every image can be learned by a network |
+
+The MATLAB code was left as it is. Images made with it carry these properties, among them the phantom set T1Prep tests against.
+
+### Another way
+
 | Step | `mri_simulate.m` | `t1sim` | Why |
 | --- | --- | --- | --- |
-| Noise | The noisy image is limited to the brightest voxel of the image before the noise | No upper limit | The limit cuts off the upper half of the noise in the brightest tissue. In MATLAB's output without a bias field, white matter has a noise SD of 11.8 instead of 19.5 |
-| Synthesis | Limited to the 98th percentile of the image | Limited to the 99.99th | On a whole head at 0.5 mm the 98th percentile is the intensity of white matter, so the scalp fat is cut down to it |
-| SNR after a contrast change | Refers to white matter before the change | Refers to white matter in the image that is written | Otherwise the SNR that is asked for is not the SNR of the image |
-| Voxel size | Sinc interpolation of the image, linear interpolation of the label | k-space cut at the new Nyquist frequency; fractions averaged over the box of a voxel | Interpolation at the new voxel centres aliases and samples the label at a point |
 | Atrophy | CSF fraction scaled inside the region | A deformation: thinning, or a change of volume | See [Which kind of atrophy](anatomy.md#which-kind-of-atrophy) |
-| Seeds | One noise pattern for all images by default | Every output file its own | The same pattern in every image can be learned by a network |
-| Movement | The mean pose is subtracted | The image is also brought back onto the object | The magnitude image was left 0.4 to 1.6 mm from its ground truth on a real head |
-| Output grid | The grid of the scan, or an affinely registered one | Always affinely registered at 0.5 mm | The segmentation of the front end works there |
 | Vessels | CAT12's atlas partitioning | T1Prep's detection and voxels brighter than white matter | The partitioning is not available in Python |
+| Output grid | The grid of the scan, or an affinely registered one | Always the affinely registered one | The segmentation of the front end works there |
+| Names | The seed of a simulated bias field is not in the name | `Rf20T2S7` for a seed of 7; a gain of tissue is `...Plus10` | Different settings gave the same file name |

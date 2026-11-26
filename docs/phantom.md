@@ -2,14 +2,14 @@
 
 Part of the [documentation of t1sim](../README.md#documentation).
 
-`t1sim.phantom` builds an object whose cortical thickness is exact by construction: a ball of white matter with regular folds, a band of grey matter of constant thickness around it, and CSF around that. It has no artefacts and no random part, so the error a thickness measure shows on it is the error of the measure. It is a port of `matlab/thickness_phantom.m` and `matlab/thickness_phantom_eval.m`.
+`t1sim.phantom` builds an object whose cortical thickness is known by construction: a ball of white matter with regular folds, a band of grey matter of constant thickness around it, and CSF around that. It has no artefacts and no random part, so the error a thickness measure shows on it is the error of the measure, down to the [accuracy of the phantom itself](#how-exact-it-is), about 0.05 mm at 0.5 mm voxels. It is a port of `matlab/thickness_phantom.m` and `matlab/thickness_phantom_eval.m`.
 
 - [Usage](#usage)
 - [Why the thickness is exact](#why-the-thickness-is-exact)
 - [Evaluation](#evaluation)
 - [Results](#results)
 - [How exact it is](#how-exact-it-is)
-- [Agreement with the MATLAB tool](#agreement-with-the-matlab-tool)
+- [Adding artefacts](#adding-artefacts)
 
 ## Usage
 
@@ -32,12 +32,13 @@ results = phantom.evaluate_phantom(labels, infos, fig="phantom_qc.png")
 | `radius`, `amplitude` | Radius of the white matter ball and amplitude of its folds in mm (`22`, `2.5`) |
 | `fold` | `"cartesian"` with a `wavelength` (`12`), or `"spherical"` with `folds` (`(6, 6)`), which get arbitrarily fine towards the poles |
 | `csf` | Thickness of the CSF layer in mm (`2`) |
+| `wm_offset` | Level of the distance map that is the white matter boundary, in mm (`None`: half a voxel). It has to stay above the sampling of the distance map; a larger value makes the phantom more exact, see [below](#how-exact-it-is) |
 | `supersample` | Factor of the finer grid the object is built on (`3`) |
 | `pve_steps`, `pve_range` | Number and range of the sub-voxel offsets that are averaged into partial volumes (`15`, `1`) |
 | `intensities` | Intensity of CSF, GM and WM in the image (`(30, 100, 150)`) |
 | `outdir` | Write `_dseg` and `_T1w` files with JSON sidecars there (`None`: write nothing) |
 
-`thickness_phantom` returns the label map (CSF = 1, GM = 2, WM = 3 with partial volumes), the image that belongs to it, and the geometry as a dict.
+`thickness_phantom` returns the label map (CSF = 1, GM = 2, WM = 3 with partial volumes), the image that belongs to it, and the geometry as a dict, which also holds the tissue volumes of the supersampled grid (`volume_ref`) and of the label map (`volume_pve`). The files are named `thicknessPhantom_res-0p5mm_desc-Thickness25mm_dseg.nii.gz` and `..._T1w.nii.gz`; the thickness in the name is rounded to a tenth of a mm, and a series in which two values get the same name is refused.
 
 ## Why the thickness is exact
 
@@ -50,7 +51,17 @@ Partial volumes come from shifting both boundaries by sub-voxel offsets of the d
 `evaluate_phantom` checks two independent things:
 
 1. **The phantom.** The distance between the two boundaries is recovered from the label map alone: it is supersampled, the distance from the white matter surface is computed, and that distance is read at the sub-voxel crossings of the pial boundary along the three axes. Tissue volumes are compared with the supersampled grid the phantom was built on. It also reports how much of the white matter surface faces a buried sulcus, a fold narrower than twice the thickness, in which any thickness measure overestimates.
-2. **A thickness measure.** By default the projection-based thickness of cat-surf (`cat_surf.vol_thickness_pbt`); `thickness_map=` takes any other map, and `pbt=False` skips it.
+2. **A thickness measure.** By default the projection-based thickness of cat-surf (`cat_surf.vol_thickness_pbt`); `thickness_map=` takes any other map, and `pbt=False` skips it. `pbt_options` are passed on to cat-surf: its default adds 0.25 mm to every thickness (`correct_thickness`), a correction for the label maps of its own pipeline that the phantom does not need.
+
+```python
+result = phantom.evaluate_phantom(label, info, pbt_options={"correct_thickness": 0.0})
+result["geom"]["outer"]["bias"]     # the phantom: recovered thickness minus the known one, mm
+result["geom"]["buried"]            # share of the white matter surface that faces a sulcus without CSF
+result["measure"]["gm"]["bias"]     # the measure over all grey matter voxels, mm
+result["volume"]                    # tissue volumes of the label map and of the reference grid, ml
+```
+
+Every entry of `geom` and `measure` holds `n`, `mean`, `median`, `sd`, `bias`, `rmse`, `p5` and `p95`.
 
 ## Results
 
@@ -64,28 +75,30 @@ Default phantom (radius 22 mm, amplitude 2.5 mm, wavelength 12 mm) at 0.5 mm. "G
 | 3.0 mm | -0.016 | 0.039 | 6.9% | +0.230 | -0.020 |
 | 3.5 mm | -0.018 | 0.035 | 10.3% | +0.267 | +0.017 |
 
-- The geometry columns equal those of the MATLAB documentation to the digits it gives.
-- cat-surf's projection-based thickness adds 0.25 mm by default (`correct_thickness`), a correction for the label maps of its own pipeline. Without it, it reads the phantom within 0.02 mm.
+- cat-surf's projection-based thickness adds 0.25 mm by default. Without that, its mean over the grey matter voxels is within 0.02 mm of the thickness asked for, which is less than the accuracy of the phantom itself (next section).
 - Tissue volumes agree with the supersampled reference within 0.43% for CSF and WM and within 1.46% for GM.
 
 ## How exact it is
 
-Checked on labels that were written analytically, without any distance map, these two effects are in the phantom and its evaluation, in the MATLAB version as well:
+The two level sets of the distance map are exactly `thickness` apart. What limits the phantom is the sampling of that map. Two effects were measured, both on a ball without folds, where the right answer can be written down, and both are in the MATLAB version as well:
 
-- **The readout of the evaluation is too small by about 0.4 samples of its grid**: -0.067 mm at 0.5 mm with a supersampling of 3, and -0.118 / -0.082 / -0.065 mm at 1 mm with 3 / 5 / 7. The half-sample correction it applies is right only for surfaces along the grid.
-- **The cortex of the default phantom is about 0.03 to 0.04 mm thicker than asked for at 0.5 mm**, and 0.07 mm at 1 mm. For a ball without folds the tissue volumes give +0.039 mm; with `wm_offset=1.0` it is +0.010 mm.
+- **The cortex is thicker than asked for**: by 0.039 mm at 0.5 mm voxels and by 0.07 mm at 1 mm, going by the tissue volumes of the label map. With `wm_offset=1.0` it is 0.010 mm at 0.5 mm.
+- **The readout of the evaluation is too small by about 0.4 samples of its grid**: -0.067 mm at 0.5 mm with a supersampling of 3, and -0.118 / -0.082 / -0.065 mm at 1 mm with 3 / 5 / 7, on a label map written down analytically without any distance map. The half-sample correction it applies is right only for surfaces along the grid.
 
-The geometry bias of -0.017 mm in the table is therefore the two nearly cancelling, not a measure of the accuracy of the phantom. The thickness of the phantom is right to about 0.04 mm at 0.5 mm.
+Together they give -0.03 mm on the ball; the folded phantom reads -0.014 to -0.018 mm in the table above, so the folds change them by about 0.01 mm. The geometry bias of the table is therefore two errors that largely cancel and not the accuracy of the phantom: take the thickness of the default phantom as right to about 0.05 mm at 0.5 mm voxels, and a difference between two thickness measures below that as not resolved by it.
 
-## Agreement with the MATLAB tool
+## Adding artefacts
 
-| Compared | Result |
-| --- | --- |
-| Label map and image, 29 phantoms of 20 parameter sets | Identical in 27 |
-| The other two | One partial volume step (1/15) in 96 of 262144 and 536 of 591360 voxels |
-| Fine-grid tissue counts | Identical in all 29 |
-| Evaluation, 11 phantoms | Every statistic within 2e-6 mm |
+The phantom has no noise and no bias field. `simulate.acquire` takes the ground truth of a scan and not a phantom, but the artefacts are plain functions of an image:
 
-The two exceptions have voxels whose distance ties exactly with a shifted level; CAT12's `cat_bwdist` is one float32 step off the correctly rounded distance in 15 to 20% of the samples, and that bit decides the tie. Fed with MATLAB's distance map, the port gives MATLAB's label exactly.
+```python
+from t1sim import artefacts
 
-The default phantom takes 6 to 8 s and its evaluation about 15 s.
+white = info["intensities"][2]
+field = artefacts.simulated_bias_field(t1w.shape, info["vx"], percent=20, seed=1)
+image = artefacts.add_noise(t1w * field, sigma=white / 30, seed=1)      # SNR 30 in white matter
+```
+
+The label map stays the ground truth of that image. Movement and ringing are in `t1sim.kspace`; see [Artefacts of the acquisition](artefacts.md).
+
+The default phantom takes 6 to 8 s and its evaluation about 15 s. The label maps of 27 of 29 phantoms are identical to those of the MATLAB tool, voxel by voxel; see [Agreement with the MATLAB tools](matlab-agreement.md#geometric-phantom).
