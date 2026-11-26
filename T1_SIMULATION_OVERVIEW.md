@@ -7,6 +7,7 @@
 ## Requirements
 
 - MATLAB with SPM12 (or SPM25) and CAT >= 26 on the MATLAB path (`cat_main_LASsimple` is required and is checked for at startup)
+- The `matlab` folder of this repository on the MATLAB path; it holds `mri_simulate.m`, the thickness phantom and the files they load
 - No MATLAB toolboxes beyond base MATLAB. Distances use CAT's `cat_bwdist` (and `cat_vbdist` where the index of the nearest voxel is needed) rather than the Image Processing Toolbox, so results do not depend on the installed toolboxes; `parpool` (Parallel Computing Toolbox) is used only for multiple input images
 - A T1-weighted NIfTI image, `.nii` or `.nii.gz` (example: `colin27_t1_tal_hires.nii`)
 - `BlaiottaTPM.nii` and `BlaiottaSegmentJob.m` next to `mri_simulate.m`, which the segmentation uses; the run stops with an error if either is missing

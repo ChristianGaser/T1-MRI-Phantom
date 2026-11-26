@@ -400,6 +400,7 @@ The motion model is retrospective: it splices k-space blocks of a rigidly moved 
 
 ## Requirements
 - MATLAB with SPM12 (or SPM26) and CAT >= 26 in the path (`cat_main_LASsimple` is required and is checked for at startup)
+- The `matlab` folder of this repository in the MATLAB path; it holds `mri_simulate.m`, `thickness_phantom.m`, `thickness_phantom_eval.m` and the files they load
 - A T1-weighted NIfTI image, `.nii` or `.nii.gz` (default examples use `colin27_t1_tal_hires.nii`)
 - `BlaiottaTPM.nii` and `BlaiottaSegmentJob.m` next to `mri_simulate.m`; the run stops with an error if either is missing
 
