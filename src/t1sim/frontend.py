@@ -130,7 +130,7 @@ def tissue_means(params: dict) -> dict:
     return means
 
 
-def segment(t1, template_dir=None, verbose: bool = False) -> dict:
+def segment(t1, template_dir=None, verbose: bool = False, deformation: bool = False) -> dict:
     """Label map, tissue fractions and corrected image of a real T1w scan.
 
     Args:
@@ -138,6 +138,8 @@ def segment(t1, template_dir=None, verbose: bool = False) -> dict:
         template_dir: Folder with the six-class shooting templates; default:
             :func:`t1sim.models.ensure_models`, which downloads them once.
         verbose: Print the stages of the segmentation.
+        deformation: Also return the deformation to the templates, which
+            :mod:`t1sim.atlas` needs to bring an atlas onto the working grid.
 
     Returns:
         A dict, all volumes on the RAS-ordered working grid (``grid``):
@@ -155,7 +157,10 @@ def segment(t1, template_dir=None, verbose: bool = False) -> dict:
         - ``grid``: the working grid as an image; ``affine``, ``world``,
           ``native_mat`` and ``native_shape``: how it relates to the scan
           (see ``t1prep.unified_seg.segment``);
-        - ``params``: the parameters the segmentation estimated.
+        - ``params``: the parameters the segmentation estimated;
+        - with *deformation*: ``iy``, (X, Y, Z, 3) float32, for every voxel
+          the template voxel it maps to (0-based, NaN where undefined), and
+          ``template_mat``, the voxel-to-world matrix of the templates.
     """
     cat_surf, apply_LAS, unified_seg = _t1prep()
     if template_dir is None:
@@ -171,7 +176,14 @@ def segment(t1, template_dir=None, verbose: bool = False) -> dict:
     denoised = nib.Nifti1Image(
         np.asarray(cat_surf.vol_sanlm(data), dtype=np.float32), image.affine)
 
-    seg = unified_seg.segment(denoised, raw, template_dir=template_dir, verbose=verbose)
+    extra = {}
+    if deformation:
+        if "deformation" not in inspect.signature(unified_seg.segment).parameters:
+            raise RuntimeError(
+                "The deformation needs a T1Prep whose unified_seg.segment takes "
+                "deformation=True (newer than 0.9.2, or a source checkout).")
+        extra["deformation"] = True
+    seg = unified_seg.segment(denoised, raw, template_dir=template_dir, verbose=verbose, **extra)
     mask = unified_seg.brain_mask(seg.pop("prob"))
     _, brain, first_label = unified_seg.working_grid_maps(seg, mask)
     means = tissue_means(seg["params"])
@@ -181,7 +193,9 @@ def segment(t1, template_dir=None, verbose: bool = False) -> dict:
     normalised[~mask] = 0.0
 
     fractions = fractions_from_label(normalised)
+    maps = {"iy": seg["iy"], "template_mat": seg["template_mat"]} if deformation else {}
     return {
+        **maps,
         "label": label_from_fractions(fractions),
         "fractions": fractions,
         "normalised": normalised,

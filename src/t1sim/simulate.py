@@ -1,0 +1,514 @@
+"""The simulation: from a real scan to simulated images with their ground truth.
+
+Three steps, which can be called on their own:
+
+1. :func:`ground_truth` runs the front end once and makes the anatomy: the
+   tissue fractions the images are rendered from, an optional change of the
+   anatomy (cortical thickness, atrophy), the cleaned ground truth, and the
+   image without artefacts.  This is the expensive step, about two minutes.
+2. :func:`acquire` makes one simulated image of that anatomy: bias field,
+   voxel size, contrast, movement, ringing and noise.  It takes seconds, and
+   any number of acquisitions can share one ground truth.
+3. :func:`write` stores an acquisition and its ground truth with names and
+   sidecars after BIDS (:mod:`t1sim.bids`).
+
+:func:`simulate` does all three for one scan.
+
+Everything lies on the working grid of the front end, which is affinely
+registered to MNI152NLin2009cAsym at 0.5 mm.  ``grid="deepmriprep"`` cuts it
+to the 336 x 384 x 336 voxels the deepmriprep networks are trained on, so the
+output is training data as it is.  For that use the image can be acquired at
+the voxel size of a real scan and brought back onto the 0.5 mm grid
+(``resolution=1, upsample=True``): the ground truth keeps its 0.5 mm, and the
+image has the resolution and the correlated noise of a 1 mm scan that was
+resampled, which is what most real data on that grid is.
+
+As in ``matlab/mri_simulate.m``, the image is rendered from the fractions
+before the cleanup and the ground truth is the fractions after it: a vessel
+stays bright in the image and is CSF in the ground truth.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import zlib
+from pathlib import Path
+
+import numpy as np
+
+from . import __version__, anatomy, artefacts, atlas, bids, cleanup, frontend, synthesis
+from ._volume import grid_voxel_size
+
+#: The part of the working grid (339 x 411 x 339) that deepmriprep's training
+#: scripts use: 336 x 384 x 336 voxels.
+DEEPMRIPREP_CROP = (slice(1, -2), slice(15, -12), slice(0, 336))
+
+_CLEAN_DEFAULTS = {"vessels": 0.5, "dura": 4.0, "pve": True}
+
+
+def _clean_options(clean) -> dict:
+    if isinstance(clean, dict):
+        unknown = set(clean) - set(_CLEAN_DEFAULTS)
+        if unknown:
+            raise ValueError(f"unknown cleanup option(s) {sorted(unknown)}; known: {sorted(_CLEAN_DEFAULTS)}")
+        return {**_CLEAN_DEFAULTS, **clean}
+    return dict(_CLEAN_DEFAULTS) if clean else None
+
+
+def _atrophy_options(spec) -> list:
+    """*spec* as a list of ``{"atlas", "region", "change", "mode"}``, one per region."""
+    if not spec:
+        return []
+    specs = [spec] if isinstance(spec, dict) else list(spec)
+    out = []
+    for item in specs:
+        unknown = set(item) - {"atlas", "regions", "change", "mode", "tissues", "reach"}
+        if unknown or "regions" not in item or "change" not in item:
+            raise ValueError("an atrophy is a dict with 'regions' and 'change', and optionally "
+                             "'atlas', 'mode', 'tissues' and 'reach'")
+        regions_ = np.atleast_1d(item["regions"]).tolist()
+        changes = np.atleast_1d(item["change"]).astype(float).tolist()
+        if len(changes) == 1:
+            changes *= len(regions_)
+        if len(changes) != len(regions_):
+            raise ValueError("an atrophy needs one change, or one per region")
+        for region, change in zip(regions_, changes):
+            out.append({"atlas": item.get("atlas", "Hammers"), "region": int(region),
+                        "change": change, "mode": item.get("mode", "thinning"),
+                        "tissues": tuple(item.get("tissues", ("GM",))), "reach": float(item.get("reach", 10.0))})
+    return out
+
+
+def ground_truth(scan, thickness=0, atrophy=None, clean=True, template_dir=None,
+                 verbose: bool = False, seg: dict = None) -> dict:
+    """The anatomy of a simulation.
+
+    Args:
+        scan: The T1w scan, a file.
+        thickness: Give the cortex this thickness in mm; one value, or three
+            for the mainly occipital parcels, the rest and the mainly frontal
+            parcels.  0: keep the cortex.
+        atrophy: A dict, or a list of dicts, each with ``regions`` (numbers
+            of the atlas) and ``change`` (relative volume change of their
+            grey matter, e.g. -0.1; one value or one per region), and
+            optionally ``atlas`` (default ``"Hammers"``), ``mode``
+            (``"thinning"`` or ``"volume"``), ``tissues`` and ``reach``; see
+            :func:`t1sim.anatomy.atrophy`.  Cannot be combined with
+            *thickness*.
+        clean: Clean the ground truth of vessels, dura and periventricular
+            partial volume: True, False, or a dict with ``vessels``,
+            ``dura`` and ``pve`` (:func:`t1sim.cleanup.detect`).
+        template_dir: Folder with the templates of the segmentation.
+        verbose: Print the steps.
+        seg: A result of ``frontend.segment(scan, deformation=True)`` to
+            start from instead of running the front end.
+
+    Returns:
+        A dict: ``fractions`` ((X, Y, Z, 3), what the image is rendered
+        from), ``truth_fractions`` and ``label`` (the ground truth),
+        ``corrected``, ``ideal`` (the image without artefacts), ``means``,
+        ``affine`` (voxel-to-world matrix of the grid), ``iy`` and
+        ``template_mat`` (the deformation to the templates), ``scan``,
+        ``tags`` (of the anatomy, for the file names) and ``parameters`` (for
+        the sidecars); with an atrophy also ``jacobian``.
+    """
+    atrophies = _atrophy_options(atrophy)
+    thick = np.atleast_1d(np.asarray(thickness, dtype=float))
+    if thick.any() and atrophies:
+        raise ValueError("a simulated thickness and an atrophy cannot be combined")
+    clean = _clean_options(clean)
+
+    if seg is None:
+        if verbose:
+            print("Ground truth: segmentation of the scan", flush=True)
+        seg = frontend.segment(scan, template_dir=template_dir, verbose=False, deformation=True)
+    affine = np.asarray(seg["grid"].affine, dtype=np.float64)
+    fractions, label, corrected = seg["fractions"], seg["label"], seg["corrected"]
+    parameters, tags = {}, ""
+    regions = None
+    if thick.any() or clean:
+        regions = atlas.to_grid("Neuromorphometrics", seg["iy"], seg["template_mat"])
+
+    if thick.any():
+        if verbose:
+            print("Ground truth: cortical thickness", flush=True)
+        fractions, label = anatomy.thickness(fractions, label, regions, affine, thick, verbose=verbose)
+        tenths = np.rint(10 * thick).astype(int)
+        tags += (f"Thickness{tenths[0]:02d}mm" if thick.size == 1
+                 else f"Thickness{tenths.min():02d}to{tenths.max():02d}mm")
+        parameters["Thickness"] = thick.tolist() if thick.size > 1 else float(thick[0])
+
+    truth_fractions, truth_label = fractions, label
+    if clean:
+        if verbose:
+            print("Ground truth: cleanup", flush=True)
+        masks = cleanup.detect(label, seg["normalised"], affine, regions, **clean)
+        truth_fractions, truth_label = cleanup.apply(fractions, label, masks["vessels"] | masks["dura"],
+                                                     masks["pve"])
+        voxel_ml = float(np.prod(grid_voxel_size(affine))) / 1000
+        parameters["LabelCleanup"] = {
+            "BloodVessels": clean["vessels"], "DuraDistance": clean["dura"],
+            "PeriventricularPVE": bool(clean["pve"]),
+            "VolumeMl": {name: round(float(mask.sum()) * voxel_ml, 2) for name, mask in masks.items()},
+            "Note": "the simulated image is rendered from the uncorrected fractions, "
+                    "so it still shows what the ground truth rejects"}
+
+    jacobian = None
+    if atrophies:
+        done = []
+        for item in atrophies:
+            if verbose:
+                print(f"Ground truth: atrophy of {item['atlas']} {item['region']}", flush=True)
+            on_grid = atlas.to_grid(item["atlas"], seg["iy"], seg["template_mat"])
+            roi = anatomy.roi_from_atlas(on_grid, [item["region"]])
+            result = anatomy.atrophy(fractions, corrected, affine, roi, item["change"], mode=item["mode"],
+                                     tissues=item["tissues"], reach=item["reach"], verbose=verbose)
+            same = truth_fractions is fractions
+            fractions, corrected = result["fractions"], result["corrected"]
+            truth_fractions = fractions if same else anatomy.warp(truth_fractions, result["displacement"])
+            jacobian = result["jacobian"] if jacobian is None else jacobian * result["jacobian"]
+            done.append({"Atlas": item["atlas"], "Region": item["region"], "Mode": item["mode"],
+                         "Change": item["change"], "Achieved": round(result["achieved"], 4)})
+        label = frontend.label_from_fractions(fractions)
+        truth_label = frontend.label_from_fractions(truth_fractions)
+        if len(done) == 1:
+            kind = "Thin" if done[0]["Mode"] == "thinning" else "Vol"
+            tags += f"{done[0]['Atlas']}Roi{done[0]['Region']}{kind}{bids.number(abs(100 * done[0]['Change']))}"
+        else:
+            tags += f"{done[0]['Atlas']}Multi"
+        parameters["Atrophy"] = done
+
+    means = dict(seg["means"])
+    parameters["TissueIntensities"] = {k: round(float(v), 3) for k, v in means.items()}
+    out = {
+        "fractions": fractions, "truth_fractions": truth_fractions, "label": truth_label,
+        "corrected": corrected, "ideal": synthesis.render(fractions, means, corrected),
+        "means": means, "affine": affine, "iy": seg["iy"], "template_mat": seg["template_mat"],
+        "scan": str(scan) if scan is not None else "", "tags": bids.label(tags),
+        "cleaned": bool(clean), "parameters": parameters,
+    }
+    if jacobian is not None:
+        out["jacobian"] = jacobian
+    return out
+
+
+def _crop_affine(affine: np.ndarray, crop: tuple) -> np.ndarray:
+    shift = np.eye(4)
+    shift[:3, 3] = [c.start or 0 for c in crop]
+    return affine @ shift
+
+
+def _seed_of(*parts) -> int:
+    """A seed that follows from names: the same for the same file, another for another."""
+    return zlib.crc32("_".join(str(p) for p in parts).encode()) & 0x7FFFFFFF
+
+
+def acquire(truth: dict, snr: float = 40.0, noise_percent: float = 0.0, bias_percent: float = 30.0,
+            bias_type=(2, 0), contrast: float = 1.0, resolution=None, upsample: bool = False,
+            motion=0, ringing=0, seed: int = None, grid: str = "working") -> dict:
+    """One simulated image of a ground truth.
+
+    The steps follow the acquisition: the bias field belongs to the object
+    and the coil, the voxel size and the movement to the sampling of
+    k-space, and the noise comes last.
+
+    Args:
+        truth: Result of :func:`ground_truth`.
+        snr: Rician noise for this signal-to-noise ratio in white matter:
+            its standard deviation in each of the two channels is the
+            intensity of white matter in the image, after a contrast change
+            if there is one, divided by *snr*.  0: use *noise_percent*.
+        noise_percent: Gaussian noise with this standard deviation in percent
+            of the white matter intensity, if *snr* is 0.
+        bias_percent: Peak-to-peak amplitude of the bias field in percent; 0
+            for none, negative to invert the field.
+        bias_type: ``(strength, seed)`` for a simulated field, or ``"A"``,
+            ``"B"``, ``"C"`` for a predefined one.  A seed of None gives
+            every scan a field of its own; a number gives all scans the same.
+        contrast: Exponent of the contrast change; 1 leaves it.
+        resolution: Voxel size of the acquisition in mm, one value or three.
+            None: that of the grid.
+        upsample: Bring the acquired image back onto the grid, so the image
+            and the ground truth both have the voxel size of the grid.
+            False: the ground truth is averaged to the voxels of the
+            acquisition.
+        motion, ringing: Movement artefacts and ringing: a severity or a
+            dict (:mod:`t1sim.kspace`); 0 for none.
+        seed: Seed of the noise and of the movement.  None: derived from
+            the name of the scan and from the settings, so every output file
+            has noise of its own that is the same in every run.  A number
+            gives every scan the same noise pattern, which is useful for a
+            comparison and harmful in training data.
+        grid: ``"working"``, or ``"deepmriprep"`` for the 336 x 384 x 336
+            voxels its networks are trained on.
+
+    Returns:
+        A dict: ``image``, ``label``, ``fractions`` ((X, Y, Z, 3): CSF, GM,
+        WM) and ``affine`` of the output grid, ``bias`` (the field, or None),
+        ``jacobian`` (of an atrophy, on the output grid, or None), ``tags``
+        (of the acquisition) and ``parameters`` (for the sidecar).
+    """
+    if grid not in ("working", "deepmriprep"):
+        raise ValueError("grid is 'working' or 'deepmriprep'")
+    if snr < 0 or noise_percent < 0:
+        raise ValueError("snr and noise_percent cannot be negative")
+    affine = truth["affine"]
+    image, label, fractions = truth["ideal"], truth["label"], truth["truth_fractions"]
+    iy, jacobian = truth["iy"], truth.get("jacobian")
+    if grid == "deepmriprep":
+        if image.shape != (339, 411, 339):
+            raise ValueError(f"the deepmriprep grid is cut from the 339 x 411 x 339 grid, not {image.shape}")
+        image, label, fractions = image[DEEPMRIPREP_CROP], label[DEEPMRIPREP_CROP], fractions[DEEPMRIPREP_CROP]
+        iy = iy[DEEPMRIPREP_CROP]
+        jacobian = None if jacobian is None else jacobian[DEEPMRIPREP_CROP]
+        affine = _crop_affine(affine, DEEPMRIPREP_CROP)
+    voxel = grid_voxel_size(affine)
+    parameters, tags = {"Grid": grid}, ""
+    name = bids.prefix(truth["scan"]) if truth["scan"] else "simulation"
+
+    if snr > 0:
+        tags += f"snr{bids.number(snr)}"
+        parameters["SNR"] = float(snr)
+    elif noise_percent > 0:
+        tags += f"pn{bids.number(noise_percent)}"
+        parameters["NoiseFraction"] = noise_percent / 100
+
+    bias = None
+    parameters["BiasFieldStrength"] = float(bias_percent)
+    if bias_percent != 0:
+        sign = "Neg" if bias_percent < 0 else ""
+        if isinstance(bias_type, str):
+            bias = artefacts.template_bias_field(bias_type, iy, truth["template_mat"], bias_percent)
+            kind = bias_type if len(bias_type) == 1 else "File"
+        else:
+            strength, bias_seed = (list(bias_type) + [0])[:2]
+            if bias_seed is None:
+                bias_seed = _seed_of(name, "bias")
+            bias = artefacts.simulated_bias_field(image.shape, voxel, bias_percent, strength, bias_seed)
+            kind = f"T{int(round(strength))}"
+            parameters["BiasFieldSeed"] = int(bias_seed)
+        parameters["BiasFieldType"] = kind
+        tags += f"Rf{sign}{bids.number(abs(bias_percent))}{kind}"
+        image = image * bias
+    white = float(truth["means"]["WM"])       # the field has a mean of 1
+
+    acquisition = None
+    if resolution is not None:
+        acquisition = artefacts.Acquisition(image.shape, affine, resolution)
+        image = acquisition.acquire(image)
+        parameters["AcquisitionVoxelSize"] = acquisition.voxel.tolist()
+        if upsample:
+            tags += "Acq" + "x".join(bids.number(round(v, 2)) for v in
+                                     (acquisition.voxel if np.ptp(acquisition.voxel) > 1e-6
+                                      else acquisition.voxel[:1])) + "mm"
+        else:
+            label, fractions = acquisition.average(label), acquisition.average(fractions)
+            if bias is not None:
+                bias = acquisition.average(bias)
+            if jacobian is not None:
+                jacobian = acquisition.average(jacobian)
+    acquired_affine = acquisition.affine if acquisition is not None else affine
+
+    if contrast != 1:
+        image, white = artefacts.change_contrast(image, contrast, reference=white)
+        tags += {0.5: "ConLow", 1.5: "ConHigh"}.get(contrast, f"Con{bids.number(contrast)}")
+        parameters["ContrastChange"] = float(contrast)
+
+    derived = seed is None
+    if derived:
+        seed = _seed_of(name, tags, truth["tags"], resolution, upsample, motion, ringing, grid)
+    parameters["Seed"] = int(seed)
+    motion_seed, noise_seed = np.random.SeedSequence(int(seed)).spawn(2)
+    if motion or ringing:
+        from . import kspace
+
+        ring = kspace.resolve_ringing(ringing, acquired_affine) if ringing else None
+        if motion:
+            move = kspace.resolve_motion(motion, acquired_affine, image.shape)
+            image, realised = kspace.add_motion(image, move, acquired_affine,
+                                                int(motion_seed.generate_state(1)[0]), ringing=ring)
+            parameters["Motion"] = realised
+            tags += f"Motion{bids.number(move['severity'])}"
+        else:
+            image = kspace.add_ringing(image, ring)
+        if ring is not None:
+            parameters["Ringing"] = {k: v for k, v in ring.items()}
+            tags += f"Ringing{bids.number(ring['strength'])}" + ("Gibbs" if ring["type"] == "gibbs" else "")
+
+    sigma = white / snr if snr > 0 else noise_percent / 100 * white
+    parameters["NoiseSD"] = round(float(sigma), 4)
+    image = artefacts.add_noise(image, sigma, rician=snr > 0, seed=np.random.default_rng(noise_seed))
+
+    if not derived and seed:
+        tags += f"Seed{int(seed)}"      # other noise, other file
+    out_affine = acquired_affine
+    if acquisition is not None and upsample:
+        image = np.maximum(acquisition.to_fine(image), 0)
+        out_affine = affine
+    parameters["VoxelSize"] = [round(float(v), 4) for v in grid_voxel_size(out_affine)]
+    return {"image": image.astype(np.float32, copy=False), "label": label, "fractions": fractions,
+            "affine": out_affine, "bias": bias, "jacobian": jacobian, "tags": bids.label(tags),
+            "parameters": parameters}
+
+
+def write(truth: dict, acquired: dict, out_dir=None, derivatives: bool = True,
+          save_bias: bool = False, save_jacobian: bool = True, compress: bool = True) -> dict:
+    """Store an acquisition and its ground truth.
+
+    Args:
+        truth, acquired: Results of :func:`ground_truth` and :func:`acquire`.
+        out_dir: Folder of the outputs; default: see
+            :func:`t1sim.bids.output_folder`.
+        derivatives: Used when *out_dir* is None.
+        save_bias: Also write the bias field.
+        save_jacobian: Also write the Jacobian determinant of an atrophy.
+        compress: Write ``.nii.gz``; False: ``.nii``.
+
+    Returns:
+        The files that were written: ``{"T1w": ..., "dseg": ..., "probseg":
+        {"CSF": ..., "GM": ..., "WM": ...}, ...}``.
+    """
+    scan = truth["scan"] or "simulation_T1w.nii.gz"
+    if out_dir is None:
+        folder, pipeline, source = bids.output_folder(scan, derivatives)
+    else:
+        folder, pipeline, source = Path(out_dir), None, ""
+    if pipeline is not None:
+        bids.write_dataset_description(pipeline)
+    ext = ".nii.gz" if compress else ".nii"
+    affine = acquired["affine"]
+    base = f"{bids.prefix(scan)}_space-{bids.SPACE}_{bids.resolution_entity(grid_voxel_size(affine))}"
+    anat = truth["tags"]
+    image_desc = acquired["tags"] + anat or "simu"
+    truth_desc = anat + ("Clean" if truth["cleaned"] else "")
+    truth_base = base + (f"_desc-{truth_desc}" if truth_desc else "")
+    common = {"GeneratedBy": [bids.GENERATED_BY]}
+    if source:
+        common["Sources"] = [source]
+    files = {}
+
+    files["T1w"] = bids.save(acquired["image"], affine, folder / f"{base}_desc-{image_desc}_T1w{ext}")
+    bids.write_sidecar(files["T1w"], {**common, "SimulationParameters": {**acquired["parameters"],
+                                                                         **truth["parameters"]}})
+    # the label map as CAT12 stores it: 16 bit in steps of 1/765
+    files["dseg"] = bids.save(acquired["label"], affine, folder / f"{truth_base}_dseg{ext}",
+                              scale=1 / 765, dtype=np.int16)
+    bids.write_sidecar(files["dseg"], {
+        **common, "Manual": False,
+        "Description": "Ground truth partial volume label image. Values are continuous and interpolate "
+                       "between the tissue labels, e.g. 2.5 is an equal mixture of GM and WM. The tissue "
+                       "fractions it is a view of are the probseg files.",
+        "Labels": {"CSF": 1, "GM": 2, "WM": 3}, "SimulationParameters": truth["parameters"]})
+    files["probseg"] = {}
+    for index, tissue in enumerate(frontend.TISSUES):
+        files["probseg"][tissue] = bids.save(
+            np.clip(acquired["fractions"][..., index], 0, 1), affine,
+            folder / f"{truth_base}_label-{tissue}_probseg{ext}", scale=1 / 255, dtype=np.uint8)
+    if save_bias and acquired["bias"] is not None and acquired["bias"].shape == acquired["image"].shape:
+        files["bias"] = bids.save(acquired["bias"], affine,
+                                  folder / f"{base}_desc-{anat + 'Biasfield' if anat else 'biasfield'}_T1w{ext}")
+    if save_jacobian and acquired.get("jacobian") is not None:
+        files["jacobian"] = bids.save(acquired["jacobian"], affine, folder / f"{truth_base}_jacobian{ext}")
+    return files
+
+
+def simulate(scan, out_dir=None, derivatives: bool = True, thickness=0, atrophy=None, clean=True,
+             template_dir=None, truth: dict = None, save_bias: bool = False, compress: bool = True,
+             verbose: bool = False, **acquisition) -> dict:
+    """Simulate one image of a scan and write it with its ground truth.
+
+    Args:
+        scan: The T1w scan, a file.
+        out_dir, derivatives, save_bias, compress: See :func:`write`.
+        thickness, atrophy, clean, template_dir: See :func:`ground_truth`.
+        truth: A result of :func:`ground_truth` for this scan, to make
+            another acquisition of the same anatomy without running the
+            front end again.
+        verbose: Print the steps.
+        **acquisition: The arguments of :func:`acquire` (``snr``,
+            ``bias_percent``, ``resolution``, ``motion``, ``grid``, ...).
+
+    Returns:
+        ``{"files": ..., "truth": ..., "acquired": ...}``.
+    """
+    if truth is None:
+        truth = ground_truth(scan, thickness=thickness, atrophy=atrophy, clean=clean,
+                             template_dir=template_dir, verbose=verbose)
+    if verbose:
+        print("Acquisition", flush=True)
+    acquired = acquire(truth, **acquisition)
+    files = write(truth, acquired, out_dir=out_dir, derivatives=derivatives, save_bias=save_bias,
+                  compress=compress)
+    if verbose:
+        print(f"Wrote {files['T1w']}\n      {files['dseg']}", flush=True)
+    return {"files": files, "truth": truth, "acquired": acquired}
+
+
+def main(argv=None) -> int:
+    """Command line: ``t1sim scan.nii.gz [options]``."""
+    parser = argparse.ArgumentParser(
+        prog="t1sim", description="Simulate T1-weighted images with an exact ground truth from a real scan.")
+    parser.add_argument("scans", nargs="+", help="T1w scan(s), NIfTI")
+    parser.add_argument("--version", action="version", version=f"t1sim {__version__}")
+    out = parser.add_argument_group("output")
+    out.add_argument("--out-dir", help="folder of the outputs (default: derivatives/t1sim-<version>)")
+    out.add_argument("--no-derivatives", action="store_true", help="write next to the scan")
+    out.add_argument("--grid", choices=("working", "deepmriprep"), default="working",
+                     help="output grid: the 0.5 mm working grid, or its 336x384x336 part deepmriprep trains on")
+    out.add_argument("--save-bias", action="store_true", help="also write the bias field")
+    anat = parser.add_argument_group("anatomy")
+    anat.add_argument("--thickness", type=float, nargs="+", default=[0],
+                      help="cortical thickness in mm: one value, or three (occipital, rest, frontal)")
+    anat.add_argument("--atrophy", nargs=3, action="append", metavar=("ATLAS", "REGION", "CHANGE"),
+                      help="atrophy of a region, e.g. Hammers 28 -0.1; can be given several times")
+    anat.add_argument("--atrophy-mode", choices=("thinning", "volume"), default="thinning")
+    anat.add_argument("--no-clean", action="store_true", help="keep vessels and dura in the ground truth")
+    acq = parser.add_argument_group("acquisition; several values of --snr or --seed give several images of one ground truth")
+    acq.add_argument("--snr", type=float, nargs="+", default=[40.0], help="SNR in white matter, Rician noise (40)")
+    acq.add_argument("--noise-percent", type=float, default=0.0, help="Gaussian noise in %% of WM, with --snr 0")
+    acq.add_argument("--bias", type=float, default=30.0, help="bias field amplitude in %% (30; 0 for none)")
+    acq.add_argument("--bias-type", nargs="+", default=["2", "0"],
+                     help="strength and seed of a simulated field (2 0; 'scan' as seed gives every "
+                          "scan its own field), or A, B or C")
+    acq.add_argument("--contrast", type=float, default=1.0, help="exponent of the contrast change (1)")
+    acq.add_argument("--resolution", type=float, nargs="+", help="voxel size of the acquisition in mm")
+    acq.add_argument("--upsample", action="store_true",
+                     help="bring the acquired image back onto the grid (for training data)")
+    acq.add_argument("--motion", type=float, default=0, help="severity of the movement artefacts (0)")
+    acq.add_argument("--ringing", type=float, default=0, help="strength of the ringing (0)")
+    acq.add_argument("--seed", type=int, nargs="+", default=[None],
+                     help="seed of noise and movement (default: every output file its own)")
+    parser.add_argument("--verbose", action="store_true")
+    if argv is None and len(sys.argv) == 1:
+        parser.print_usage(sys.stderr)
+        return 1
+    args = parser.parse_args(argv)
+
+    if args.bias_type[0].isalpha():
+        bias_type = args.bias_type[0]
+    else:
+        bias_type = (float(args.bias_type[0]),
+                     None if args.bias_type[1:] == ["scan"] else int((args.bias_type + ["0"])[1]))
+    atrophy = [{"atlas": a, "regions": [int(r)], "change": float(c), "mode": args.atrophy_mode}
+               for a, r, c in (args.atrophy or [])]
+    resolution = None if not args.resolution else (args.resolution[0] if len(args.resolution) == 1
+                                                   else tuple(args.resolution))
+    thickness = args.thickness[0] if len(args.thickness) == 1 else tuple(args.thickness)
+    for scan in args.scans:
+        truth = ground_truth(scan, thickness=thickness, atrophy=atrophy, clean=not args.no_clean,
+                             verbose=args.verbose)
+        for snr in args.snr:
+            for seed in args.seed:
+                result = simulate(scan, out_dir=args.out_dir, derivatives=not args.no_derivatives,
+                                  truth=truth, save_bias=args.save_bias, verbose=args.verbose,
+                                  snr=snr, noise_percent=args.noise_percent, bias_percent=args.bias,
+                                  bias_type=bias_type, contrast=args.contrast, resolution=resolution,
+                                  upsample=args.upsample, motion=args.motion, ringing=args.ringing,
+                                  seed=seed, grid=args.grid)
+                print(result["files"]["T1w"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
