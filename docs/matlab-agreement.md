@@ -2,16 +2,31 @@
 
 Part of the [documentation of t1sim](../README.md#documentation).
 
-`t1sim` was ported from `matlab/mri_simulate.m`. This page compares the ground truth the two make of one scan, and lists where the other steps agree and where `t1sim` differs on purpose. The comparison of the ground truth is one of two implementations of one idea, not a test against a truth: `mri_simulate.m` uses SPM's unified segmentation and CAT12's LAS, `t1sim` CAT-Surface's and T1Prep's.
+`t1sim` was ported from the [MATLAB tools](../matlab/README.md). This page holds everything about the relation of the two: the ground truth they make of one scan, the steps that give the same result, and the steps where `t1sim` differs on purpose. It is for those who know or use the MATLAB tools; nothing here is needed to use `t1sim`.
 
-- [What was compared](#what-was-compared)
-- [Result](#result)
+The comparison of the ground truth is one of two implementations of one idea, not a test against a truth: `mri_simulate.m` uses SPM's unified segmentation and CAT12's LAS, `t1sim` CAT-Surface's and T1Prep's.
+
+- [Summary](#summary)
+- [The ground truth of one scan](#the-ground-truth-of-one-scan)
 - [The intensity of pure GM](#the-intensity-of-pure-gm)
-- [Limits](#limits)
-- [The other steps](#the-other-steps)
+- [Limits of the comparison](#limits-of-the-comparison)
+- [Geometric phantom](#geometric-phantom)
 - [Where t1sim differs on purpose](#where-t1sim-differs-on-purpose)
 
-## What was compared
+## Summary
+
+| Step | Compared how | Result |
+| --- | --- | --- |
+| Ground truth before the cleanup | One scan, on the grid of the scan | Soft Dice 0.82 / 0.91 / 0.95 for CSF / GM / WM, boundaries within 0.04 mm; [below](#the-ground-truth-of-one-scan) |
+| Cleanup | The voxels both relabel as CSF, same scan | Dice 0.47 inside MATLAB's brain mask; [Cleanup](cleanup.md#measured) |
+| Cortical thickness | Not against MATLAB; against the thickness asked for | 1.50 / 2.49 / 3.49 mm for 1.5 / 2.5 / 3.5 mm on a sphere; [Anatomy](anatomy.md#cortical-thickness) |
+| Simulated bias field | Same seed, three settings | The same field: largest difference 8e-8 of a field with a mean of 1 |
+| Movement | MATLAB's pose fed to `t1sim`, 17 cases, rotations included, without the recentring | Largest difference 3e-7 to 5e-7 of the brightest voxel |
+| Ringing | 11 cases | Largest difference 3e-7 to 7e-7 of the brightest voxel |
+| Geometric phantom | Voxel by voxel, 29 phantoms | Identical in 27; [below](#geometric-phantom) |
+| Atrophy, voxel size, contrast, noise, seeds, output | - | Differ on purpose; [below](#where-t1sim-differs-on-purpose) |
+
+## The ground truth of one scan
 
 | Item | Value |
 | --- | --- |
@@ -27,8 +42,6 @@ Part of the [documentation of t1sim](../README.md#documentation).
 | Soft Dice | Overlap of the fraction maps of a tissue: twice the sum of the voxel-wise minimum, over the sum of both maps |
 | Boundary shift | Mean displacement of a boundary in mm: the difference in the volume beyond it, divided by the area of the boundary. Positive: the boundary of `t1sim` lies further out |
 | Volume | Sum of the fraction map of a tissue |
-
-## Result
 
 | Measure | `t1sim` against MATLAB | Interpolation alone |
 | --- | --- | --- |
@@ -68,23 +81,25 @@ With the GM mean of the mixture, pure GM sits at 379.4 in the corrected scan, ag
 
 For the peak to hold, it has to be used twice in LAS: the global mapping runs through it, and the local field of the tissue is scaled to it. With the global mapping alone the GM/WM boundary was still 0.14 mm off, because the local field is fitted on the voxels a first label map calls GM and follows their median.
 
-## Limits
+## Limits of the comparison
 
 - **One scan.** Nothing here says how the numbers vary between scans, scanners or field strengths.
 - **No truth.** The MATLAB label is a second implementation. Where the two agree, both may be wrong in the same way.
 - **Before the cleanup.** The labels were compared before the cleanup of either tool; the two cleanups are compared in [Cleaning the ground truth](cleanup.md#measured).
+- **Volumes are those of the scan.** Everything on this page was measured on the grid of the scan. What `t1sim` writes lies in the space of the template, where this brain is 1.26 times as large; see [The working grid](frontend.md#the-working-grid).
 - **Not reproducible from the repository.** The scan and the scripts of this comparison are not part of it.
 
-## The other steps
+## Geometric phantom
 
-| Step | Compared how | Result | Details |
-| --- | --- | --- | --- |
-| Simulated bias field | Same seed, three settings | The same field: largest difference 8e-8 | [Artefacts](artefacts.md#what-was-checked) |
-| Movement | MATLAB's pose fed to `t1sim`, 17 cases | Largest difference 3e-7 to 5e-7 | [Artefacts](artefacts.md#what-was-checked) |
-| Ringing | 11 cases | Largest difference 3e-7 to 7e-7 | [Artefacts](artefacts.md#what-was-checked) |
-| Cortical thickness | Not against MATLAB; against the thickness asked for | 1.50 / 2.49 / 3.49 mm for 1.5 / 2.5 / 3.5 mm on a sphere | [Anatomy](anatomy.md#cortical-thickness) |
-| Cleanup | The voxels both relabel on one scan | Dice 0.47 inside MATLAB's brain mask | [Cleanup](cleanup.md#measured) |
-| Geometric phantom | Voxel by voxel | See its page | [Phantom](phantom.md) |
+| Compared | Result |
+| --- | --- |
+| Label map and image, 29 phantoms of 20 parameter sets | Identical in 27 |
+| The other two | One partial volume step (1/15) in 96 of 262144 and 536 of 591360 voxels |
+| Fine-grid tissue counts | Identical in all 29 |
+| Evaluation, 11 phantoms | Every statistic within 2e-6 mm |
+| Geometry columns of the [table of results](phantom.md#results) | Those of the MATLAB documentation, to the digits it gives |
+
+The two exceptions have voxels whose distance ties exactly with a shifted level; CAT12's `cat_bwdist` is one float32 step off the correctly rounded distance in 15 to 20% of the samples, and that bit decides the tie. Fed with MATLAB's distance map, the port gives MATLAB's label exactly.
 
 ## Where t1sim differs on purpose
 
