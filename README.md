@@ -3,6 +3,45 @@ Simulates T1-weighted MR images with optional atrophy, cortical thickness contro
 
 ![Pipeline overview](docs/T1-MRI-Phantom-Scheme.png)
 
+## Repository layout
+
+Folder | Contents
+-------|---------
+`matlab/` | The MATLAB tools this README describes: `mri_simulate.m`, `thickness_phantom.m`, `thickness_phantom_eval.m` and the files they load
+`src/t1sim/` | `t1sim`, the Python version, in development (see below)
+`tests/` | Tests of `t1sim` (`python -m unittest discover tests`)
+`models/` | The model files `t1sim` downloads; not part of the repository
+
+## Python package `t1sim` (in development)
+
+`t1sim` is the Python counterpart of `mri_simulate.m`, for validation phantoms and for training data. So far it holds two parts; the synthesis, the artefacts and the anatomical modifications are still MATLAB only.
+
+**Front end** (`t1sim.frontend`): a real scan becomes a ground truth. It takes the three steps of `mri_simulate.m` with CAT-Surface's unified segmentation in place of SPM's: SANLM denoising, unified segmentation with six-class shooting templates, and LAS. The label is the LAS-normalised image and the tissue fractions are its triangular decomposition; no second segmentation takes part. The tissue intensities for the synthesis are read from the mixture of Gaussians the segmentation estimated, and LAS takes its intensity of pure GM from the same mixture, as `mri_simulate.m` does: a voxel as bright as the GM of the mixture gets the label 2 and is rendered at that intensity.
+
+Measured on a 0.75mm MPRAGE against the label `mri_simulate.m` 0.10.2 makes of the same scan (before its cleanup): soft Dice 0.820/0.908/0.948 for CSF/GM/WM, the GM/WM boundary 0.04mm and the pial boundary 0.01mm apart, volumes of 340/695/587ml against 348/708/577ml. Resampling the MATLAB label onto the working grid and back gives 0.913/0.949/0.968 on its own.
+
+```python
+from t1sim import frontend
+
+seg = frontend.segment("sub-01_T1w.nii.gz")
+seg["label"]       # 0 outside the brain, CSF = 1, GM = 2, WM = 3, partial volumes in between
+seg["fractions"]   # (X, Y, Z, 3): CSF, GM, WM
+seg["corrected"]   # the denoised and bias-corrected scan, whole head
+seg["means"]       # {"CSF": ..., "GM": ..., "WM": ...} on the scale of seg["corrected"]
+```
+
+All volumes are on T1Prep's working grid: 339x411x339 voxels of about 0.5mm, affinely registered to MNI152NLin2009cAsym and stored in RAS order. A run takes about 100s on an M2 MacBook Air.
+
+**Model files** (`t1sim.models`): the six-class shooting templates (44MB) are not part of T1Prep's PyPI package, so `t1sim` downloads them itself on the first run, from the commit of the T1Prep repository that added them, and checks every file against its SHA-256. In a source checkout they go to `models/` in this repository, otherwise to the user cache; `T1SIM_MODEL_DIR` names another folder and `T1SIM_MODEL_URL` another source.
+
+```bash
+python -m t1sim.models            # download what is missing
+python -m t1sim.models --verify   # hash the files that are there as well
+python -m t1sim.models --where    # print the folder
+```
+
+Requirements of the front end: [cat-surf](https://pypi.org/project/cat-surf/) >= 1.2.0 and a [T1Prep](https://github.com/ChristianGaser/T1Prep) that has the public modules `t1prep.unified_seg` and `t1prep.apply_LAS`, i.e. one newer than 0.9.1 or a source checkout.
+
 ## Overview
 `mri_simulate` generates a realistic T1-weighted (T1w) image and its explicit ground truth from a high-quality input (e.g., 0.5 mm Colin27 or a custom T1w). Key steps:
 
