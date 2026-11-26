@@ -5,3 +5,6 @@
 *old.m
 *seg8.mat
 .refact
+models/
+__pycache__/
+*.egg-info/
