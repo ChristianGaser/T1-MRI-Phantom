@@ -34,7 +34,9 @@ def render(fractions: np.ndarray, means, corrected: np.ndarray,
             ``WM``, or three values in that order.
         corrected: (X, Y, Z) bias-corrected scan, which fills what is not
             brain.  Voxels that are 0 or not finite there carry no data and
-            get a value just above 0.
+            get a value just above 0.  Negative values, which the resampling
+            of the scan leaves in the background, become 0: a magnitude image
+            has none.
         clip_percentile: The image is limited to this percentile of all its
             voxels, because the bias correction can leave single very bright
             voxels in the noisy background.  None: no limit.
@@ -63,7 +65,7 @@ def render(fractions: np.ndarray, means, corrected: np.ndarray,
     scale = np.maximum(brain, 1.0)
     image = fractions @ means
     no_data = (corrected == 0) | ~np.isfinite(corrected)
-    image += np.where(no_data, 0.0, corrected) * (scale - brain)
+    image += np.where(no_data, 0.0, np.maximum(corrected, 0)) * (scale - brain)
     image /= scale
     image[no_data] = 1e-3
     if clip_percentile is not None:

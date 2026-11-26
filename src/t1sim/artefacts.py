@@ -4,16 +4,22 @@ Every function takes the image and explicit parameters and returns a new
 image; the ground truth is never touched.  Movement artefacts and ringing,
 which are made in k-space, are in :mod:`t1sim.kspace`.
 
-The bias field and the contrast change are ported from
-``matlab/mri_simulate.m`` and give the same result for the same parameters;
-a simulated field is the very field MATLAB makes for a seed.  The noise is
-the same model without its upper limit (see :func:`add_noise`).  The
-resolution is not a port.  ``mri_simulate.m`` interpolates the image at the new voxel
-centres, which aliases, and interpolates the label linearly, which samples
-it at a point.  Here the image is acquired: its k-space is cut at the Nyquist
-frequency of the new voxel size, which is what a smaller acquisition matrix
-does, and the tissue fractions are averaged over the box of every new voxel,
-which is what a partial volume is.
+What is and is not a port of ``matlab/mri_simulate.m``:
+
+- The bias field is: a simulated field is the very field MATLAB makes for a
+  seed.
+- The noise is the same model without its upper limit (see
+  :func:`add_noise`).
+- The contrast change is the same power law, but applied to the intensities
+  of the tissues before the image is mixed from them and before the bias
+  field (see :func:`change_contrast`); MATLAB applies it to the finished
+  image.
+- The resolution is not.  ``mri_simulate.m`` interpolates the image at the
+  new voxel centres, which aliases, and interpolates the label linearly,
+  which samples it at a point.  Here the image is acquired: its k-space is
+  cut at the Nyquist frequency of the new voxel size, which is what a smaller
+  acquisition matrix does, and the tissue fractions are averaged over the box
+  of every new voxel, which is what a partial volume is.
 """
 
 from __future__ import annotations
@@ -63,15 +69,16 @@ def simulated_bias_field(shape, vx, percent: float = 30.0, strength: int = 2,
 
     A random field of ``2**strength`` voxels per axis, low-pass filtered,
     brought to the size of the image and smoothed with 15 mm: a larger
-    *strength* gives a field with more detail (3 to 4 for 7 T).  For one
-    seed it is the field ``mri_simulate.m`` makes (``rf.type = [strength,
-    seed]``).
+    *strength* gives a field with more local detail.  For one seed it is the
+    field ``mri_simulate.m`` makes (``rf.type = [strength, seed]``).
 
     Args:
         shape: Size of the image.
         vx: Its voxel size in mm.
-        percent: Peak-to-peak amplitude in percent.  A negative value swaps
-            the bright and the dark areas.
+        percent: Peak-to-peak amplitude in percent, over the whole volume;
+            inside the brain it is a little less (27 of 30 on the scan this
+            was measured on).  A negative value swaps the bright and the
+            dark areas.
         strength: 1 to 4.
         seed: Seed of the field.
 
@@ -127,15 +134,22 @@ def template_bias_field(name, iy: np.ndarray, template_mat: np.ndarray,
             space.
         iy, template_mat: The deformation (``frontend.segment(...,
             deformation=True)``).
-        percent: Amplitude in percent; negative inverts the field.
+        percent: Percent of the stored field.  With 30 the three fields
+            spanned 30 to 31% over the brain of the scan this was measured
+            on (26 to 28% over its central 98%), like a simulated field of
+            30%.  Negative inverts the field.
         folder: Where ``rf100_<name>.nii`` lies; default: ``matlab/`` of the
             repository.
 
     Returns:
-        (X, Y, Z) float32 with a mean of 1 where the field is defined, and 1
-        elsewhere.
+        (X, Y, Z) float32 with a mean of 1.  Where the deformation is not
+        defined or the stored field ends, it is continued with its nearest
+        value.
     """
+    import nibabel as nib
+
     from . import atlas
+    from ._volume import nearest_index
 
     path = Path(str(name))
     if not path.is_file():
@@ -145,42 +159,72 @@ def template_bias_field(name, iy: np.ndarray, template_mat: np.ndarray,
             raise FileNotFoundError(
                 f"The bias field '{name}' was not found: {path} does not exist.  The predefined "
                 "fields are part of the repository (matlab/rf100_A.nii, _B, _C).")
-    field = atlas.to_grid(path, iy, template_mat, order=1, fill=np.nan)
+    stored = nib.load(path)
+    stored = nib.Nifti1Image(_repair_edges(np.asarray(stored.dataobj, dtype=np.float32)), stored.affine)
+    field = atlas.to_grid(stored, iy, template_mat, order=1, fill=np.nan)
     defined = np.isfinite(field)
-    field *= percent / 100.0
-    out = np.ones(field.shape, dtype=np.float32)
-    out[defined] = 1 + field[defined] - field[defined].mean()
-    return out
+    if not defined.any():
+        raise ValueError(f"the bias field {path} does not cover the grid")
+    mean = float(field[defined].mean(dtype=np.float64))
+    if not defined.all():
+        field = field[nearest_index(defined)]        # a step to 1 would be an edge in the image
+    return (1 + (field - mean) * (percent / 100.0)).astype(np.float32)
+
+
+def _repair_edges(field: np.ndarray) -> np.ndarray:
+    """Replace an outermost plane that holds about half of the plane next to it.
+
+    Such a plane is what interpolating a field against the zeros beyond its
+    border leaves behind.  The first axial plane of ``rf100_A``, ``_B`` and
+    ``_C`` is one: at 30% it darkened the lowest 2 mm of the grid to a fifth.
+    """
+    field = field.copy()
+    for axis in range(3):
+        for edge, inner in ((0, 1), (-1, -2)):
+            outer, next_to = np.take(field, edge, axis), np.take(field, inner, axis)
+            valid = next_to != 0
+            if valid.any() and 0.4 < float(np.median(outer[valid] / next_to[valid])) < 0.6:
+                index = [slice(None)] * 3
+                index[axis] = edge
+                field[tuple(index)] = next_to
+    return field
 
 
 # -------------------------------------------------------------------- contrast
-def change_contrast(image: np.ndarray, exponent: float, reference: float = None):
-    """Power-law change of the contrast.
+def change_contrast(intensity, exponent: float, white: float):
+    """Power-law change of the contrast around the intensity of white matter.
 
-    The image is scaled to 0..1, raised to *exponent* and scaled back to its
-    range: 0.5 lowers the contrast between the tissues, 1.5 raises it.
+    ``white * (intensity / white) ** exponent``: white matter keeps its
+    intensity, and the ratio of any two intensities is raised to *exponent*.
+    0.5 lowers the contrast between the tissues (a ratio of GM to WM of 0.76
+    becomes 0.87), 1.5 raises it (0.66).
+
+    This is a map for the intensities of pure tissues, not for a finished
+    image.  A voxel that holds two tissues is the mixture of their
+    intensities, also at another contrast, and a power law of the mixture is
+    not the mixture of the power laws: applied to the image, an exponent of
+    0.5 or 1.5 moved the apparent pial boundary by 0.07 mm.  Applied after a
+    bias field, it also halved the field or made it 1.6 times as strong.
+    :func:`t1sim.simulate.acquire` therefore maps the tissue intensities and
+    what is not brain, and mixes the image again
+    (:func:`t1sim.synthesis.render`).
 
     Args:
-        image: The image.
+        intensity: Intensities on the scale of *white*: the three tissue
+            intensities, or an image of what is not brain.  Values below 0
+            count as 0.
         exponent: Greater than 0; 1 changes nothing.
-        reference: An intensity of the image, e.g. that of white matter, to
-            be mapped the same way.
+        white: The intensity of white matter.
 
     Returns:
-        The new image, float32; with *reference* a tuple of the image and
-        the mapped intensity, which a noise level given as an SNR has to
-        refer to from here on.
+        The mapped intensities: an array of float32, or a float for a number.
     """
-    image = np.asarray(image, dtype=np.float32)
-    low, high = float(image.min()), float(image.max())
-    if exponent == 1 or exponent <= 0 or not np.isfinite([low, high]).all() or high <= low:
-        return image.copy() if reference is None else (image.copy(), reference)
-    scaled = np.clip((image - low) / (high - low), 0, 1)
-    out = (scaled ** exponent * (high - low) + low).astype(np.float32)
-    if reference is None:
-        return out
-    mapped = float(np.clip((reference - low) / (high - low), 0, 1) ** exponent * (high - low) + low)
-    return out, mapped
+    if not exponent > 0 or not white > 0:
+        raise ValueError("the exponent of a contrast change and the intensity of white matter are positive")
+    if np.ndim(intensity) == 0:
+        return float(white * (max(float(intensity), 0.0) / white) ** exponent)
+    scaled = np.maximum(np.asarray(intensity, dtype=np.float32), 0) / np.float32(white)
+    return (scaled ** np.float32(exponent) * np.float32(white)).astype(np.float32)
 
 
 # ----------------------------------------------------------------------- noise

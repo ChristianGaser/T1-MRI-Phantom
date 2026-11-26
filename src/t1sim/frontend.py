@@ -46,6 +46,10 @@ from . import models
 #: Order of the tissue fractions, and their values in the label map.
 TISSUES = ("CSF", "GM", "WM")
 
+#: Lowest value of the normalised image inside the brain.  0 is what lies
+#: outside of it, and has no fractions.
+DARKEST = 0.01
+
 
 def _t1prep():
     """T1Prep's public unified segmentation and LAS, or an error that names what is missing."""
@@ -74,7 +78,9 @@ def fractions_from_label(label: np.ndarray) -> np.ndarray:
     linear mixture.  Below 1 and above 3 only one fraction is left, and the
     division makes it 1: a brain voxel darker than CSF is CSF, one brighter
     than WM is WM.  From 4 on, and at 0, all fractions are zero: such a voxel
-    is not brain, and the synthesis keeps the image there.
+    is not brain, and the synthesis keeps the image there.  Inside the brain
+    this happens to the brightest vessels, which :mod:`t1sim.cleanup` makes
+    CSF; :func:`segment` keeps the darkest voxels of the brain above 0.
 
     Args:
         label: (X, Y, Z) array on the scale CSF = 1, GM = 2, WM = 3.
@@ -147,7 +153,9 @@ def segment(t1, template_dir=None, verbose: bool = False, deformation: bool = Fa
         - ``label``: (X, Y, Z) float32, 0 outside the brain, CSF = 1, GM = 2,
           WM = 3 with partial volumes in between;
         - ``fractions``: (X, Y, Z, 3) float32, CSF, GM and WM
-          (:func:`fractions_from_label` of the normalised image);
+          (:func:`fractions_from_label` of the normalised image).  They sum
+          to 1 in the brain, except in voxels of 4 or more in ``normalised``,
+          the brightest vessels, where they are 0;
         - ``normalised``: (X, Y, Z) float32, the LAS-normalised brain on the
           scale of the label, up to 5 for what is brighter than WM; its 2 is
           the GM mean of the mixture (``means["GM"]``);
@@ -190,6 +198,8 @@ def segment(t1, template_dir=None, verbose: bool = False, deformation: bool = Fa
     # Pure GM is where the mixture has it; CSF and WM are left to LAS
     las = apply_LAS(brain, first_label, verbose=verbose, peaks=(None, means["GM"], None))
     normalised = 3.0 * np.asarray(las.dataobj, dtype=np.float32)
+    # A brain voxel as dark as the background would get no fractions: it is CSF
+    np.maximum(normalised, DARKEST, out=normalised)
     normalised[~mask] = 0.0
 
     fractions = fractions_from_label(normalised)

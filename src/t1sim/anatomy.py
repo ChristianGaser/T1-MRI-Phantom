@@ -12,18 +12,33 @@ averaging the hard labels.  Non-cortical structures keep their labels, and
 no band is grown around the ventricles or the corpus callosum.
 
 **Atrophy** (:func:`atrophy`) is not a port.  ``mri_simulate.m`` multiplies
-the CSF fraction inside a region and renormalises, which leaves every voxel
-without CSF untouched and moves no boundary: the cortex does not get thinner,
-its partial volume voxels get darker.  That method is kept as
-:func:`atrophy_by_scaling` for comparison.  :func:`atrophy` deforms the
-anatomy instead.  Tissue of the region is given a volume change, the CSF
-around it takes up the space, and a smooth deformation with that divergence
-is integrated and applied to the fractions and to the image.  Boundaries
-move, the cortex thins and the sulci widen, and the Jacobian determinant of
-the deformation is returned as the ground truth of the volume change.  The
-deformation can prescribe the thickness of the cortex (it then acts along the
-normal of the white matter surface) or the volume of the tissue (it then
-shrinks the same in all directions).
+the CSF fraction inside a region and renormalises.  No point of the anatomy
+moves, but nearly every cortical voxel of a label map made from intensities
+holds some CSF, so the cortex does read thinner afterwards (12% for a factor
+of 2 on the scan this was measured on).  The effect is set by a factor
+without a unit, depends on the voxel size (a loss of 9.5% of the grey
+matter at 0.5 mm was one of 10.6% at 1 mm), darkens the cortex, and leaves
+no deformation to validate against.  That method is kept as
+:func:`atrophy_by_scaling` for comparison.
+
+:func:`atrophy` deforms the anatomy instead.  A smooth deformation is
+integrated from a velocity field and applied to the fractions and to the
+image: boundaries move, the cortex thins and the sulci widen, and the
+Jacobian determinant of the deformation is the ground truth of the volume
+change.  The velocity either scales the distance of the cortex from the
+white matter surface (``"thinning"``) or is the curl-free field whose sinks
+are the tissue of the region and whose sources are the CSF around it
+(``"volume"``).
+
+A deformation is described by three maps, all in voxels of the grid:
+
+- ``displacement`` (backward): where every voxel of the new anatomy comes
+  from, relative to itself.  It is what resamples a volume (:func:`warp`).
+- ``forward``: where every voxel of the old anatomy goes, relative to itself.
+- ``jacobian``: the Jacobian determinant of the forward map, so it lies on
+  the old anatomy: the factor by which the tissue that was at a voxel changes
+  its volume.  :func:`compose` chains the last two for deformations that
+  follow each other.
 """
 
 from __future__ import annotations
@@ -35,7 +50,7 @@ from scipy.optimize import brentq
 
 from . import atlas
 from ._volume import (bounding_box, closing, dilate, distance, erode, grey_close, grid_voxel_size,
-                      largest_component, smooth, voxel_size)
+                      largest_component, smooth)
 
 _CSF, _GM, _WM = 0, 1, 2
 
@@ -51,7 +66,7 @@ def _round(values: np.ndarray) -> np.ndarray:
 
 # ------------------------------------------------------------------- thickness
 def thickness(fractions: np.ndarray, label: np.ndarray, regions_on_grid: np.ndarray,
-              grid_affine: np.ndarray, mm, verbose: bool = False) -> tuple:
+              grid_affine: np.ndarray, mm, verbose: bool = False, return_rebuilt: bool = False) -> tuple:
     """Give the cortex a chosen thickness.
 
     Args:
@@ -62,9 +77,14 @@ def thickness(fractions: np.ndarray, label: np.ndarray, regions_on_grid: np.ndar
         mm: The thickness in mm: one value, or three for the mainly occipital
             parcels, the rest and the mainly frontal parcels.
         verbose: Print the progress.
+        return_rebuilt: Also return where the result is the rebuilt anatomy.
 
     Returns:
-        ``(fractions, label)`` with the new cortex.
+        ``(fractions, label)`` with the new cortex; with *return_rebuilt*
+        also an (X, Y, Z) boolean map of the brain voxels whose fractions
+        come from the rebuilt bands and no longer from the scan.  The other
+        brain voxels, in the structures that are kept and deep in the white
+        matter, have the fractions they had.
     """
     mm = np.atleast_1d(np.asarray(mm, dtype=np.float64))
     if mm.size not in (1, 3) or np.any(mm <= 0):
@@ -151,7 +171,13 @@ def thickness(fractions: np.ndarray, label: np.ndarray, regions_on_grid: np.ndar
     all_label = np.array(label, dtype=np.float32)
     all_fractions[box] = out
     all_label[box] = new_label
-    return all_fractions, all_label
+    if not return_rebuilt:
+        return all_fractions, all_label
+    # share of the original fractions in the two blends above
+    original = 1 - (1 - keep_soft) * (1 - core)
+    rebuilt = np.zeros(all_label.shape, dtype=bool)
+    rebuilt[box] = (inside | holes) & ((original < 0.5) | holes)
+    return all_fractions, all_label, rebuilt
 
 
 # --------------------------------------------------------------------- atrophy
@@ -180,8 +206,8 @@ def atrophy_by_scaling(fractions: np.ndarray, roi: np.ndarray, factor: float) ->
     return out
 
 
-def _sample(volume: np.ndarray, coords: np.ndarray) -> np.ndarray:
-    """Trilinear samples of (C, X, Y, Z) *volume* at (3, ...) voxel coordinates."""
+def _sample(volume: np.ndarray, coords: np.ndarray, nearest: bool = False) -> np.ndarray:
+    """Samples of (C, X, Y, Z) *volume* at (3, ...) voxel coordinates: trilinear, or the nearest voxel."""
     import torch
     import torch.nn.functional as F
 
@@ -191,7 +217,8 @@ def _sample(volume: np.ndarray, coords: np.ndarray) -> np.ndarray:
     grid = grid.reshape(3, -1).T / (size - 1) * 2 - 1           # to -1..1, corners aligned
     grid = grid.flip(-1).reshape(1, *coords.shape[1:], 3) if coords.ndim == 4 \
         else grid.flip(-1).reshape(1, -1, 1, 1, 3)
-    out = F.grid_sample(vol, grid, mode="bilinear", padding_mode="border", align_corners=True)
+    out = F.grid_sample(vol, grid, mode="nearest" if nearest else "bilinear", padding_mode="border",
+                        align_corners=True)
     return out[0].reshape(volume.shape[0], *coords.shape[1:]).numpy()
 
 
@@ -247,7 +274,7 @@ def _velocity(divergence: np.ndarray, vx: np.ndarray, pad: int = 12) -> np.ndarr
 
 
 def _volume_flow(fractions, roi, fine_vx, change, tissue_index, reach, resolution, verbose):
-    """Backward displacement and Jacobian on the fine grid for a change of volume.
+    """Backward and forward displacement and Jacobian on the fine grid for a change of volume.
 
     The tissue of the region is a sink and the CSF around it the source of a
     curl-free velocity field, found on a coarser grid; the flow shrinks the
@@ -290,15 +317,16 @@ def _volume_flow(fractions, roi, fine_vx, change, tissue_index, reach, resolutio
             break
         amplitude *= np.log1p(change) / np.log1p(achieved)
 
-    backward = _exponential(-velocity)
     # to the fine grid: positions and displacements both scale with the grids
     scale = zoom[:, None, None, None].astype(np.float32)
     at_coarse = (_identity(shape) + 0.5) * scale - 0.5
-    return _sample(backward, at_coarse) / scale, _sample(jac[None], at_coarse)[0], achieved
+    backward = _sample(_exponential(-velocity), at_coarse) / scale
+    forward = _sample(_exponential(velocity), at_coarse) / scale
+    return backward, forward, _sample(jac[None], at_coarse)[0], achieved
 
 
 def _thinning_flow(fractions, label, roi, fine_vx, change, tissue_index, reach, verbose):
-    """Backward displacement and Jacobian on the fine grid for a thinner cortex.
+    """Backward and forward displacement and Jacobian on the fine grid for a thinner cortex.
 
     Every point of the cortex moves along the normal of the white matter
     surface with a speed proportional to its distance from that surface, so
@@ -334,7 +362,8 @@ def _thinning_flow(fractions, label, roi, fine_vx, change, tissue_index, reach, 
     rate = np.log1p(change)
     for iteration in range(5):
         velocity = rate * unit
-        jac = _jacobian(_exponential(velocity))
+        forward = _exponential(velocity)
+        jac = _jacobian(forward)
         achieved = float(np.sum(sink * (jac - 1), dtype=np.float64) / np.sum(sink, dtype=np.float64))
         if verbose:
             print(f"  atrophy: rate {rate:+.4f} gives {100 * achieved:+.2f}% "
@@ -342,12 +371,15 @@ def _thinning_flow(fractions, label, roi, fine_vx, change, tissue_index, reach, 
         if abs(achieved - change) < 0.01 * abs(change) or iteration == 4:
             break
         rate *= np.log1p(change) / np.log1p(achieved)
-    backward = _exponential(-velocity)
-    disp = np.zeros((3,) + shape, dtype=np.float32)
+    # outside the box nothing moves
+    full = (slice(None),) + box
+    backward_fine = np.zeros((3,) + shape, dtype=np.float32)
+    forward_fine = np.zeros((3,) + shape, dtype=np.float32)
     jac_fine = np.ones(shape, dtype=np.float32)
-    disp[(slice(None),) + box] = backward
+    backward_fine[full] = _exponential(-velocity)
+    forward_fine[full] = forward
     jac_fine[box] = jac
-    return disp, jac_fine, achieved
+    return backward_fine, forward_fine, jac_fine, achieved
 
 
 def atrophy(fractions: np.ndarray, corrected: np.ndarray, grid_affine: np.ndarray,
@@ -389,12 +421,14 @@ def atrophy(fractions: np.ndarray, corrected: np.ndarray, grid_affine: np.ndarra
 
     Returns:
         A dict with the deformed ``fractions`` and ``corrected``, the
-        ``label`` of the new fractions, ``jacobian`` ((X, Y, Z), Jacobian
-        determinant of the deformation at every voxel of the original
-        anatomy: below 1 where volume is lost), ``displacement`` ((3, X, Y,
-        Z) in voxels: where every voxel of the new anatomy comes from,
-        relative to itself) and ``achieved``, the relative volume change of
-        the tissue of the region, followed with the tissue.
+        ``label`` of the new fractions, and the deformation (see the module
+        notes): ``jacobian`` ((X, Y, Z), on the anatomy that was passed in:
+        below 1 where volume is lost), ``displacement`` and ``forward`` ((3,
+        X, Y, Z) in voxels).  ``achieved`` is the relative volume change of
+        the tissue of the region, followed with the tissue: the integral of
+        the Jacobian over the tissue that was in the region.  What is found
+        in the fixed region afterwards differs from it, because tissue moves
+        across its border.
     """
     if not -0.5 <= change <= 0.5 or change == 0:
         raise ValueError("change is a relative change between -0.5 and 0.5, and not 0")
@@ -410,16 +444,20 @@ def atrophy(fractions: np.ndarray, corrected: np.ndarray, grid_affine: np.ndarra
         raise ValueError("the region is empty")
     fine_vx = grid_voxel_size(grid_affine)
     if mode == "volume":
-        disp, jac, achieved = _volume_flow(fractions, roi, fine_vx, change, tissue_index, reach,
-                                           resolution, verbose)
+        disp, forward, jac, achieved = _volume_flow(fractions, roi, fine_vx, change, tissue_index,
+                                                    reach, resolution, verbose)
     else:
         label = fractions[..., 0] + 2 * fractions[..., 1] + 3 * fractions[..., 2]
-        disp, jac, achieved = _thinning_flow(fractions, label, roi, fine_vx, change, tissue_index,
-                                             reach, verbose)
+        disp, forward, jac, achieved = _thinning_flow(fractions, label, roi, fine_vx, change,
+                                                      tissue_index, reach, verbose)
     if jac.min() <= 0:
         raise RuntimeError("the deformation folds; choose a smaller change or a larger reach")
 
-    moved = bounding_box(np.abs(disp).max(0) > 0.01, 2)
+    moving = np.abs(disp).max(0) > 0.01
+    if not moving.any():
+        raise ValueError("the deformation moves nothing by more than 0.01 voxels: the region is too "
+                         "small for this change")
+    moved = bounding_box(moving, 2)
     stack = np.concatenate([np.moveaxis(fractions, -1, 0), np.asarray(corrected, np.float32)[None]])
     sub = (slice(None),) + moved
     grid = _identity([s.stop - s.start for s in moved])
@@ -432,20 +470,29 @@ def atrophy(fractions: np.ndarray, corrected: np.ndarray, grid_affine: np.ndarra
         "corrected": warped[3],
         "jacobian": jac,
         "displacement": disp,
+        "forward": forward,
         "achieved": achieved,
     }
 
 
-def warp(volume: np.ndarray, displacement: np.ndarray) -> np.ndarray:
-    """Deform another volume as :func:`atrophy` deformed the anatomy.
+def warp(volume: np.ndarray, displacement: np.ndarray, nearest: bool = False) -> np.ndarray:
+    """Read a volume at the places a displacement points to.
+
+    With the ``displacement`` of :func:`atrophy` this deforms a volume as the
+    anatomy was deformed; with its ``forward`` it brings a map of the new
+    anatomy back onto the old one.
 
     Args:
         volume: (X, Y, Z), or (X, Y, Z, C) with a last axis of classes.
-        displacement: ``atrophy(...)["displacement"]``.
+        displacement: (3, X, Y, Z) in voxels: the result at a voxel is the
+            volume at that voxel plus its displacement.
+        nearest: Take the nearest voxel instead of interpolating linearly:
+            for an atlas, whose numbers must not be mixed.
 
     Returns:
-        The deformed volume, float32, in the shape of *volume*.
+        The volume in its shape: float32, or its own type with *nearest*.
     """
+    dtype = np.asarray(volume).dtype if nearest else np.float32
     volume = np.asarray(volume, dtype=np.float32)
     classes = volume.ndim == 4
     stack = np.moveaxis(volume, -1, 0) if classes else volume[None]
@@ -453,8 +500,31 @@ def warp(volume: np.ndarray, displacement: np.ndarray) -> np.ndarray:
     if np.abs(displacement).max() > 0.01:
         moved = bounding_box(np.abs(displacement).max(0) > 0.01, 2)
         sub = (slice(None),) + moved
-        out[sub] = _sample(stack[sub], _identity([s.stop - s.start for s in moved]) + displacement[sub])
-    return np.ascontiguousarray(np.moveaxis(out, 0, -1)) if classes else out[0]
+        out[sub] = _sample(stack[sub], _identity([s.stop - s.start for s in moved]) + displacement[sub],
+                           nearest=nearest)
+    out = np.ascontiguousarray(np.moveaxis(out, 0, -1)) if classes else out[0]
+    return out.astype(dtype, copy=False)
+
+
+def compose(jacobian: np.ndarray, forward: np.ndarray, step: dict) -> tuple:
+    """Jacobian determinant and forward displacement of two deformations, one after the other.
+
+    The Jacobian of the second deformation lies on the anatomy the first one
+    made.  It is read where the first one took every voxel, and only then
+    multiplied: the plain product of the two maps is wrong wherever both
+    change the volume.
+
+    Args:
+        jacobian: (X, Y, Z) Jacobian determinant of the first deformation.
+        forward: (3, X, Y, Z) its forward displacement.
+        step: The result of the :func:`atrophy` that followed.
+
+    Returns:
+        ``(jacobian, forward)`` of both together, on the anatomy before the
+        first.
+    """
+    then = np.moveaxis(warp(np.moveaxis(step["forward"], 0, -1), forward), -1, 0)
+    return jacobian * warp(step["jacobian"], forward), forward + then
 
 
 def roi_from_atlas(regions_on_grid: np.ndarray, numbers) -> np.ndarray:

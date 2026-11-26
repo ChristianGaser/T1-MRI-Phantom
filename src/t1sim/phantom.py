@@ -66,7 +66,7 @@ Precision:
     ``thickness_phantom.m`` operation by operation, each one rounded to
     single precision (:func:`_single`), because a sample within rounding of
     a boundary would otherwise fall on its other side than in MATLAB.  With
-    that, label and T1w image of the default phantom and of 25 others were
+    that, label and T1w image of the default phantom and of 26 others were
     those of the MATLAB version bit by bit.
 
     Two further phantoms differed, and any will whose shifted levels coincide
@@ -84,14 +84,13 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 import warnings
 
 import nibabel as nib
 import numpy as np
 from scipy import ndimage
 
-from . import __version__
+from . import bids
 
 #: Order of the tissues in ``intensities`` and in the volumes, and their label.
 LABELS = {"CSF": 1, "GM": 2, "WM": 3}
@@ -124,9 +123,13 @@ def _round(value: float) -> int:
     return math.floor(value + 0.5)
 
 
-def _bids_label(tag: str) -> str:
-    """A valid BIDS entity label: 0.5 becomes 0p5, all else but letters and digits is dropped."""
-    return re.sub(r"[^a-zA-Z0-9]", "", tag.replace(".", "p"))
+def _basename(name: str, vx: float, thickness: float) -> str:
+    """Name of the files of a phantom without their suffix.
+
+    The thickness is written in tenths of a mm, as ``thickness_phantom.m``
+    writes it, so two values less than that apart can get the same name.
+    """
+    return "{}_res-{}mm_desc-{}".format(name, bids.label(f"{vx:g}"), bids.thickness_tag(thickness))
 
 
 def _distance_to(obj: np.ndarray, vx: float) -> np.ndarray:
@@ -331,6 +334,10 @@ def thickness_phantom(
     if len(intensities) != 3:
         raise ValueError("intensities has to hold the values of CSF, GM and WM")
     pve_steps = int(pve_steps)
+    if outdir is not None and len({_basename(name, vx, t) for t in values}) < len(values):
+        # one file would silently replace the other
+        raise ValueError("two values of thickness get the same file name, which holds the "
+                         "thickness in tenths of a mm: write them to different folders")
 
     ss = max(1, _round(supersample))
     if ss % 2 == 0:
@@ -505,8 +512,7 @@ def write_phantom(label, t1w, info: dict, outdir=".", name: str = "thicknessPhan
     os.makedirs(outdir, exist_ok=True)
 
     vx, t = info["vx"], info["thickness"]
-    base = "{}_res-{}mm_desc-{}".format(
-        name, _bids_label(f"{vx:g}"), _bids_label(f"Thickness{_round(10 * t):02d}mm"))
+    base = _basename(name, vx, t)
     files = {"label": os.path.join(outdir, base + "_dseg.nii.gz"),
              "t1w": os.path.join(outdir, base + "_T1w.nii.gz")}
 
@@ -523,7 +529,7 @@ def write_phantom(label, t1w, info: dict, outdir=".", name: str = "thicknessPhan
         image.set_qform(affine, code="aligned")
         nib.save(image, files[key])
 
-    generated = [{"Name": "t1sim", "Version": __version__}]
+    generated = [dict(bids.GENERATED_BY)]
     parameters = {
         "Thickness": t,
         "CSFLayer": info["csf"],
@@ -559,7 +565,7 @@ def write_phantom(label, t1w, info: dict, outdir=".", name: str = "thicknessPhan
             "Description": (
                 "Ideal T1w image of the phantom, i.e. the tissue intensities mixed by the "
                 "partial volume fractions. It carries no noise, no bias field and no other "
-                "artefact, use mri_simulate for those."),
+                "artefact; t1sim.artefacts and t1sim.kspace add those."),
             "PhantomParameters": dict(parameters, Intensities=list(info["intensities"])),
         },
     }
@@ -572,7 +578,7 @@ def write_phantom(label, t1w, info: dict, outdir=".", name: str = "thicknessPhan
 
 def _sidecar(fname: str) -> str:
     """Name of the JSON sidecar of an image."""
-    return re.sub(r"\.nii(\.gz)?$", "", fname) + ".json"
+    return bids.strip_extension(fname) + ".json"
 
 
 def _along(axis: int, *item) -> tuple:

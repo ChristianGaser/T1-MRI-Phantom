@@ -26,10 +26,15 @@ that is typical for motion.
   oscillations give every block its own pose (``continuous``); they are
   translations only, which are free.
 - Only the differences between the poses make the artefact.  The mean of the
-  poses weighted by the k-space energy of their blocks is where the object
-  appears, so it is subtracted and the image stays where its label map is.
+  poses weighted by the k-space energy of their blocks is where the complex
+  image lies, so it is subtracted.
 - The assembled k-space is no longer conjugate symmetric, so the image is the
   magnitude of a complex volume, as it is in a scanner.
+- The magnitude is not linear, so the magnitude image does not lie where the
+  complex image does: up to two voxels away for a severe motion.  Its
+  displacement from the unmoved volume is therefore estimated and removed
+  (``recentre``, see :func:`apply_motion`), so that the image stays where its
+  label map is.
 
 **Ringing.**  A gain on k-space, of two types that are different artefacts:
 ``notch`` damps or inverts a narrow band at ``|k| = k0`` (gain
@@ -44,8 +49,8 @@ as one after the other.
 
 What is random (:func:`sample_motion`) is separate from what is not
 (:func:`apply_motion`), so that the latter can be compared with MATLAB: fed
-with the pose table of ``mri_simulate.m``, it gives the image of
-``mri_simulate.m``.
+with the pose table of ``mri_simulate.m`` and with ``recentre=False``, it
+gives the image of ``mri_simulate.m``.
 
 Volumes are 3-D numpy arrays or torch tensors indexed ``[x, y, z]`` and come
 back as what they were, a tensor on its device.  float64 is computed in
@@ -59,6 +64,9 @@ What differs from the MATLAB version:
 - The random numbers are numpy's and not MATLAB's.  What is drawn, in which
   order and from which distribution is the same.
 - An option that does not exist is an error and is not ignored.
+- The magnitude image is brought back onto the unmoved volume (``recentre``).
+  ``mri_simulate.m`` stops at the mean pose, which left the image 0.4 to
+  1.6 mm from its label map on a real head.
 
 The rotation interpolates as ``rotate_volume`` of ``mri_simulate.m`` does,
 with SPM's sinc interpolation (``spm_slice_vol`` with a hold of -5): a sinc

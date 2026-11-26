@@ -16,11 +16,17 @@ every simulated image with its ground truth by these names):
 
 BIDS labels are alphanumeric, so a decimal point becomes ``p`` and
 everything else that is not a letter or a digit is dropped.
+
+The names do not hold every setting (the strength of the cleanup, the reach
+of an atrophy, the output grid), so two simulations can ask for the same
+name.  :func:`t1sim.simulate.write` refuses to replace a ground truth that
+was made with other settings.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -43,7 +49,21 @@ def number(value: float) -> str:
     return label(f"{value:g}")
 
 
+def thickness_tag(mm) -> str:
+    """``Thickness25mm`` for 2.5 mm, ``Thickness15to25mm`` for several values.
+
+    Tenths of a mm, rounded as MATLAB rounds, which is how ``mri_simulate.m``
+    and ``thickness_phantom.m`` name their files.  Values less than a tenth
+    apart share a name, and so do sets of values with the same extremes.
+    """
+    tenths = [math.floor(10 * float(value) + 0.5) for value in (mm if hasattr(mm, "__len__") else [mm])]
+    if len(tenths) == 1:
+        return f"Thickness{tenths[0]:02d}mm"
+    return f"Thickness{min(tenths):02d}to{max(tenths):02d}mm"
+
+
 def strip_extension(name: str) -> str:
+    """A file name without ``.nii`` or ``.nii.gz``."""
     for ext in (".nii.gz", ".nii"):
         if name.lower().endswith(ext):
             return name[:-len(ext)]
@@ -78,7 +98,10 @@ def output_folder(scan, derivatives: bool = True) -> tuple:
         derivatives: Write into ``derivatives/t1sim-<version>`` of the
             dataset: at the root of a BIDS dataset (the folder above the
             first ``sub-*`` folder), with the folders of subject and session
-            kept below it, or next to the folder of the scan otherwise.
+            kept below it.  For a scan outside a BIDS dataset the
+            ``derivatives`` folder lies next to the folder of the scan, and
+            the name of that folder is kept below it, so that scans of the
+            same name in different folders do not replace each other.
             False: next to the scan.
 
     Returns:
@@ -98,7 +121,7 @@ def output_folder(scan, derivatives: bool = True) -> tuple:
         return (root / "derivatives" / pipeline).joinpath(*below), root / "derivatives" / pipeline, \
             "bids::" + "/".join(below + (scan.name,))
     pipeline_folder = scan.parent.parent / "derivatives" / pipeline
-    return pipeline_folder, pipeline_folder, ""
+    return pipeline_folder / scan.parent.name, pipeline_folder, ""
 
 
 def write_dataset_description(pipeline_folder) -> None:
@@ -109,6 +132,20 @@ def write_dataset_description(pipeline_folder) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"Name": Path(pipeline_folder).name, "BIDSVersion": "1.8.0",
                                 "DatasetType": "derivative", "GeneratedBy": [GENERATED_BY]}, indent=2))
+
+
+def as_json(value):
+    """*value* as it comes back from a JSON file: to compare with what was written."""
+    return json.loads(json.dumps(_plain(value)))
+
+
+def read_sidecar(image_path):
+    """The JSON sidecar of an image as a dict, or None if there is none that can be read."""
+    path = Path(strip_extension(str(image_path)) + ".json")
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def _plain(value):

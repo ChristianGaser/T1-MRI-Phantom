@@ -24,6 +24,13 @@ Voxels above :data:`HYPER_SEED` are taken, together with the voxels above
 body.  Measured on that scan and on a scan without visible vessels, the
 seeds are 6.3 ml against 0.05 ml.
 
+The brightest of these voxels have no label at all.  From an intensity of 4
+on, the decomposition of the front end gives a brain voxel neither tissue nor
+CSF (:func:`t1sim.frontend.fractions_from_label`), so that the image keeps
+the scan there: 3.7 ml on the scan with the vessels, as holes of zeros inside
+the ground truth.  They are vessels by the same rule and become CSF with the
+others.
+
 **Dura** cannot be told from cortex by its shape or by its distance to the
 white matter; both are thin sheets of grey matter intensity.  What differs is
 that the cortex hangs on the white matter while the dura lies beyond the
@@ -33,13 +40,14 @@ grey matter it does not reach within a few mm is dura.  Structures whose
 shape makes a long path normal are spared: the cerebellum, whose white matter
 is a thin tree, and the deep grey matter.
 
-**Periventricular partial volume** follows the level 3 cleanup of CAT12's
-``cat_main_cleanup``: next to a ventricle, the brainstem or the corpus
-callosum, not in the basal ganglia or the thalamus, between pure white
-matter and pure CSF, and thin.  Such a voxel is decomposed again as a mixture
-of CSF and WM only.  Its label stays what it was, because the same value
-describes both mixtures; only the fractions carry the correction, which is
-why they are the ground truth and the label map is a view of them.
+**Periventricular partial volume** is found as the level 3 cleanup of CAT12's
+``cat_main_cleanup`` finds it: next to a ventricle, the brainstem or the
+corpus callosum, not in the basal ganglia or the thalamus, between pure white
+matter and pure CSF, and thin.  Such a voxel is decomposed again as the
+mixture of CSF and WM that has its intensity in the rendered image.  That is
+not the mixture with its label: GM is not half way between CSF and WM (148,
+380 and 501 on the scan this was measured on), so a voxel as bright as GM is
+34% CSF and 66% WM, and its label becomes 2.3.
 """
 
 from __future__ import annotations
@@ -56,6 +64,8 @@ _CSF, _GM, _WM = 0, 1, 2
 #: brain is a vessel, and above which a voxel connected to such a one is.
 HYPER_SEED = 3.5
 HYPER_GROW = 3.2
+#: Intensity from which on the front end gives a voxel no label and no fractions.
+NO_LABEL = 4.0
 
 
 def _in(regions_on_grid: np.ndarray, numbers) -> np.ndarray:
@@ -70,8 +80,8 @@ def detect(label: np.ndarray, normalised: np.ndarray, grid_affine: np.ndarray,
     Args:
         label: (X, Y, Z) label map, CSF = 1, GM = 2, WM = 3.
         normalised: (X, Y, Z) LAS-normalised image on the scale of the label
-            (``frontend.segment(...)["normalised"]``); the vessel detection
-            reads the intensities from it.
+            and 0 outside the brain (``frontend.segment(...)["normalised"]``);
+            the vessel detection reads the intensities from it.
         grid_affine: Voxel-to-world matrix of the working grid.
         regions_on_grid: (X, Y, Z) Neuromorphometrics atlas on the grid
             (``atlas.to_grid("Neuromorphometrics", iy, template_mat)``).
@@ -109,12 +119,14 @@ def detect(label: np.ndarray, normalised: np.ndarray, grid_affine: np.ndarray,
 
         norm = normalised[box]
         body = erode(lab >= 2.5, 1.5, vx)                # hyperintense white matter is no vessel
-        seeds = (norm > HYPER_SEED) & (lab > 0) & ~body
+        # the image is 0 outside the brain, so every bright voxel is one of the brain
+        seeds = (norm > HYPER_SEED) & ~body
         bright = cat_surf.vol_dilate_geodesic(seeds, region=(norm > HYPER_GROW) & ~body, iterations=4)
         found["vessels"] = weight > 1 - vessels
         found["vessels"][box] |= np.asarray(bright, dtype=bool)
-        # a vessel the label already calls CSF needs no correction
-        found["vessels"] &= label > 1.5
+        # A vessel the label already calls CSF needs no correction.  One that
+        # is too bright to have a label does: it is a hole in the ground truth.
+        found["vessels"] &= (label > 1.5) | (normalised >= NO_LABEL)
 
     if dura > 0:
         import cat_surf
@@ -145,25 +157,38 @@ def detect(label: np.ndarray, normalised: np.ndarray, grid_affine: np.ndarray,
 
 
 def apply(fractions: np.ndarray, label: np.ndarray, to_csf: np.ndarray = None,
-          pve: np.ndarray = None) -> tuple:
+          pve: np.ndarray = None, means=None) -> tuple:
     """Correct the ground truth in the detected voxels.
 
     Args:
         fractions: (X, Y, Z, 3) fractions of CSF, GM and WM.
         label: (X, Y, Z) label map.
         to_csf: Voxels that become CSF: vessels and dura.
-        pve: Voxels that become a mixture of CSF and WM with the label they
-            have: ``csf = (3 - label) / 2``, ``wm = 1 - csf``, no GM.
+        pve: Voxels that become the mixture of CSF and WM with the intensity
+            they are rendered at: ``csf = (WM - intensity) / (WM - CSF)``
+            with ``intensity = fractions @ means``, ``wm = 1 - csf``, no GM.
+        means: The tissue intensities the image is rendered with: a dict
+            with ``CSF``, ``GM`` and ``WM``, or three values in that order.
+            Needed with *pve*.
 
     Returns:
-        ``(fractions, label)``, new arrays.  The label changes only where
-        *to_csf* is set.
+        ``(fractions, label)``, new arrays; the label is that of the new
+        fractions.
     """
     fractions = np.array(fractions, dtype=np.float32)
     label = np.array(label, dtype=np.float32)
     if pve is not None and pve.any():
-        csf = np.clip((3 - label[pve]) / 2, 0, 1)
+        if means is None:
+            raise ValueError("the periventricular correction needs the tissue intensities (means)")
+        if isinstance(means, dict):
+            means = [means[t] for t in ("CSF", "GM", "WM")]
+        means = np.asarray(means, dtype=np.float32)
+        if not means[_CSF] < means[_WM]:
+            raise ValueError("white matter has to be brighter than CSF")
+        intensity = fractions[pve] @ means
+        csf = np.clip((means[_WM] - intensity) / (means[_WM] - means[_CSF]), 0, 1)
         fractions[pve] = np.stack([csf, np.zeros_like(csf), 1 - csf], axis=-1)
+        label[pve] = csf + 3 * (1 - csf)
     if to_csf is not None and to_csf.any():
         fractions[to_csf] = (1.0, 0.0, 0.0)
         label[to_csf] = 1.0
@@ -193,7 +218,8 @@ def clean(seg: dict, vessels: float = 0.5, dura: float = 4.0, pve: bool = True,
     affine = seg["grid"].affine
     regions_on_grid = atlas.to_grid("Neuromorphometrics", seg["iy"], seg["template_mat"])
     masks = detect(label, seg["normalised"], affine, regions_on_grid, vessels, dura, pve)
-    new_fractions, new_label = apply(fractions, label, masks["vessels"] | masks["dura"], masks["pve"])
+    new_fractions, new_label = apply(fractions, label, masks["vessels"] | masks["dura"], masks["pve"],
+                                     means=seg["means"])
     voxel_ml = float(np.prod(grid_voxel_size(affine))) / 1000
     return {"fractions": new_fractions, "label": new_label, "masks": masks,
             "volumes_ml": {name: float(mask.sum()) * voxel_ml for name, mask in masks.items()}}
