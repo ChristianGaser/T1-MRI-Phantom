@@ -43,15 +43,30 @@ class TestApply(unittest.TestCase):
         self.assertEqual(label[0, 0, 0], 1.0)
         np.testing.assert_array_equal(fractions[1:], self.fractions[1:])
 
-    def test_periventricular_voxels_lose_their_gm_and_keep_their_label(self):
+    def test_periventricular_voxels_become_the_mixture_of_csf_and_wm_with_their_intensity(self):
         pve = np.array([False, True, True, False]).reshape(4, 1, 1)
-        fractions, label = cleanup.apply(self.fractions, self.label, None, pve)
-        np.testing.assert_allclose(fractions[1, 0, 0], [0.3, 0, 0.7], atol=1e-6)
-        np.testing.assert_allclose(fractions[2, 0, 0], [0.5, 0, 0.5], atol=1e-6)
-        np.testing.assert_array_equal(label, self.label)
-        # the same label, now as a mixture of CSF and WM
-        np.testing.assert_allclose((fractions[..., 0] + 3 * fractions[..., 2])[pve], self.label[pve], atol=1e-6)
+        means = np.array([150.0, 380.0, 500.0], np.float32)      # GM is not half way
+        fractions, label = cleanup.apply(self.fractions, self.label, None, pve, means=means)
+        np.testing.assert_array_equal(fractions[..., 1][pve], 0)
+        np.testing.assert_allclose(fractions.sum(-1), 1, atol=1e-6)
+        # the image is rendered from the fractions as they were: the new ones give the same intensity
+        np.testing.assert_allclose(fractions @ means, self.fractions @ means, rtol=1e-5)
+        np.testing.assert_allclose(fractions[2, 0, 0], [120 / 350, 0, 230 / 350], atol=1e-6)
+        # the label is that of the new fractions, no longer 2
+        np.testing.assert_allclose(label, fractions[..., 0] + 2 * fractions[..., 1] + 3 * fractions[..., 2], atol=1e-6)
+        self.assertAlmostEqual(float(label[2, 0, 0]), 3 - 2 * 120 / 350, places=5)
         np.testing.assert_array_equal(fractions[~pve], self.fractions[~pve])
+        with self.assertRaisesRegex(ValueError, "means"):
+            cleanup.apply(self.fractions, self.label, None, pve)
+
+    def test_a_voxel_without_fractions_becomes_csf(self):
+        # the brightest vessels have no label and no fractions before the cleanup
+        fractions, label = self.fractions.copy(), self.label.copy()
+        fractions[0], label[0] = 0, 0
+        to_csf = np.array([True, False, False, False]).reshape(4, 1, 1)
+        fractions, label = cleanup.apply(fractions, label, to_csf)
+        np.testing.assert_array_equal(fractions[0, 0, 0], [1, 0, 0])
+        self.assertEqual(label[0, 0, 0], 1.0)
 
     def test_the_input_is_not_changed(self):
         before = self.fractions.copy()
@@ -106,6 +121,62 @@ class TestDura(unittest.TestCase):
         self.assertEqual(int(self.detect(dura=0)["dura"].sum()), 0)
         with self.assertRaises(ValueError):
             self.detect(dura=-1)
+
+
+@unittest.skipUnless(HAVE_CAT_SURF, "cat_surf is needed for the growth from the brightest voxels")
+class TestBrightVessels(unittest.TestCase):
+    """A vessel in the cortex whose core is too bright to have a label, and a bright spot deep in the white matter."""
+
+    def setUp(self):
+        r, x = _radius()
+        label = np.zeros((N, N, N), np.float32)
+        label[r < 26] = 1
+        label[r < 15] = 2
+        label[r < 12] = 3
+        normalised = label.copy()
+        c = N // 2
+        self.shell = np.zeros(label.shape, bool)
+        self.shell[c + 12:c + 15, c - 1:c + 2, c - 1:c + 2] = True          # in the cortex
+        self.core = np.zeros(label.shape, bool)
+        self.core[c + 13, c, c] = True
+        self.spot = np.zeros(label.shape, bool)
+        self.spot[c - 1:c + 2, c - 1:c + 2, c - 1:c + 2] = True              # in the middle of the white matter
+        normalised[self.shell | self.spot] = 3.7
+        label[self.shell] = 3                       # brighter than white matter is white matter in the label
+        normalised[self.core] = 4.5
+        label[self.core] = 0                        # and from 4 on there is no label
+        self.label, self.normalised = label, normalised
+        # T1Prep's own detection finds nothing here: only the rule of the brightness is tested
+        fake = mock.MagicMock()
+        fake.vessel_weight.return_value = np.zeros(label.shape, np.float32)
+        package = mock.MagicMock(vessels=fake)
+        patcher = mock.patch.dict(sys.modules, {"t1prep": package, "t1prep.vessels": fake})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def detect(self, **kwargs):
+        options = dict(vessels=0.5, dura=0, pve=False)
+        options.update(kwargs)
+        return cleanup.detect(self.label, self.normalised, AFFINE, np.zeros(self.label.shape, np.uint8),
+                              **options)["vessels"]
+
+    def test_the_vessel_is_found_with_its_core_and_the_white_matter_is_left(self):
+        found = self.detect()
+        self.assertTrue(found[self.shell].all())
+        self.assertTrue(found[self.core].all())      # the hole in the ground truth
+        self.assertEqual(int(found[self.spot].sum()), 0)
+        self.assertEqual(int(found[~self.shell].sum()), 0)
+
+    def test_the_cleaned_ground_truth_has_no_hole(self):
+        fractions = np.zeros(self.label.shape + (3,), np.float32)
+        for k in range(3):
+            fractions[..., k] = self.label == k + 1
+        cleaned, label = cleanup.apply(fractions, self.label, self.detect())
+        np.testing.assert_array_equal(cleaned[self.core], [[1, 0, 0]])
+        np.testing.assert_array_equal(label[self.shell], 1.0)
+
+    def test_it_can_be_switched_off(self):
+        self.assertEqual(int(self.detect(vessels=0).sum()), 0)
 
 
 class TestPeriventricular(unittest.TestCase):

@@ -148,6 +148,34 @@ class TestTheChain(unittest.TestCase):
         self.assertTrue(calls["deformation"])
         self.assertEqual((out["iy"], out["template_mat"]), ("iy", "mat"))
 
+    def test_a_brain_voxel_that_las_maps_to_zero_is_csf_and_no_hole(self):
+        scan = nib.Nifti1Image(np.ones(self.shape, np.float32), np.eye(4))
+        grid = nib.Nifti1Image(np.zeros(self.shape, np.float32), np.eye(4))
+        mask = np.ones(self.shape, bool)
+        mask[0] = False                                         # outside the brain
+        las = np.full(self.shape, 2 / 3, np.float32)
+        dark = (1, 1, 1)
+        las[dark] = 0.0                                         # darker than everything LAS knows
+        unified_seg = mock.Mock()
+        unified_seg.segment.return_value = {
+            "prob": None, "label": None, "corrected": np.ones(self.shape, np.float32), "grid": grid,
+            "affine": np.eye(4), "world": np.eye(4), "native_mat": np.eye(4), "native_shape": self.shape,
+            "params": dict(TestTheTissueMeans.params)}
+        unified_seg.brain_mask.return_value = mask
+        unified_seg.working_grid_maps.return_value = (None, None, None)
+        apply_las = mock.Mock(return_value=nib.Nifti1Image(las, np.eye(4)))
+        cat_surf = mock.Mock()
+        cat_surf.vol_sanlm.side_effect = lambda data: data
+        with mock.patch.object(frontend, "_t1prep", return_value=(cat_surf, apply_las, unified_seg)):
+            out = frontend.segment(scan, template_dir="/t")
+        np.testing.assert_array_equal(out["fractions"][dark], [1, 0, 0])
+        self.assertEqual(float(out["label"][dark]), 1.0)
+        self.assertGreater(float(out["normalised"][dark]), 0)
+        # outside the brain there is nothing
+        self.assertEqual(float(np.abs(out["fractions"][0]).max()), 0.0)
+        self.assertEqual(float(out["normalised"][0].max()), 0.0)
+        np.testing.assert_allclose(out["fractions"][mask].sum(-1), 1.0, atol=1e-6)
+
     def test_a_t1prep_without_the_deformation_is_named(self):
         scan = nib.Nifti1Image(np.ones(self.shape, np.float32), np.eye(4))
 

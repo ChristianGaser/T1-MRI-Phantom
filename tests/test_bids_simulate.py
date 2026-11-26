@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import nibabel as nib
 import numpy as np
@@ -14,7 +15,13 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from t1sim import bids, frontend, simulate  # noqa: E402
+from t1sim import artefacts, bids, frontend, simulate  # noqa: E402
+
+try:
+    import torch  # noqa: F401
+    HAVE_TORCH = True
+except ImportError:
+    HAVE_TORCH = False
 
 
 class TestNames(unittest.TestCase):
@@ -39,9 +46,21 @@ class TestNames(unittest.TestCase):
 
     def test_other_scans_get_a_derivatives_folder_next_to_theirs(self):
         folder, pipeline, source = bids.output_folder("/data/scans/colin.nii")
-        self.assertEqual(folder, Path("/data/derivatives") / f"t1sim-{bids.GENERATED_BY['Version']}")
-        self.assertEqual((pipeline, source), (folder, ""))
+        self.assertEqual(pipeline, Path("/data/derivatives") / f"t1sim-{bids.GENERATED_BY['Version']}")
+        self.assertEqual((folder, source), (pipeline / "scans", ""))
         self.assertEqual(bids.output_folder("/data/scans/colin.nii", derivatives=False)[0], Path("/data/scans"))
+
+    def test_scans_of_one_name_in_two_folders_do_not_share_their_outputs(self):
+        first = bids.output_folder("/data/subj01/T1.nii")[0]
+        second = bids.output_folder("/data/subj02/T1.nii")[0]
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.parent, second.parent)
+
+    def test_the_thickness_in_a_name(self):
+        self.assertEqual(bids.thickness_tag(2.5), "Thickness25mm")
+        self.assertEqual(bids.thickness_tag(np.array([0.8])), "Thickness08mm")
+        self.assertEqual(bids.thickness_tag(1.25), "Thickness13mm")       # rounded as MATLAB rounds
+        self.assertEqual(bids.thickness_tag([2.5, 1.5, 2.0]), "Thickness15to25mm")
 
 
 class TestFiles(unittest.TestCase):
@@ -82,7 +101,9 @@ def _seg(shape=(40, 44, 36)):
     means = {"CSF": 100.0, "GM": 300.0, "WM": 400.0}
     corrected = np.where(r < 17, 250.0, 5.0).astype(np.float32)          # a "scalp" around the brain
     grid = np.stack(np.meshgrid(*[np.arange(n, dtype=np.float32) for n in shape], indexing="ij"), -1)
-    return {"label": label, "normalised": label.copy(), "fractions": frontend.fractions_from_label(label),
+    fractions = frontend.fractions_from_label(label)
+    # as in the front end, the label map is that of the fractions: at the rim of the brain a voxel is CSF or nothing
+    return {"label": frontend.label_from_fractions(fractions), "normalised": label.copy(), "fractions": fractions,
             "corrected": corrected, "mask": label > 0, "means": means,
             "grid": nib.Nifti1Image(np.zeros(shape, np.uint8), np.diag([0.5, 0.5, 0.5, 1.0])),
             "iy": grid, "template_mat": np.diag([0.5, 0.5, 0.5, 1.0])}
@@ -99,7 +120,7 @@ class TestThePipeline(unittest.TestCase):
         pure_wm = truth["label"] == 3
         np.testing.assert_allclose(truth["ideal"][pure_wm], 400.0, rtol=1e-5)
         np.testing.assert_allclose(truth["ideal"][truth["label"] == 0], self.seg["corrected"][truth["label"] == 0])
-        self.assertIs(truth["truth_fractions"], truth["fractions"])       # nothing cleaned
+        self.assertIs(truth["image_fractions"], truth["fractions"])       # nothing cleaned
 
     def test_an_acquisition_has_the_noise_and_the_names_asked_for(self):
         acq = simulate.acquire(self.truth, snr=20, bias_percent=0)
@@ -120,26 +141,70 @@ class TestThePipeline(unittest.TestCase):
         fixed = simulate.acquire(other, snr=20, bias_percent=0, seed=5)
         np.testing.assert_array_equal(fixed["image"], simulate.acquire(self.truth, snr=20, bias_percent=0, seed=5)["image"])
         self.assertTrue(fixed["tags"].endswith("Seed5"))
+        # a seed of 0 is a seed that was given: its file is not that of the default
+        self.assertEqual(simulate.acquire(self.truth, snr=20, bias_percent=0, seed=0)["tags"], "snr20Seed0")
+
+    def test_scans_of_one_name_in_two_folders_get_noise_and_a_field_of_their_own(self):
+        first = simulate.ground_truth("/data/subj01/T1.nii", seg=self.seg, clean=False)
+        second = simulate.ground_truth("/data/subj02/T1.nii", seg=self.seg, clean=False)
+        a = simulate.acquire(first, snr=20, bias_type=(2, None))
+        b = simulate.acquire(second, snr=20, bias_type=(2, None))
+        self.assertNotEqual(a["parameters"]["Seed"], b["parameters"]["Seed"])
+        self.assertNotEqual(a["parameters"]["BiasFieldSeed"], b["parameters"]["BiasFieldSeed"])
+        self.assertFalse(np.array_equal(a["bias"], b["bias"]))
+
+    def test_the_ground_truth_is_not_changed_by_an_acquisition(self):
+        before = {key: self.truth[key].copy() for key in ("fractions", "label", "ideal", "corrected")}
+        simulate.acquire(self.truth, snr=20, contrast=0.5, resolution=1.0)
+        for key, value in before.items():
+            np.testing.assert_array_equal(self.truth[key], value)
 
     def test_the_tags_of_the_acquisition(self):
-        acq = simulate.acquire(self.truth, snr=30, bias_percent=-20, bias_type=(3, 1), contrast=0.5)
+        acq = simulate.acquire(self.truth, snr=30, bias_percent=-20, bias_type=(3, 0), contrast=0.5)
         self.assertEqual(acq["tags"], "snr30RfNeg20T3ConLow")
         self.assertEqual(acq["parameters"]["BiasFieldType"], "T3")
+        # another seed of the field is another file
+        other = simulate.acquire(self.truth, snr=30, bias_percent=-20, bias_type=(3, 7), contrast=0.5)
+        self.assertEqual(other["tags"], "snr30RfNeg20T3S7ConLow")
+        self.assertEqual((other["parameters"]["BiasFieldType"], other["parameters"]["BiasFieldSeed"]), ("T3", 7))
         acq = simulate.acquire(self.truth, snr=0, noise_percent=3, bias_percent=0, contrast=1.3)
         self.assertEqual(acq["tags"], "pn3Con1p3")
+        with self.assertRaisesRegex(ValueError, "positive"):
+            simulate.acquire(self.truth, contrast=0)
 
     def test_the_snr_refers_to_white_matter_after_a_contrast_change(self):
         acq = simulate.acquire(self.truth, snr=25, bias_percent=0, contrast=0.5)
         clean = simulate.acquire(self.truth, snr=0, bias_percent=0, contrast=0.5)
         wm = float(np.median(clean["image"][self.truth["label"] == 3]))
+        self.assertAlmostEqual(wm, 400.0, delta=0.01)                   # white matter keeps its intensity
         self.assertAlmostEqual(acq["parameters"]["NoiseSD"], wm / 25, delta=0.02)
+
+    def test_a_contrast_change_keeps_a_mixed_voxel_the_mixture_of_its_tissues(self):
+        truth = self.truth
+        brain = truth["fractions"].sum(-1) > 0.999
+        for exponent in (0.5, 1.5):
+            with self.subTest(exponent=exponent):
+                image = simulate.acquire(truth, snr=0, bias_percent=0, contrast=exponent)
+                means = [artefacts.change_contrast(truth["means"][t], exponent, 400.0) for t in frontend.TISSUES]
+                np.testing.assert_allclose(image["image"][brain], (truth["fractions"] @ np.float32(means))[brain],
+                                           rtol=1e-4)
+                self.assertEqual(image["parameters"]["TissueIntensities"]["GM"], round(means[1], 3))
+                # outside the brain the scan is mapped: 250 of the "scalp"
+                scalp = (truth["label"] == 0) & (truth["corrected"] == 250.0)
+                np.testing.assert_allclose(image["image"][scalp],
+                                           artefacts.change_contrast(250.0, exponent, 400.0), rtol=1e-4)
+
+    def test_a_contrast_change_leaves_the_bias_field_what_was_asked_for(self):
+        plain = simulate.acquire(self.truth, snr=0, bias_percent=0, contrast=0.5)["image"]
+        biased = simulate.acquire(self.truth, snr=0, bias_percent=30, contrast=0.5)
+        np.testing.assert_allclose(biased["image"], plain * biased["bias"], rtol=1e-4, atol=1e-3)
 
     def test_another_voxel_size_averages_the_ground_truth(self):
         acq = simulate.acquire(self.truth, snr=0, bias_percent=0, resolution=1.0)
         self.assertEqual(acq["image"].shape, (20, 22, 18))
         self.assertEqual(acq["label"].shape, (20, 22, 18))
         np.testing.assert_allclose(np.sqrt((acq["affine"][:3, :3] ** 2).sum(0)), 1.0)
-        fine = self.truth["truth_fractions"].sum((0, 1, 2), dtype=np.float64) * 0.125
+        fine = self.truth["fractions"].sum((0, 1, 2), dtype=np.float64) * 0.125
         np.testing.assert_allclose(acq["fractions"].sum((0, 1, 2), dtype=np.float64), fine, rtol=1e-4)
 
     def test_back_on_the_grid_the_ground_truth_keeps_its_voxels(self):
@@ -171,6 +236,43 @@ class TestThePipeline(unittest.TestCase):
             self.assertEqual(image[0], truth[0])
             self.assertTrue(image[1].endswith(truth[1] or ""))
 
+    def test_a_ground_truth_of_other_settings_is_not_replaced(self):
+        acquired = simulate.acquire(self.truth, snr=40)
+        with tempfile.TemporaryDirectory() as folder:
+            simulate.write(self.truth, acquired, out_dir=folder)
+            simulate.write(self.truth, simulate.acquire(self.truth, snr=20), out_dir=folder)   # the same one
+            # the same names, but made with a thickness: the images in the folder would lose their ground truth
+            other = dict(self.truth, settings={**self.truth["settings"], "Thickness": [2.5]})
+            with self.assertRaisesRegex(FileExistsError, "Thickness"):
+                simulate.write(other, acquired, out_dir=folder)
+            # and so they would with a ground truth on another grid
+            coarse = simulate.acquire(self.truth, snr=40, resolution=1.0)
+            coarse["affine"] = acquired["affine"]                   # as if the name were the same
+            with self.assertRaisesRegex(FileExistsError, "Shape"):
+                simulate.write(self.truth, coarse, out_dir=folder)
+            # a ground truth that was written without the record of its settings is checked by its grid
+            dseg = next(Path(folder).glob("*_dseg.json"))
+            dseg.write_text("{}")
+            simulate.write(other, acquired, out_dir=folder)
+            dseg.write_text("{}")
+            with self.assertRaisesRegex(FileExistsError, "another grid"):
+                simulate.write(self.truth, coarse, out_dir=folder)
+
+    def test_the_bias_field_is_written_under_the_name_of_its_image(self):
+        with tempfile.TemporaryDirectory() as folder:
+            files = simulate.write(self.truth, simulate.acquire(self.truth, snr=40), out_dir=folder, save_bias=True)
+            self.assertEqual(files["bias"].name,
+                             "sub-07_space-MNI152NLin2009cAsym_res-0p5mm_desc-snr40Rf30T2Biasfield_T1w.nii.gz")
+
+    def test_the_bias_type_of_the_command_line(self):
+        self.assertEqual(simulate._bias_type_argument(["2", "0"]), (2.0, 0))
+        self.assertEqual(simulate._bias_type_argument(["3"]), (3.0, 0))
+        self.assertEqual(simulate._bias_type_argument(["2", "scan"]), (2.0, None))
+        self.assertEqual(simulate._bias_type_argument(["A"]), "A")
+        self.assertEqual(simulate._bias_type_argument(["/fields/rf.nii"]), "/fields/rf.nii")
+        with self.assertRaises(SystemExit):
+            simulate._bias_type_argument(["A", "0"])
+
     def test_the_deepmriprep_grid_is_cut_from_the_working_grid_only(self):
         with self.assertRaisesRegex(ValueError, "339 x 411 x 339"):
             simulate.acquire(self.truth, grid="deepmriprep")
@@ -190,6 +292,161 @@ class TestThePipeline(unittest.TestCase):
         self.assertEqual(shape, (336, 384, 336))
         moved = simulate._crop_affine(np.diag([0.5, 0.5, 0.5, 1.0]), simulate.DEEPMRIPREP_CROP)
         np.testing.assert_allclose(moved[:3, 3], [0.5, 7.5, 0.0])
+
+
+class TestTheCleanedGroundTruth(unittest.TestCase):
+    """The pipeline with a cleanup: what is detected is given, how it is used is tested."""
+
+    def setUp(self):
+        self.seg = _seg()
+        label = self.seg["label"]
+        cortex = np.argwhere(label == 2)
+        self.vessel = np.zeros(label.shape, bool)
+        self.vessel[tuple(cortex[len(cortex) // 2])] = True
+        self.rim = np.zeros(label.shape, bool)
+        self.rim[tuple(cortex[len(cortex) // 3])] = True
+        masks = {"vessels": self.vessel, "dura": np.zeros(label.shape, bool), "pve": self.rim}
+        for target, value in (("atlas.to_grid", np.full(label.shape, 100, np.uint8)),      # one cortical parcel
+                              ("cleanup.detect", masks)):
+            patcher = mock.patch(f"t1sim.simulate.{target}", return_value=value if target == "atlas.to_grid" else None,
+                                 side_effect=None if target == "atlas.to_grid" else self.detect)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.masks = masks
+
+    def detect(self, *args, **kwargs):
+        return {name: mask.copy() for name, mask in self.masks.items()}
+
+    def test_the_image_shows_what_the_ground_truth_rejects(self):
+        truth = simulate.ground_truth("/data/sub-07/anat/sub-07_T1w.nii.gz", seg=self.seg)
+        self.assertIsNot(truth["fractions"], truth["image_fractions"])
+        # the vessel is CSF in the ground truth and has the intensity of GM in the image
+        np.testing.assert_array_equal(truth["fractions"][self.vessel], [[1, 0, 0]])
+        self.assertEqual(float(truth["label"][self.vessel][0]), 1.0)
+        self.assertAlmostEqual(float(truth["ideal"][self.vessel][0]), 300.0, places=3)
+        # the rim is CSF and WM with the intensity of the image: (400 - 300) / (400 - 100) of CSF
+        np.testing.assert_allclose(truth["fractions"][self.rim], [[1 / 3, 0, 2 / 3]], atol=1e-6)
+        self.assertAlmostEqual(float(truth["label"][self.rim][0]), 3 - 2 / 3, places=5)
+        np.testing.assert_allclose(truth["label"], frontend.label_from_fractions(truth["fractions"]), atol=1e-6)
+        self.assertEqual(truth["parameters"]["LabelCleanup"]["VolumeMl"]["vessels"], round(0.125 / 1000, 2))
+        self.assertTrue(truth["cleaned"])
+
+    def test_the_files_pair_as_deepmriprep_train_pairs_them(self):
+        truth = simulate.ground_truth("/data/sub-07/anat/sub-07_T1w.nii.gz", seg=self.seg)
+        with tempfile.TemporaryDirectory() as folder:
+            files = simulate.write(truth, simulate.acquire(truth, snr=40), out_dir=folder)
+            self.assertEqual(files["dseg"].name, "sub-07_space-MNI152NLin2009cAsym_res-0p5mm_desc-Clean_dseg.nii.gz")
+            # pair_simulations: the desc of the label without "Clean" ends the desc of the image
+            image_desc = re.search(r"_desc-([A-Za-z0-9]+)_T1w", files["T1w"].name).group(1)
+            label_desc = re.search(r"_desc-([A-Za-z0-9]+)_dseg", files["dseg"].name).group(1)
+            self.assertTrue(label_desc.endswith("Clean"))
+            self.assertTrue(image_desc.endswith(label_desc[:-5]))
+            self.assertEqual(files["T1w"].name.split("_desc-")[0], files["dseg"].name.split("_desc-")[0])
+            np.testing.assert_allclose(nib.load(files["probseg"]["GM"]).get_fdata(), truth["fractions"][..., 1],
+                                       atol=0.5 / 255 + 1e-6)
+            sidecar = json.loads(Path(str(files["dseg"]).replace(".nii.gz", ".json")).read_text())
+            self.assertEqual(sidecar["GroundTruthSettings"]["Cleanup"], {"vessels": 0.5, "dura": 4.0, "pve": True})
+            self.assertEqual(sidecar["GroundTruthSettings"]["Grid"], "working")
+
+    def test_a_rebuilt_cortex_is_not_cleaned(self):
+        # everything the detection would take lies in the cortex a thickness rebuilds
+        self.masks["dura"] = self.seg["label"] == 2
+        truth = simulate.ground_truth("x", seg=self.seg, thickness=2.5)
+        # 2.5 mm are 5 voxels of cortex along a ray, in the ground truth as in the image
+        centre = tuple(n // 2 for n in truth["label"].shape)
+        for name in ("fractions", "image_fractions"):
+            along = truth[name][centre[0]:, centre[1], centre[2], 1]
+            self.assertAlmostEqual(float(along.sum()) * 0.5, 2.5, delta=0.3, msg=name)
+        self.assertEqual(truth["tags"], "Thickness25mm")
+        self.assertEqual(truth["parameters"]["LabelCleanup"]["VolumeMl"]["dura"], 0.0)
+
+    def test_a_structure_that_a_thickness_keeps_is_still_cleaned(self):
+        # one half of the brain is no cortex: it keeps its labels, and with them what the cleanup finds there
+        shape = self.seg["label"].shape
+        half = np.arange(shape[0])[:, None, None] * np.ones(shape) > shape[0] / 2 + 3
+        regions = np.where(half, 36, 100).astype(np.uint8)
+        self.masks["dura"] = self.seg["label"] == 2
+        with mock.patch("t1sim.simulate.atlas.to_grid", return_value=regions):
+            truth = simulate.ground_truth("x", seg=self.seg, thickness=2.5)
+        centre = tuple(n // 2 for n in shape)
+        kept = (slice(centre[0] + 6, None), centre[1], centre[2], 1)
+        rebuilt = truth["fractions"][:centre[0], centre[1], centre[2], 1]
+        # the image keeps the 1.5 mm of cortex there; in the ground truth all of it that was pure became CSF
+        self.assertAlmostEqual(float(truth["image_fractions"][kept].sum()) * 0.5, 1.5, delta=0.2)
+        self.assertLess(float(truth["fractions"][kept].sum()) * 0.5, 0.7)
+        self.assertAlmostEqual(float(rebuilt.sum()) * 0.5, 2.5, delta=0.3)
+
+
+@unittest.skipUnless(HAVE_TORCH, "torch is needed for the deformations")
+class TestAtrophyInThePipeline(unittest.TestCase):
+    """Two neighbouring regions of an atlas that is given as a file."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.seg = _seg()
+        shape = cls.seg["label"].shape
+        x = np.arange(shape[0])[:, None, None] * np.ones(shape)
+        regions = np.where(cls.seg["label"] > 0, np.where(x < shape[0] / 2, 1, 2), 0).astype(np.uint8)
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.atlas = str(Path(cls._tmp.name) / "halves.nii.gz")
+        nib.save(nib.Nifti1Image(regions, cls.seg["template_mat"]), cls.atlas)
+        cls.regions = regions
+        cls.both = simulate.ground_truth("/data/sub-07/anat/sub-07_T1w.nii.gz", seg=cls.seg, clean=False,
+                                         atrophy={"atlas": cls.atlas, "regions": [1, 2], "change": -0.1})
+        cls.one = simulate.ground_truth("/data/sub-07/anat/sub-07_T1w.nii.gz", seg=cls.seg, clean=False,
+                                        atrophy={"atlas": cls.atlas, "regions": [1], "change": -0.1})
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_every_region_reaches_what_was_asked_for(self):
+        done = self.both["parameters"]["Atrophy"]
+        self.assertEqual([step["Region"] for step in done], [1, 2])
+        for step in done:
+            self.assertAlmostEqual(step["Achieved"], -0.1, delta=0.005)
+            self.assertLess(step["ChangeInRegion"], -0.05)
+            self.assertLess(step["TissueChangeMl"]["GM"], 0)
+            self.assertGreater(step["TissueChangeMl"]["CSF"], 0)
+
+    def test_the_sidecar_holds_the_change_of_the_fractions_that_are_written(self):
+        before = self.seg["fractions"].sum((0, 1, 2), dtype=np.float64) * 0.125 / 1000
+        after = self.both["fractions"].sum((0, 1, 2), dtype=np.float64) * 0.125 / 1000
+        steps = self.both["parameters"]["Atrophy"]
+        for index, tissue in enumerate(frontend.TISSUES):
+            total = sum(step["TissueChangeMl"][tissue] for step in steps)
+            self.assertAlmostEqual(total, after[index] - before[index], delta=0.002)
+
+    def test_the_names(self):
+        self.assertEqual(self.one["tags"], "halvesRoi1Thin10")
+        self.assertEqual(self.both["tags"], "halvesMulti")
+        thicker = simulate.ground_truth("x", seg=self.seg, clean=False,
+                                        atrophy={"atlas": self.atlas, "regions": [1], "change": 0.1})
+        self.assertEqual(thicker["tags"], "halvesRoi1ThinPlus10")       # not the name of a loss of 10%
+
+    def test_the_jacobian_of_two_regions_is_chained(self):
+        jacobian = self.both["jacobian"]
+        self.assertEqual(jacobian.shape, self.seg["label"].shape)
+        first = self.one["jacobian"]
+        # far from the second region the first deformation is all there is
+        far = np.zeros(jacobian.shape, bool)
+        far[:6] = True
+        np.testing.assert_allclose(jacobian[far], first[far], atol=0.02)
+        # the grey matter that was there, times the Jacobian, is the grey matter that is left
+        gm = self.seg["fractions"][..., 1].astype(np.float64)
+        left = float(self.both["fractions"][..., 1].sum(dtype=np.float64))
+        self.assertAlmostEqual(float((gm * jacobian).sum()) / left, 1.0, delta=0.03)
+
+    def test_the_jacobian_is_written_with_the_space_it_lies_in(self):
+        acquired = simulate.acquire(self.one, snr=40)
+        with tempfile.TemporaryDirectory() as folder:
+            files = simulate.write(self.one, acquired, out_dir=folder)
+            self.assertTrue(files["jacobian"].name.endswith("_desc-halvesRoi1Thin10_jacobian.nii.gz"))
+            np.testing.assert_allclose(nib.load(files["jacobian"]).get_fdata(), self.one["jacobian"], atol=1e-6)
+            sidecar = json.loads(Path(str(files["jacobian"]).replace(".nii.gz", ".json")).read_text())
+            self.assertIn("BEFORE the atrophy", sidecar["Description"])
+            self.assertEqual(sidecar["SimulationParameters"]["Atrophy"][0]["Region"], 1)
+            self.assertNotIn("jacobian", simulate.write(self.one, acquired, out_dir=folder, save_jacobian=False))
 
 
 if __name__ == "__main__":

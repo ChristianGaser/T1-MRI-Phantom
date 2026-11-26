@@ -101,6 +101,49 @@ class TestAtrophyByDeformation(unittest.TestCase):
         np.testing.assert_allclose(anatomy.warp(self.image, res["displacement"]), res["corrected"], atol=1e-3)
         np.testing.assert_allclose(res["label"], frontend.label_from_fractions(res["fractions"]), atol=1e-5)
 
+    def test_forward_is_the_way_back_of_the_displacement(self):
+        # a voxel that goes to x + u(x) comes from x again: b(x + u(x)) = -u(x)
+        for mode, res in self.results.items():
+            with self.subTest(mode=mode):
+                self.assertEqual(res["forward"].shape, res["displacement"].shape)
+                back = anatomy.warp(np.moveaxis(res["displacement"], 0, -1), res["forward"])
+                self.assertLess(float(np.abs(np.moveaxis(back, -1, 0) + res["forward"]).max()), 0.03)
+                self.assertGreater(float(np.abs(res["forward"]).max()), 0.2)
+
+    def test_two_deformations_are_chained_and_not_multiplied(self):
+        y = np.swapaxes(self.x, 0, 1)
+        first = self.results["thinning"]
+        second = anatomy.atrophy(first["fractions"], first["corrected"], AFFINE, (y > 0) & (self.r < CSF_R), -0.10)
+        jacobian, forward = anatomy.compose(first["jacobian"], first["forward"], second)
+        exact = anatomy._jacobian(forward)                      # of the map of both, by its differences
+        both = (np.abs(first["jacobian"] - 1) > 0.02) & (np.abs(second["jacobian"] - 1) > 0.02)
+        self.assertGreater(int(both.sum()), 1000)
+        chained = np.abs(jacobian - exact)[both]
+        product = np.abs(first["jacobian"] * second["jacobian"] - exact)[both]
+        self.assertLess(float(np.percentile(chained, 95)), 0.006)
+        self.assertGreater(float(np.percentile(product, 95)), 3 * float(np.percentile(chained, 95)))
+        # where only one of the two acts, the other changes nothing
+        only_first = (np.abs(second["jacobian"] - 1) < 1e-4) & (np.abs(first["forward"]).max(0) < 1e-3)
+        np.testing.assert_allclose(jacobian[only_first], first["jacobian"][only_first], atol=1e-4)
+
+    def test_an_atlas_follows_the_deformation_without_new_numbers(self):
+        regions = np.where(self.r < GM_R, 7, np.where(self.r < CSF_R, 3, 0)).astype(np.uint8)
+        moved = anatomy.warp(regions, self.results["thinning"]["displacement"], nearest=True)
+        self.assertEqual(moved.dtype, np.uint8)
+        self.assertEqual(set(np.unique(moved).tolist()), {0, 3, 7})
+        # every voxel takes the number of the voxel 1.4 further along x: the nearest is the next one
+        shift = np.zeros((3,) + regions.shape, np.float32)
+        shift[0] = 1.4
+        np.testing.assert_array_equal(anatomy.warp(regions, shift, nearest=True)[2:-3], regions[3:-2])
+        mixed = anatomy.warp(regions, shift)
+        self.assertGreater(len(np.unique(mixed)), 3)            # what linear interpolation would do to an atlas
+
+    def test_a_region_too_small_to_move_anything_is_refused(self):
+        tiny = np.zeros_like(self.roi)
+        tiny[N // 2 + 13, N // 2, N // 2] = True
+        with self.assertRaisesRegex(ValueError, "too small"):
+            anatomy.atrophy(self.fractions, self.image, AFFINE, tiny, -0.01, mode="volume")
+
     def test_a_positive_change_thickens(self):
         res = anatomy.atrophy(self.fractions, self.image, AFFINE, self.roi, 0.10, mode="thinning")
         self.assertGreater(_gm_along(res["fractions"], +1), _gm_along(self.fractions, +1) * 1.05)

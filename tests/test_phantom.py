@@ -265,6 +265,14 @@ class TestTheFiles(unittest.TestCase):
         with open(self.base + suffix + ".json", encoding="utf-8") as handle:
             return json.load(handle)
 
+    def test_two_values_with_one_name_are_not_written_over_each_other(self):
+        with self.assertRaisesRegex(ValueError, "same file name"):
+            phantom.thickness_phantom([1.25, 1.3], dim=40, radius=5, amplitude=1, wavelength=6, csf=1,
+                                      outdir=self.outdir)
+        # without files there is nothing to collide
+        labels, _, _ = phantom.thickness_phantom([1.25, 1.3], dim=40, radius=5, amplitude=1, wavelength=6, csf=1)
+        self.assertEqual(len(labels), 2)
+
     def test_the_names_follow_mri_simulate(self):
         self.assertEqual(self.info["files"], {"label": self.base + "_dseg.nii.gz",
                                               "t1w": self.base + "_T1w.nii.gz"})

@@ -1,9 +1,11 @@
 """Synthesis (:mod:`t1sim.synthesis`) and the artefacts of the image domain (:mod:`t1sim.artefacts`)."""
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
+import nibabel as nib
 import numpy as np
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
@@ -35,6 +37,10 @@ class TestSynthesis(unittest.TestCase):
 
     def test_a_voxel_without_data_is_nearly_zero(self):
         np.testing.assert_allclose(self.render([[0, 1, 0], [0, 0, 0]], [0.0, np.nan]), [1e-3, 1e-3])
+
+    def test_a_negative_intensity_of_the_scan_becomes_zero(self):
+        # the resampling of the scan leaves them in the background; a magnitude image has none
+        np.testing.assert_allclose(self.render([[0, 0, 0], [0.5, 0, 0]], [-80.0, -80.0]), [0.0, 50.0])
 
     def test_the_brightest_voxels_are_limited(self):
         fractions = np.zeros((100, 1, 1, 3), np.float32)
@@ -78,15 +84,65 @@ class TestTheSimulatedBiasField(unittest.TestCase):
             artefacts.simulated_bias_field((24, 24, 24), 2.0, strength=0)
 
 
+class TestThePredefinedBiasField(unittest.TestCase):
+    """A stored field in template space, with the defects of the fields that come with t1sim."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        shape = (12, 14, 10)
+        x = np.arange(shape[0], dtype=np.float32)[:, None, None]
+        self.stored = np.broadcast_to(5 + 0.05 * x, shape).copy()
+        self.stored[:, :, 0] *= 0.5                 # an edge that was interpolated against zeros
+        self.path = Path(self._tmp.name) / "rf100_X.nii"
+        nib.save(nib.Nifti1Image(self.stored, np.eye(4)), self.path)
+        self.iy = np.stack(np.meshgrid(*[np.arange(n, dtype=np.float32) for n in shape], indexing="ij"), -1)
+
+    def test_the_halved_edge_is_repaired(self):
+        field = artefacts.template_bias_field("X", self.iy, np.eye(4), 30.0, folder=self._tmp.name)
+        np.testing.assert_allclose(field[:, :, 0], field[:, :, 1], rtol=1e-6)
+        self.assertAlmostEqual(float(field.mean()), 1.0, places=5)
+        # 30% of a field that spans 0.55
+        self.assertAlmostEqual(float(field.max() - field.min()), 0.3 * 0.55, places=4)
+        np.testing.assert_array_equal(artefacts._repair_edges(self.stored)[:, :, 1:], self.stored[:, :, 1:])
+
+    def test_where_the_deformation_is_undefined_the_field_goes_on(self):
+        iy = self.iy.copy()
+        iy[:2] = np.nan
+        field = artefacts.template_bias_field(self.path, iy, np.eye(4), 30.0)
+        self.assertTrue(np.isfinite(field).all())
+        np.testing.assert_allclose(field[0], field[2], rtol=1e-6)       # the nearest value, not a step to 1
+        np.testing.assert_allclose(field[1], field[2], rtol=1e-6)
+
+    def test_a_negative_amplitude_inverts_it_and_a_missing_field_is_named(self):
+        up = artefacts.template_bias_field(self.path, self.iy, np.eye(4), 30.0)
+        down = artefacts.template_bias_field(self.path, self.iy, np.eye(4), -30.0)
+        np.testing.assert_allclose(up + down, 2.0, atol=1e-5)
+        with self.assertRaisesRegex(FileNotFoundError, "rf100_Q"):
+            artefacts.template_bias_field("Q", self.iy, np.eye(4), 30.0, folder=self._tmp.name)
+
+
 class TestContrastAndNoise(unittest.TestCase):
-    def test_the_contrast_change_keeps_the_range_and_the_order(self):
-        image = np.linspace(10, 500, 50, dtype=np.float32).reshape(50, 1, 1)
-        low = artefacts.change_contrast(image, 0.5)
-        self.assertAlmostEqual(float(low.min()), 10, places=3)
-        self.assertAlmostEqual(float(low.max()), 500, places=3)
-        self.assertTrue(np.all(np.diff(low[:, 0, 0]) > 0))
-        self.assertGreater(float(low[25, 0, 0]), float(image[25, 0, 0]))     # 0.5 lifts the middle
-        np.testing.assert_array_equal(artefacts.change_contrast(image, 1), image)
+    def test_the_contrast_change_keeps_white_matter_and_raises_the_ratios(self):
+        means = np.array([150.0, 380.0, 500.0, 800.0], np.float32)          # CSF, GM, WM and fat
+        low = artefacts.change_contrast(means, 0.5, 500.0)
+        high = artefacts.change_contrast(means, 1.5, 500.0)
+        self.assertAlmostEqual(float(low[2]), 500.0, places=3)
+        self.assertAlmostEqual(float(high[2]), 500.0, places=3)
+        np.testing.assert_allclose(low / low[2], (means / 500) ** 0.5, rtol=1e-5)
+        np.testing.assert_allclose(high / high[2], (means / 500) ** 1.5, rtol=1e-5)
+        self.assertGreater(low[1] / low[2], means[1] / means[2])             # less contrast
+        self.assertLess(high[1] / high[2], means[1] / means[2])              # more
+        np.testing.assert_allclose(artefacts.change_contrast(means, 1, 500.0), means, rtol=1e-6)
+
+    def test_the_contrast_change_of_one_intensity_and_of_what_cannot_be_mapped(self):
+        self.assertAlmostEqual(artefacts.change_contrast(125.0, 0.5, 500.0), 250.0, places=4)
+        self.assertIsInstance(artefacts.change_contrast(125.0, 0.5, 500.0), float)
+        # below 0 counts as 0, where a power would not be a number
+        np.testing.assert_array_equal(artefacts.change_contrast(np.array([-5.0, 0.0]), 0.5, 500.0), [0, 0])
+        for exponent, white in ((0, 500.0), (-1, 500.0), (0.5, 0.0)):
+            with self.assertRaises(ValueError):
+                artefacts.change_contrast(np.ones(3), exponent, white)
 
     def test_rician_noise_has_the_standard_deviation_at_a_high_snr(self):
         image = np.full((40, 40, 40), 400.0, np.float32)
@@ -113,14 +169,6 @@ class TestContrastAndNoise(unittest.TestCase):
         self.assertAlmostEqual(float(np.mean(noisy > 400.0)), 0.5, delta=0.02)
         limited = artefacts.add_noise(image, 16.0, seed=3, ceiling=400.0)
         self.assertLess(float(limited.std()), 0.7 * 16.0)       # what a ceiling at the maximum does
-
-    def test_a_contrast_change_maps_a_reference_intensity_with_the_image(self):
-        image = np.linspace(0, 500, 51, dtype=np.float32).reshape(51, 1, 1)
-        out, white = artefacts.change_contrast(image, 0.5, reference=400.0)
-        self.assertAlmostEqual(white, float(out[40, 0, 0]), places=3)
-        self.assertGreater(white, 400.0)
-        same, white = artefacts.change_contrast(image, 1.0, reference=400.0)
-        self.assertEqual(white, 400.0)
 
     def test_the_seed_decides_and_no_noise_changes_nothing(self):
         image = np.full((8, 8, 8), 50.0, np.float32)
