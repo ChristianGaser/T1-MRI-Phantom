@@ -1,0 +1,37 @@
+[build-system]
+requires      = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "t1sim"
+dynamic = ["version"]
+description = "Simulated T1-weighted MR images with a known ground truth"
+authors = [
+    { name = "Christian Gaser" },
+]
+license = {file = "LICENSE"}
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "nibabel",
+    "requests",
+]
+
+[project.optional-dependencies]
+# The front end: unified segmentation, LAS and SANLM.  It needs a T1Prep that
+# has the public modules t1prep.unified_seg and t1prep.apply_LAS, i.e. one
+# newer than 0.9.1 or a source checkout.
+frontend = [
+    "cat-surf>=1.2.0",
+    "T1Prep>=0.9.2",
+]
+
+[project.scripts]
+t1sim-download-models = "t1sim.models:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "t1sim.__version__"}
