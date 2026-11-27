@@ -397,12 +397,12 @@ def figure_examples(d, path):
             ("Image after", "rendered from the deformed fractions", d["ex_atrophy"], gray),
             ("Ground truth after", "fraction of grey matter", gm_after,
              {"cmap": _tissue_cmap("GM"), "vmin": 0, "vmax": 1}),
-            ("Change of the ground truth", "grey matter after minus before; region outlined", gm_after - gm_before,
+            ("Change of the ground truth", "after minus before; region outlined", gm_after - gm_before,
              {"cmap": change, "vmin": -0.6, "vmax": 0.6})]),
     ]
 
     aspect = (box[1].stop - box[1].start) / (box[0].stop - box[0].start)
-    fw, fh = 15.6, 12.3
+    fw, fh = 15.6, 13.3
     fig = plt.figure(figsize=(fw, fh), facecolor=SURFACE)
 
     def frame(ax):
@@ -422,7 +422,7 @@ def figure_examples(d, path):
     for n, (title, sub, image) in enumerate((
             ("Synthesised image", "no artefact; the detail is outlined", d["sim_ideal"]),
             ("Bias field", "60%, inverted, strength 3", d["ex_bias"]))):
-        ax = fig.add_axes([0.012, 0.905 - tall - n * (tall + 0.075), wide, tall])
+        ax = fig.add_axes([0.012, 0.878 - tall - n * (tall + 0.075), wide, tall])
         _show(ax, image, box, **gray)
         if n == 0:
             ax.add_patch(Rectangle((zoom[0].start - box[0].start - 0.5, zoom[1].start - box[1].start - 0.5),
@@ -434,10 +434,10 @@ def figure_examples(d, path):
 
     size = 0.182
     height = size * fw / fh
-    x0, pitch_x, pitch_y = 0.238, size + 0.008, height + 0.098
+    x0, pitch_x, pitch_y = 0.238, size + 0.008, height + 0.094
     for r, (heading, panels) in enumerate(rows):
-        top = 0.905 - r * pitch_y
-        fig.text(x0, top + 0.046, heading, fontsize=11.5, color=INK, weight="bold", va="bottom")
+        top = 0.878 - r * pitch_y
+        fig.text(x0, top + 0.043, heading, fontsize=11.5, color=INK, weight="bold", va="bottom")
         for c, (title, sub, image, style) in enumerate(panels):
             ax = fig.add_axes([x0 + c * pitch_x, top - height, size, height])
             shown = _show(ax, image, zoom, **style)
@@ -454,8 +454,9 @@ def figure_examples(d, path):
                 bar.set_ticklabels([f"{t:g}" if style["vmin"] == 0 else f"{t:+g}" if t else "0" for t in ticks])
                 bar.ax.tick_params(labelsize=8.5, colors=INK_SOFT, length=2.5)
                 bar.outline.set_edgecolor("#c8c8c8")
-    fig.text(0.012, 0.03, f"The detail is {ZOOM_MM[2]:.0f} mm wide. All images share one grey scale, "
-             "from 0 to 1.25 times the intensity of white matter.", fontsize=10, color=INK_SOFT)
+    fig.text(0.012, 0.878 - 2 * tall - 0.105, f"The detail is {ZOOM_MM[2]:.0f} mm wide.\nAll images share one grey scale,\n"
+             "from 0 to 1.25 times the intensity\nof white matter.", fontsize=10, color=INK_SOFT, va="top",
+             linespacing=1.4)
     fig.suptitle("What t1sim.simulate.acquire() and a change of the anatomy do", fontsize=15,
                  color=INK, x=0.012, ha="left", y=0.985, weight="bold")
     fig.savefig(path, dpi=150, facecolor=SURFACE)
