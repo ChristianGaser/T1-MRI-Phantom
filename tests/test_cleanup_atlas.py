@@ -149,6 +149,7 @@ class TestBrightVessels(unittest.TestCase):
         # T1Prep's own detection finds nothing here: only the rule of the brightness is tested
         fake = mock.MagicMock()
         fake.vessel_weight.return_value = np.zeros(label.shape, np.float32)
+        self.t1prep_vessels = fake
         package = mock.MagicMock(vessels=fake)
         patcher = mock.patch.dict(sys.modules, {"t1prep": package, "t1prep.vessels": fake})
         patcher.start()
@@ -177,6 +178,21 @@ class TestBrightVessels(unittest.TestCase):
 
     def test_it_can_be_switched_off(self):
         self.assertEqual(int(self.detect(vessels=0).sum()), 0)
+
+    def test_the_priors_lie_in_template_space_and_the_lengths_in_that_of_the_grid(self):
+        fake = self.t1prep_vessels
+        for template_affine, priors in ((None, AFFINE), (np.diag([0.55, 0.55, 0.55, 1.0]), None)):
+            with self.subTest(template_affine=template_affine is not None):
+                fake.reset_mock()
+                self.detect(template_affine=template_affine)
+                expected = template_affine if priors is None else priors
+                for prior in (fake.blood_vessel_prior, fake.protected_regions):
+                    affine, shape = prior.call_args.args
+                    np.testing.assert_array_equal(affine, expected)
+                    self.assertEqual(tuple(shape), self.label.shape)
+                # the voxel size of the detection is that of the grid, not of the template
+                voxel = fake.vessel_weight.call_args.args[2]
+                np.testing.assert_allclose(voxel, np.sqrt((AFFINE[:3, :3] ** 2).sum(0)))
 
 
 class TestPeriventricular(unittest.TestCase):

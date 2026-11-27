@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import nibabel as nib
 import numpy as np
@@ -253,6 +254,12 @@ class TestTheAcquisition(unittest.TestCase):
             acq.acquire(np.zeros((4, 4, 4), np.float32))
 
 
+def rotation_about_x(angle):
+    """A rotation about the first axis, by *angle* radians."""
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[1.0, 0, 0], [0, c, -s], [0, s, c]])
+
+
 class TestTheObliqueAcquisition(unittest.TestCase):
     """A grid of other voxels, another orientation and a larger field of view than that of the image."""
 
@@ -298,28 +305,52 @@ class TestTheObliqueAcquisition(unittest.TestCase):
         # one volume without classes is averaged the same way
         np.testing.assert_allclose(self.oblique.average(self.fractions[..., 1]), averaged[..., 1], atol=1e-6)
 
+    @staticmethod
+    def integral(lattice, volume, slices):
+        """The mean over every new voxel, from the boxes of *slices* slices along every axis of it.
+
+        Slices much smaller than a fine voxel lie in one fine voxel nearly
+        all, and their boxes then give the value there: the result converges
+        to the integral, here to 0.0003 with 6 slices for voxels near cubes.
+        """
+        def many(linear):
+            lengths = np.sqrt((linear ** 2).sum(0))
+            return slices * np.maximum(1, np.round(lengths / lengths.min())).astype(int)
+
+        with mock.patch.object(artefacts, "_box_counts", many):
+            return lattice.average(volume)
+
     def test_the_average_is_the_mean_over_the_voxel_and_not_its_centre(self):
         from scipy import ndimage
 
-        def counted(points, linear=None, offset=None, shape=None):       # the fine voxel at points inside every voxel
-            linear = self.oblique.linear if linear is None else linear
-            offset = self.oblique.offset if offset is None else offset
-            shape = self.shape if shape is None else shape
-            total = np.zeros(shape)
-            steps = (np.arange(points) + 0.5) / points - 0.5
-            for a in steps:
-                for b in steps:
-                    for c in steps:
-                        total += ndimage.affine_transform(self.fractions[..., 1], linear, order=0, output_shape=shape,
-                                                          offset=offset + linear @ np.array([a, b, c]))
-            return total / points ** 3
-
-        exact = counted(16)                       # turned by 6 to 11 degrees the count converges quickly
-        averaged = self.oblique.average(self.fractions[..., 1])
+        gm = self.fractions[..., 1]
+        exact = self.integral(self.oblique, gm, 6)
+        averaged = self.oblique.average(gm)
         boundary = (exact > 0.02) & (exact < 0.98)
-        self.assertLess(float(np.abs(averaged - exact).max()), 0.03)
-        self.assertLess(float(np.sqrt(np.mean((averaged - exact)[boundary] ** 2))), 0.005)
-        self.assertGreater(float(np.abs(counted(1) - exact).max()), 0.3)
+        self.assertLess(float(np.abs(averaged - exact).max()), 0.008)                # 0.0055
+        self.assertLess(float(np.sqrt(np.mean((averaged - exact)[boundary] ** 2))), 0.002)   # 0.0014
+        # the fine voxel at the centre of every new voxel is far from it
+        centre = ndimage.affine_transform(gm, self.oblique.linear, offset=self.oblique.offset, order=0,
+                                          output_shape=self.shape)
+        self.assertGreater(float(np.abs(centre - exact).max()), 0.3)
+
+    def test_a_turned_voxel_four_times_as_long_as_wide_is_cut_into_more_slices_along_its_length(self):
+        a, b = 0.4, 0.25
+        turn = (np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])
+                @ np.array([[np.cos(b), 0, np.sin(b)], [0, 1, 0], [-np.sin(b), 0, np.cos(b)]]))
+        shape = (60, 60, 15)
+        target = np.eye(4)
+        target[:3, :3] = turn @ np.diag([0.5, 0.5, 2.0])
+        target[:3, 3] = -target[:3, :3] @ ((np.array(shape) - 1) / 2) + [0.3, -0.2, 0.1]
+        lattice = artefacts.ObliqueAcquisition(self.image.shape, self.affine, shape, target)
+        np.testing.assert_array_equal(artefacts._box_counts(lattice.linear), [3, 3, 12])
+        gm = self.fractions[..., 1]
+        exact = self.integral(lattice, gm, 4)
+        averaged = lattice.average(gm)
+        boundary = (exact > 0.02) & (exact < 0.98)
+        # 3 slices along every axis were 0.034 and 0.007 off
+        self.assertLess(float(np.abs(averaged - exact).max()), 0.003)                # 0.0010
+        self.assertLess(float(np.sqrt(np.mean((averaged - exact)[boundary] ** 2))), 0.001)   # 0.0003
 
     def test_the_average_is_exact_on_any_grid_along_the_axes(self):
         # 0.8 x 1 x 1.3 mm: no whole number of fine voxels, where counting at points is furthest off
@@ -348,6 +379,35 @@ class TestTheObliqueAcquisition(unittest.TestCase):
         self.assertEqual(float(cut[0, 0, 0]), 0.0)
         self.assertGreaterEqual(float(continued.min()), 0.8 - 1e-6)
         np.testing.assert_allclose(cut[coverage == 1], continued[coverage == 1], atol=1e-6)
+
+    def test_the_coverage_falls_only_where_something_lies_beyond(self):
+        # a new grid that ends inside the fine one at the lower faces and beyond it at the upper ones
+        target = np.diag([1.0, 1.0, 1.0, 1.0])
+        target[:3, 3] = self.affine[:3, 3] + 4.0                    # starts 8 fine voxels in
+        lattice = artefacts.ObliqueAcquisition(self.image.shape, self.affine, (40, 40, 40), target)
+        coverage = lattice.coverage(ramp=6.0)
+        # 8 fine voxels from the lower faces: no ramp there, nothing lies below them
+        self.assertEqual(float(coverage[0, 20, 20]), 1.0)
+        # the upper faces: new voxels lie beyond them
+        self.assertEqual(float(coverage[-1, 20, 20]), 0.0)
+        position = 8 + 2 * np.arange(40)                             # fine coordinate of the new voxels
+        expected = np.clip((63.5 - position) / 6.0, 0, 1)            # from the outer face of the last fine voxel
+        np.testing.assert_allclose(coverage[:, 20, 20], expected, atol=1e-6)
+
+    def test_a_grid_that_ends_at_the_faces_of_the_fine_one_is_covered(self):
+        face = self.affine[:3, 3] - 0.25                             # the outer face of the first fine voxel, in mm
+        # voxels of 0.4 mm over the same field of view: the outermost centres lie between a face and a fine centre
+        fine = np.diag([0.4, 0.4, 0.4, 1.0])
+        fine[:3, 3] = face + 0.2
+        # the fine grid itself, its affine off by rounding
+        same = self.affine.copy()
+        same[:3, :3] = same[:3, :3] @ rotation_about_x(1e-9)
+        same[:3, 3] -= 1e-9
+        for target, shape in ((fine, (80, 80, 80)), (same, self.image.shape)):
+            lattice = artefacts.ObliqueAcquisition(self.image.shape, self.affine, shape, target)
+            self.assertEqual(float(lattice.coverage().min()), 1.0)
+            image = lattice.acquire(self.image + 50)                 # nothing of it is 0 by itself
+            self.assertGreater(float(image.min()), 0.0)
 
     def test_a_volume_of_another_size_is_refused(self):
         with self.assertRaises(ValueError):

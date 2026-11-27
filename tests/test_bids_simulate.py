@@ -144,6 +144,13 @@ class TestThePipeline(unittest.TestCase):
         # a seed of 0 is a seed that was given: its file is not that of the default
         self.assertEqual(simulate.acquire(self.truth, snr=20, bias_percent=0, seed=0, grid="working")["tags"], "snr20Seed0")
 
+    def test_upsample_without_another_voxel_size_changes_nothing(self):
+        plain = simulate.acquire(self.truth, snr=20, bias_percent=0, grid="working")
+        upsampled = simulate.acquire(self.truth, snr=20, bias_percent=0, grid="working", upsample=True)
+        self.assertEqual(upsampled["tags"], plain["tags"])
+        self.assertEqual(upsampled["parameters"]["Seed"], plain["parameters"]["Seed"])
+        np.testing.assert_array_equal(upsampled["image"], plain["image"])
+
     def test_scans_of_one_name_in_two_folders_get_noise_and_a_field_of_their_own(self):
         first = simulate.ground_truth("/data/subj01/T1.nii", seg=self.seg, clean=False)
         second = simulate.ground_truth("/data/subj02/T1.nii", seg=self.seg, clean=False)
@@ -326,6 +333,144 @@ def _seg_with_scan():
     return seg
 
 
+def _seg_on_the_scan():
+    """The made-up brain of :func:`_seg`, made on the scan as the front end does by default.
+
+    The scan has voxels of 1 mm and is stored with its first axis running to
+    the left; the anatomy lies on it at 0.5 mm along the same axes, two by two
+    by two to a scan voxel, and covers all of it but two scan voxels at every
+    face.  The registration turns the scan and enlarges it by 1.1.
+    """
+    from scipy import ndimage
+
+    seg = _seg()
+    fine_shape = seg["label"].shape                                   # (40, 44, 36)
+    shape = tuple(n // 2 + 4 for n in fine_shape)                     # (24, 26, 22)
+    scan_affine = np.diag([-1.0, 1.0, 1.0, 1.0])
+    scan_affine[:3, 3] = [12.0, -13.0, -11.0]
+    to_scan_voxel = np.eye(4)                                         # fine voxel -> scan voxel
+    to_scan_voxel[:3, :3] = 0.5 * np.eye(3)
+    to_scan_voxel[:3, 3] = 2 - 0.25                                   # two scan voxels in, at their face
+    affine = scan_affine @ to_scan_voxel
+    a = np.deg2rad(8.0)
+    world = np.eye(4)
+    world[:3, :3] = 1.1 * np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])
+    world[:3, 3] = [0.6, -0.4, 0.3]
+    # the scan: what the head looks like, half as bright as the bias-corrected scan, and a neck below
+    corrected = seg["corrected"].copy()
+    corrected[12:28, 14:30, :8] = 250.0
+    seg["corrected"] = corrected
+    to_fine = np.linalg.inv(to_scan_voxel)
+    data = 0.5 * ndimage.affine_transform(corrected, to_fine[:3, :3], offset=to_fine[:3, 3], output_shape=shape,
+                                          order=1, mode="nearest")
+    scan = nib.Nifti1Image(data.astype(np.float32), scan_affine)
+    scan.header.set_sform(scan_affine, code=1)
+    template_shape = (50, 56, 46)
+    centre = world @ affine @ np.append((np.array(fine_shape) - 1) / 2, 1)
+    template = np.diag([0.5, 0.5, 0.5, 1.0])
+    template[:3, 3] = centre[:3] - 0.5 * (np.array(template_shape) - 1) / 2
+    seg.update(grid=nib.Nifti1Image(np.zeros(fine_shape, np.uint8), affine), space="scan", world=world,
+               template_affine=world @ affine, template_grid={"shape": template_shape, "affine": template},
+               scan=scan)
+    return seg
+
+
+class TestAnAnatomyMadeOnTheScan(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.seg = _seg_on_the_scan()
+        cls.truth = simulate.ground_truth("/data/sub-07/anat/sub-07_T1w.nii.gz", seg=cls.seg, clean=False)
+        cls.plain = simulate.acquire(cls.truth, snr=0, bias_percent=0)
+
+    def test_the_truth_knows_where_it_was_made(self):
+        self.assertEqual(self.truth["space"], "scan")
+        np.testing.assert_allclose(self.truth["to_scan"], self.seg["grid"].affine)
+        np.testing.assert_allclose(self.truth["template_affine"], self.seg["world"] @ self.seg["grid"].affine)
+        self.assertEqual(self.truth["parameters"]["AnatomySpace"], "scan")
+        self.assertEqual(self.truth["settings"]["Space"], "scan")
+
+    def test_on_the_scan_every_voxel_is_the_mean_of_two_by_two_by_two(self):
+        acq = self.plain
+        self.assertEqual(acq["image"].shape, self.seg["scan"].shape)
+        np.testing.assert_allclose(acq["affine"], self.seg["scan"].affine)
+        fine = self.truth["fractions"]
+        blocks = fine.reshape(20, 2, 22, 2, 18, 2, 3).mean((1, 3, 5))
+        np.testing.assert_allclose(acq["fractions"][2:-2, 2:-2, 2:-2], blocks, atol=1e-6)
+        np.testing.assert_array_equal(acq["fractions"][:2], 0)
+        # nothing is lost or made: the volumes are those of the anatomy, in the millimetres of the scan
+        np.testing.assert_allclose(acq["fractions"].sum((0, 1, 2), dtype=np.float64),
+                                   fine.sum((0, 1, 2), dtype=np.float64) / 8, rtol=1e-6)
+
+    def test_the_image_on_the_scan(self):
+        white = self.plain["fractions"][..., 2] > 0.9999
+        self.assertGreater(int(white.sum()), 20)
+        self.assertAlmostEqual(float(self.plain["image"][white].mean()), 400.0, delta=6.0)
+        self.assertGreaterEqual(float(self.plain["image"].min()), 0.0)
+        # beyond the grid of the anatomy, at the faces, the scan brought to the corrected intensities
+        scan = np.asarray(self.seg["scan"].dataobj)
+        outer = np.zeros(scan.shape, bool)
+        outer[0], outer[-1] = True, True
+        bright = outer & (scan > 50)
+        if bright.any():
+            np.testing.assert_allclose(self.plain["image"][bright], 2 * scan[bright], rtol=0.1)
+
+    def test_on_the_grid_of_the_anatomy_nothing_is_averaged(self):
+        acq = simulate.acquire(self.truth, grid="anatomy", snr=0, bias_percent=0)
+        self.assertIs(acq["fractions"], self.truth["fractions"])
+        np.testing.assert_allclose(acq["affine"], self.seg["grid"].affine)
+        self.assertEqual(acq["parameters"]["Space"], "scan")
+        with tempfile.TemporaryDirectory() as folder:
+            files = simulate.write(self.truth, simulate.acquire(self.truth, grid="anatomy", snr=40), out_dir=folder)
+            # in the space of the scan, but not on its voxels
+            self.assertEqual(files["T1w"].name, "sub-07_res-0p5mm_desc-snr40Rf30T2_T1w.nii.gz")
+            self.assertEqual(int(nib.load(files["T1w"]).header["sform_code"]), 1)
+
+    def test_in_template_space_the_head_is_larger(self):
+        acq = simulate.acquire(self.truth, grid="working", snr=0, bias_percent=0)
+        self.assertEqual(acq["image"].shape, (50, 56, 46))
+        np.testing.assert_allclose(acq["affine"], self.seg["template_grid"]["affine"])
+        self.assertEqual((acq["parameters"]["Space"], acq["parameters"]["AnatomySpace"]),
+                         ("MNI152NLin2009cAsym", "scan"))
+        on_scan = self.truth["fractions"].sum((0, 1, 2), dtype=np.float64) * 0.5 ** 3
+        on_template = acq["fractions"].sum((0, 1, 2), dtype=np.float64) * 0.5 ** 3
+        np.testing.assert_allclose(on_template, on_scan * 1.1 ** 3, rtol=2e-3)
+        # at a coarser voxel size and back on the 0.5 mm grid, where the ground truth stays
+        back = simulate.acquire(self.truth, grid="working", snr=0, bias_percent=0, resolution=1.0, upsample=True)
+        self.assertEqual(back["image"].shape, (50, 56, 46))
+        self.assertIs(back["fractions"], simulate.acquire(self.truth, grid="working", snr=0, bias_percent=0,
+                                                          resolution=1.0, upsample=True)["fractions"])
+        np.testing.assert_allclose(back["fractions"], acq["fractions"], atol=1e-6)
+        self.assertEqual(back["tags"], "Acq1mm")
+        with self.assertRaisesRegex(ValueError, "339 x 411 x 339"):
+            simulate.acquire(self.truth, grid="deepmriprep")
+        # without T1Prep's working grid there is no template space to write into
+        alone = dict(self.seg)
+        del alone["template_grid"]
+        truth = simulate.ground_truth("x", seg=alone, clean=False)
+        with self.assertRaisesRegex(ValueError, "template_grid"):
+            simulate.acquire(truth, grid="working")
+
+    def test_a_thickness_is_one_of_the_scan(self):
+        regions = np.full(self.seg["label"].shape, 100, np.uint8)          # all of it one cortical parcel
+        with mock.patch("t1sim.simulate.atlas.to_grid", return_value=regions):
+            on_scan = simulate.ground_truth("x", seg=self.seg, clean=False, thickness=2.5)
+            in_template = simulate.ground_truth("x", seg=_seg_with_scan(), clean=False, thickness=2.5)
+        # along a ray of the grid of the anatomy, 0.5 mm of the scan
+        centre = tuple(n // 2 for n in on_scan["label"].shape)
+        self.assertAlmostEqual(float(on_scan["fractions"][centre[0]:, centre[1], centre[2], 1].sum()) * 0.5,
+                               2.5, delta=0.2)
+        # and in the image on the grid of the scan, of 1 mm voxels
+        acq = simulate.acquire(on_scan, snr=0, bias_percent=0)
+        middle = tuple(n // 2 for n in acq["fractions"].shape[:3])
+        self.assertAlmostEqual(float(acq["fractions"][middle[0]:, middle[1], middle[2], 1].sum()), 2.5, delta=0.3)
+        # made in template space, the same 2.5 mm are 2.5 mm of the template: 2.5 / 1.1 of the subject
+        centre = tuple(n // 2 for n in in_template["label"].shape)
+        template_mm = float(in_template["fractions"][centre[0]:, centre[1], centre[2], 1].sum()) * 0.5
+        self.assertAlmostEqual(template_mm, 2.5, delta=0.2)
+        self.assertEqual((on_scan["parameters"]["AnatomySpace"], in_template["parameters"]["AnatomySpace"]),
+                         ("scan", "template"))
+
+
 class TestTheGridOfTheScan(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -395,6 +540,16 @@ class TestTheGridOfTheScan(unittest.TestCase):
         np.testing.assert_allclose(acq["jacobian"][brain], 0.9, atol=1e-4)
         np.testing.assert_allclose(acq["jacobian"][0, 0, 0], 1.0, atol=1e-6)        # beyond the working grid
         self.assertIsNone(simulate.acquire(self.truth, grid="scan", snr=0, bias_percent=0)["jacobian"])
+
+    def test_a_copy_with_another_scan_does_not_get_the_ground_truth_of_this_one(self):
+        first = simulate.acquire(self.truth, snr=0, bias_percent=0)
+        scan = self.scan
+        larger = nib.Nifti1Image(np.pad(np.asarray(scan.dataobj), 2), scan.affine @ np.array(
+            [[1, 0, 0, -2], [0, 1, 0, -2], [0, 0, 1, -2], [0, 0, 0, 1.0]]))
+        other = dict(self.truth, scan_image=larger)                  # shares the kept ground truth
+        second = simulate.acquire(other, snr=0, bias_percent=0)
+        self.assertEqual(second["fractions"].shape, larger.shape + (3,))
+        np.testing.assert_allclose(second["fractions"][2:-2, 2:-2, 2:-2], first["fractions"], atol=1e-6)
 
     def test_another_voxel_size_stays_on_the_axes_of_the_scan(self):
         coarse = simulate.acquire(self.truth, grid="scan", snr=0, bias_percent=0, resolution=1.4)
