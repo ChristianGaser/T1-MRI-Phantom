@@ -9,7 +9,7 @@ Part of the [documentation of t1sim](../README.md#documentation).
 - [What `change` means](#what-change-means)
 - [Which kind of atrophy](#which-kind-of-atrophy)
 
-All lengths and volumes on this page are those of the output grid, on which the head has the size of the template ([The working grid](frontend.md#the-working-grid)).
+All lengths and volumes on this page are those of the working grid, on which the anatomy is made and the head has the size of the template ([The working grid](frontend.md#the-working-grid)). An image on the grid of the scan, the default of `simulate.acquire`, shows the same anatomy in the size of the subject; the measurements below were made with `grid="working"`.
 
 ## Cortical thickness
 
@@ -55,7 +55,7 @@ truth["jacobian"]                               # Jacobian determinant of the de
 truth["parameters"]["Atrophy"][0]               # what was asked for and what was reached
 ```
 
-The tissue of a region changes its volume by `change`, by a smooth deformation that is applied to the ground truth, to the fractions of the image and to the scan outside the brain. Boundaries move, and the Jacobian determinant of the deformation says where volume was lost. Two kinds:
+The tissue of a region changes its volume by `change`, by a smooth deformation that is applied to the ground truth, to the fractions of the image and to the scan outside the brain. The fractions are interpolated linearly, which keeps them between 0 and 1 and keeps their sum; the scan is interpolated by a cubic B-spline. Boundaries move, and the Jacobian determinant of the deformation says where volume was lost. Two kinds:
 
 - **`mode="thinning"`** (default). Every point of the cortex of the region moves towards the white matter surface in proportion to its distance from it. The cortex keeps its area and gets thinner; the CSF beyond it widens. The white matter surface stays.
 - **`mode="volume"`**. The tissue of the region is the sink and the CSF within `reach` the source of a curl-free flow. The tissue shrinks the same in all directions.

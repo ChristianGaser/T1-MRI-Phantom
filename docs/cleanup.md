@@ -23,7 +23,7 @@ truth = simulate.ground_truth(scan, clean=False)                      # as segme
 | `dura` | Length in mm of the path through the tissue beyond which grey matter is dura; 0 switches it off, lower removes more (`4.0`) |
 | `pve` | Correct the partial volume of CSF and WM around the ventricles (`True`) |
 
-`truth["fractions"]` and `truth["label"]` are the cleaned ground truth, and `truth["image_fractions"]` is what the image is rendered from. The sidecar lists the volume of each of the three corrections (`LabelCleanup`, in ml of the output grid).
+`truth["fractions"]` and `truth["label"]` are the cleaned ground truth, and `truth["image_fractions"]` is what the image is rendered from. The sidecar lists the volume of each of the three corrections (`LabelCleanup`, in ml of the working grid).
 
 After a simulated [cortical thickness](anatomy.md#cortical-thickness) the cleanup leaves the rebuilt cortex alone: it holds no vessel and no dura, and its label no longer follows the intensities the detection reads. Only the structures that keep their labels are cleaned.
 
@@ -40,7 +40,7 @@ After a simulated [cortical thickness](anatomy.md#cortical-thickness) the cleanu
 
 ## Measured
 
-Volumes that were corrected, converted to ml of the scan (the sidecar gives ml of the output grid, 1.26 and 1.42 times as much for these two scans):
+Volumes that were corrected, converted to ml of the scan (the sidecar gives ml of the working grid, 1.26 and 1.42 times as much for these two scans):
 
 | Scan | Vessels | Dura | Periventricular |
 | --- | --- | --- | --- |

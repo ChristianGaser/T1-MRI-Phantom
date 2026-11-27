@@ -9,6 +9,7 @@ Part of the [documentation of t1sim](../README.md#documentation).
 - [Options of the anatomy](#options-of-the-anatomy)
 - [Options of the acquisition](#options-of-the-acquisition)
 - [Options of the output](#options-of-the-output)
+- [The grid of the output](#the-grid-of-the-output)
 - [What is written](#what-is-written)
 - [Command line](#command-line)
 - [How long it takes](#how-long-it-takes)
@@ -84,11 +85,11 @@ Arguments of `acquire`, which `simulate` passes on. [Artefacts of the acquisitio
 | `bias_type` | `(strength, seed)` of a simulated field, or `"A"`, `"B"`, `"C"` or a file for a stored one. A seed of `None` gives every scan a field of its own (`(2, 0)`) |
 | `contrast` | Exponent of the contrast change: below 1 for less contrast between the tissues, above 1 for more (`1`) |
 | `resolution` | Voxel size of the acquisition in mm, one value or three (`None`: that of the grid) |
-| `upsample` | Bring the acquired image back onto the 0.5 mm grid; the ground truth then keeps its voxels. `False`: the ground truth is averaged to the voxels of the acquisition (`False`) |
+| `upsample` | With `grid="working"` or `"deepmriprep"`: bring the acquired image back onto the 0.5 mm grid; the ground truth then keeps its voxels. `False`: the ground truth is averaged to the voxels of the acquisition (`False`) |
 | `motion` | Movement artefacts: a severity, or a dict (`0`) |
 | `ringing` | Ringing: a strength, or a dict (`0`) |
 | `seed` | Seed of noise and movement. `None`: derived from the folder and the name of the scan and from the settings, so every output file has noise of its own that is the same in every run (`None`) |
-| `grid` | `"working"` (339 x 411 x 339), or `"deepmriprep"` for the 336 x 384 x 336 voxels its networks are trained on (`"working"`) |
+| `grid` | `"scan"` for the grid of the scan itself; `"working"` for the 0.5 mm grid in template space the anatomy is made on (339 x 411 x 339); or `"deepmriprep"` for the 336 x 384 x 336 voxels of that grid its networks are trained on. See [The grid of the output](#the-grid-of-the-output) (`"scan"`) |
 
 ## Options of the output
 
@@ -102,20 +103,50 @@ Arguments of `write`, which `simulate` passes on:
 | `save_jacobian` | Also write the Jacobian determinant of an atrophy (`True`) |
 | `compress` | Write `.nii.gz`; `False` writes `.nii` (`True`) |
 
+## The grid of the output
+
+The anatomy is always made on the working grid, 0.5 mm in template space. `grid` says where an image of it is acquired:
+
+| `grid` | Image and ground truth lie | Use |
+| --- | --- | --- |
+| `"scan"` (default) | On the grid of the scan: its voxels, its orientation and storage order, its field of view and its world coordinates. The head has the size of the subject | Validation: the input a pipeline is built for, lying on the scan voxel by voxel |
+| `"working"` | On the working grid, or on one of another voxel size inside it (`resolution`) | The anatomy as it was made, with nothing averaged |
+| `"deepmriprep"` | On the 336 x 384 x 336 voxels of the working grid that deepmriprep trains on | [Training data](training-data.md) |
+
+### On the grid of the scan
+
+![The default output on the grid of the scan](t1sim-scan-grid.png)
+
+- **The image** is acquired on that grid as on any other: its k-space is cut to that of the scan, whose axes are turned against the working grid, and it is read at the voxel centres of the scan by a cubic B-spline. Movement, ringing and noise follow on the grid of the scan, so millimetres of a movement are those of the subject and the noise is white there.
+- **The ground truth** is the mean of the fractions over every voxel of the scan, a parallelepiped in the working grid; see [Voxel size](artefacts.md#voxel-size) for how exact that is. It is never interpolated.
+- **Beyond the working grid** a scan usually shows more: the neck, the lower face, more air; on one scan 17% of the head. There the image is the denoised scan itself, brought to the intensities of the bias-corrected scan next to it and given the contrast and the bias field of the simulation. The two are blended over 3 mm.
+- **`resolution`** gives another voxel size along the axes and in the field of view of the scan, in millimetres of the scan. `upsample` is not available.
+- **The anatomy stays defined in template space.** A `thickness` in mm, the region of an atrophy and the volumes in the sidecar are those of the working grid, where the head is larger ([The working grid](frontend.md#the-working-grid)). On the scan a cortex of 2.5 mm is thinner by the factor of the registration, which differs by direction.
+
+Checked on a 0.75 mm scan that is stored in another order than the working grid (288 x 320 x 208, turned by about 15 degrees): the tissue volumes on the grid of the scan are those of the working grid divided by the factor of the registration to five digits, the image lies within 0.02 mm of the scan, the noise in white matter has a standard deviation of 16.9 for a nominal 16.7, and nothing that is written is below 0.
+
 ## What is written
 
 For `sub-01_T1w.nii.gz` with `snr=30, bias_percent=20`:
 
 ```text
-sub-01_space-MNI152NLin2009cAsym_res-0p5mm_desc-snr30Rf20T2_T1w.nii.gz     the simulated image
-sub-01_space-MNI152NLin2009cAsym_res-0p5mm_desc-snr30Rf20T2_T1w.json       its parameters
-sub-01_space-MNI152NLin2009cAsym_res-0p5mm_desc-Clean_dseg.nii.gz          label map of the ground truth
-sub-01_space-MNI152NLin2009cAsym_res-0p5mm_desc-Clean_dseg.json
-sub-01_space-MNI152NLin2009cAsym_res-0p5mm_desc-Clean_label-GM_probseg.nii.gz   and _label-WM_, _label-CSF_
+sub-01_desc-snr30Rf20T2_T1w.nii.gz            the simulated image
+sub-01_desc-snr30Rf20T2_T1w.json              its parameters
+sub-01_desc-Clean_dseg.nii.gz                 label map of the ground truth
+sub-01_desc-Clean_dseg.json
+sub-01_desc-Clean_label-GM_probseg.nii.gz     and _label-WM_, _label-CSF_
+```
+
+With `grid="working"` or `"deepmriprep"` the names carry the space and the voxel size:
+
+```text
+sub-01_space-MNI152NLin2009cAsym_res-0p5mm_desc-snr30Rf20T2_T1w.nii.gz
+sub-01_space-MNI152NLin2009cAsym_res-0p5mm_desc-Clean_dseg.nii.gz
 ```
 
 - **Where.** For a scan inside a BIDS dataset: in `derivatives/t1sim-<version>/` at the root of the dataset, with the folders of subject and session kept. For any other scan: in `derivatives/t1sim-<version>/<folder of the scan>/` next to the folder of the scan, so that scans of one name in different folders do not replace each other. `out_dir` names another folder, and `derivatives=False` writes next to the scan.
-- **Space.** All outputs are affinely registered to MNI152NLin2009cAsym. The registration scales the head, so lengths and volumes are those of the template and not of the subject; see [The working grid](frontend.md#the-working-grid). The voxels are 0.5 mm, or those of the acquisition with `resolution` and without `upsample`.
+- **On the grid of the scan** the names carry no `space`, and a `res` only for another `resolution` (`sub-01_res-1mm_desc-...`), as `matlab/mri_simulate.m` names them. The world coordinates and their NIfTI code are those of the scan.
+- **Space.** The outputs of the other two grids are affinely registered to MNI152NLin2009cAsym. The registration scales the head, so lengths and volumes are those of the template and not of the subject; see [The working grid](frontend.md#the-working-grid). The voxels are 0.5 mm, or those of the acquisition with `resolution` and without `upsample`.
 - **Ground truth.** The fractions (`probseg`, 8 bit in steps of 1/255) are the ground truth. The label map (`dseg`, 16 bit in steps of 1/765) is a view of them, `CSF + 2 GM + 3 WM`: 2.5 is half GM and half WM. Read back, a pure voxel is 1 or 3 to within 1e-7, not exactly.
 - **Sidecar of the image.** `SimulationParameters` holds every setting, the seeds, the noise SD that was used, the tissue intensities, the volumes the cleanup corrected, what an atrophy reached, and for movement the pose of every block of k-space. `AffineVolumeScaling` is the volume of the head on the grid over its volume in the scan; `VolumeMl` and `TissueChangeMl` are ml of the grid.
 - **Atrophy.** The Jacobian determinant of the deformation is written as `..._jacobian.nii.gz`. It lies on the anatomy before the atrophy, not on the label map next to it; see [Atrophy](anatomy.md#atrophy).
@@ -142,8 +173,9 @@ The names do not hold every setting: not the options of the cleanup, the reach o
 ## Command line
 
 ```bash
-t1sim sub-01_T1w.nii.gz --snr 20 40 --bias 20                       # two images of one ground truth
-t1sim sub-01_T1w.nii.gz --resolution 1 1 1.5 --motion 2             # a 1 x 1 x 1.5 mm scan with movement
+t1sim sub-01_T1w.nii.gz --snr 20 40 --bias 20                       # two images of one ground truth, on the grid of the scan
+t1sim sub-01_T1w.nii.gz --resolution 1 1 1.5 --motion 2             # the scan at 1 x 1 x 1.5 mm, with movement
+t1sim sub-01_T1w.nii.gz --grid working --snr 30                     # in template space at 0.5 mm
 t1sim sub-01_T1w.nii.gz --atrophy Hammers 28 -0.1                   # 10% less grey matter in a region
 t1sim sub-01_T1w.nii.gz --thickness 2.5                             # a cortex of 2.5 mm
 t1sim sub-*_T1w.nii.gz --grid deepmriprep --resolution 1 --upsample --bias-type 2 scan   # training data
@@ -161,8 +193,10 @@ Measured on an M2 MacBook Air, one 0.75 mm scan, 0.5 mm working grid:
 | Cleanup | 35 to 40 s |
 | Atrophy of one region | 20 to 30 s |
 | Cortical thickness | 7 to 8 minutes |
-| One acquisition on the 0.5 mm grid | 8 s |
-| One acquisition at 1 mm, brought back to 0.5 mm | 18 s |
+| One acquisition on the working grid (`grid="working"`) | 8 s |
+| The same at 1 mm, brought back to 0.5 mm | 18 s |
 | Movement at 1 mm, severity 1 / 2 / 3 | 10 / 15 / 23 s |
 
 A ground truth without a change of the anatomy takes about two minutes, most of it in the front end.
+
+On the grid of the scan, the default, the first acquisition of a ground truth also averages the fractions and takes longer; the result is kept for the next ones. Measured on another machine, an M2 Ultra, for a 0.75 mm scan of 288 x 320 x 208 voxels: 27 s for the first acquisition and 12 s for every further one.

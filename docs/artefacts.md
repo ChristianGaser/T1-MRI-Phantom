@@ -46,13 +46,28 @@ A smooth field with a mean of 1 that the image is multiplied with. `bias_percent
 
 ## Voxel size
 
-`resolution` is the voxel size of the acquisition.
+`resolution` is the voxel size of the acquisition. Without it the image is acquired at the voxel size of its grid, which for the default, the grid of the scan, is the voxel size of the scan.
+
+**How an image is resampled.** Wherever an image changes its grid, to a coarser voxel size, onto the grid of the scan, back onto the 0.5 mm grid, or under the deformation of an atrophy, it is read by a cubic B-spline, after its k-space was cut if the new grid is coarser. On a scan the cubic spline was within 0.07% of the white matter intensity (RMS) of a quintic one and within 1.5% at its worst voxel; linear interpolation was off by 1.1% and 23%. A cut of k-space and a spline both swing below 0 next to a bright edge, 1.6% of the voxels of that scan before the image was read; what is below 0 is set to 0, so nothing that is written is negative. A ground truth is never interpolated by a spline, which would take fractions below 0 and above 1: it is averaged over the new voxels, and under a deformation interpolated linearly.
 
 - **The image is acquired.** Its k-space is cut at the Nyquist frequency of the new voxel size along every axis that gets coarser, which is what a smaller acquisition matrix does, Gibbs ringing included. The band-limited image is then read at the new voxel centres.
 - **The ground truth is averaged.** Every new voxel holds the mean of the fractions over the box it covers, which is the partial volume of that voxel. The tissue volumes stay what they were.
 - **The grid** has as many whole voxels as fit into the field of view, centred, so the voxel size is exactly the one asked for.
 
-The two are not the same filter, as they are not in a scanner: next to a sharp boundary the image rings around the mixture that the averaged fractions give (see [How exact the ground truth is](validation.md#how-exact-the-ground-truth-is)). The cut is periodic, as an FFT is, so what touches one end of the field of view, such as the neck, rings faintly into the first planes of the other end.
+The two are not the same filter, as they are not in a scanner: next to a sharp boundary the image rings around the mixture that the averaged fractions give (see [How exact the ground truth is](validation.md#how-exact-the-ground-truth-is)).
+
+A Fourier transform takes the image as periodic, so what touches one end of the field of view, as the neck does, would ring into the other end: a slab of 400 at one end left 33 in the last plane of the other. The image is therefore continued with its mirror image for 16 voxels beyond every face before its k-space is cut, which leaves 1.
+
+**On the grid of the scan** (`grid="scan"`) the new voxels are turned against the working grid. The k-space of the scan is then a box that lies obliquely in that of the image, and the cut removes every wave with more than half a cycle per voxel of the scan along one of its three axes. A voxel of the scan is a parallelepiped in the working grid, and the ground truth is the mean of the fractions over it, each fine voxel counting with the share of it that lies inside. That mean is computed over 1, 8 or 27 small boxes along the axes of the working grid that cover the voxel, each of them integrated exactly:
+
+| Grids turned by | Boxes | Largest error of a fraction | RMS in the voxels of a boundary |
+| --- | --- | --- | --- |
+| 0 (along the axes) | 1 | 0: the result of the grid along the axes | 0 |
+| 1 degree | 8 | 0.0006, against 27 boxes | - |
+| 6 to 11 degrees | 8 | 0.005 | 0.0015 |
+| 17 to 29 degrees | 27 | 0.006 | 0.0012 |
+
+(A ball whose boundaries are one fine voxel wide, new voxels of 1.7 fine voxels; a scan has softer boundaries.) Reading the fine voxel at points inside the new voxel, the obvious way, needed 40 points per axis to come that close on the grid turned by 1 degree, because the points fall in step with the fine grid; and the mean of the linearly interpolated fractions is another quantity, smoother by one fine voxel, that differed by up to 0.065.
 
 With `upsample=True` the acquired image is brought back onto the 0.5 mm grid by cubic B-spline interpolation, and the ground truth keeps its 0.5 mm voxels. This is a scan of that voxel size after resampling, the form in which most real data reaches a network that works at 0.5 mm.
 
@@ -93,7 +108,7 @@ With `upsample=True` the noise is white at the voxel size of the acquisition and
 
 ## What was checked
 
-**Noise**, each case against the same acquisition without noise, in voxels of pure white matter (0.75 mm MPRAGE, SNR 25):
+**Noise**, each case against the same acquisition without noise, in voxels of pure white matter (0.75 mm MPRAGE, SNR 25, on the working grid; on the grid of the scan white matter had an SD of 16.9 for a nominal 16.7 at SNR 30):
 
 | Case | Nominal SD | SD in WM | Mean shift in WM (Rician theory) | SNR in WM | Correlation of neighbours |
 | --- | --- | --- | --- | --- | --- |

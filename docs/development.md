@@ -72,3 +72,4 @@ It needs matplotlib and scipy in addition to the front end.
 | `docs/t1sim-scheme.png` | The path from the scan to the simulated image and to its ground truth |
 | `docs/t1sim-frontend.png` | What `frontend.segment` returns: an axial slice and an enlarged detail of each volume |
 | `docs/t1sim-examples.png` | A bias field on the whole slice, one detail of the anatomy under every other artefact, and an atrophy with the change of the ground truth |
+| `docs/t1sim-scan-grid.png` | The default output on the grid of the scan, next to the scan and with its ground truth |

@@ -7,6 +7,8 @@
 - ``t1sim-frontend.png``: what :func:`t1sim.frontend.segment` returns.
 - ``t1sim-examples.png``: one detail of the anatomy under every artefact, a
   bias field on the whole slice, and an atrophy.
+- ``t1sim-scan-grid.png``: the default output, on the grid of the scan, next
+  to the scan.
 
 Every image is one axial slice of the working grid, and everything shown is
 made by t1sim from the scan.  ``--cache`` keeps the slices, so that a change
@@ -33,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from t1sim import anatomy, atlas, frontend, simulate  # noqa: E402
+from t1sim import anatomy, artefacts, atlas, frontend, simulate  # noqa: E402
 
 # One colour per tissue wherever a tissue is shown by colour, and the inks of
 # the text.  The three hues stay apart for colour-blind readers as well.
@@ -88,12 +90,13 @@ def collect(scan):
     truth = simulate.ground_truth(scan, seg=seg)
     out["sim_fractions"] = truth["fractions"][:, :, k]
     out["sim_ideal"] = truth["ideal"][:, :, k]
-    plain = dict(snr=0, bias_percent=0, seed=1)
+    # every figure shows a slice of the working grid, on which the anatomy is made
+    plain = dict(snr=0, bias_percent=0, seed=1, grid="working")
     coarse = dict(plain, resolution=1.0, upsample=True)
     examples = {
-        "sim_image": dict(snr=30, bias_percent=30, seed=1),
-        "ex_noise": dict(snr=12, bias_percent=0, seed=1),
-        "ex_bias": dict(snr=0, bias_percent=-60, bias_type=(3, 2), seed=1),
+        "sim_image": dict(plain, snr=30, bias_percent=30),
+        "ex_noise": dict(plain, snr=12),
+        "ex_bias": dict(plain, bias_percent=-60, bias_type=(3, 2)),
         "ex_contrast_low": dict(plain, contrast=0.5),
         "ex_contrast_high": dict(plain, contrast=1.5),
         "ex_resolution": coarse,
@@ -103,6 +106,7 @@ def collect(scan):
     }
     for key, options in examples.items():
         out[key] = simulate.acquire(truth, **options)["image"][:, :, k]
+    out.update(_on_the_scan(seg, truth))
     name, region, change = ATROPHY
     thin = simulate.ground_truth(scan, seg=seg, atrophy={"atlas": name, "regions": [region], "change": change})
     out["ex_atrophy"] = thin["ideal"][:, :, k]
@@ -110,6 +114,26 @@ def collect(scan):
     out["ex_atrophy_reached"] = np.array([thin["parameters"]["Atrophy"][0]["Achieved"]])
     out["roi"] = anatomy.roi_from_atlas(atlas.to_grid(name, seg["iy"], seg["template_mat"]), [region])[:, :, k]
     return out
+
+
+def _on_the_scan(seg, truth):
+    """Sagittal slices of the default output, which lies on the grid of the scan, and of the scan."""
+    stored = seg["scan"]
+    acquired = simulate.acquire(truth, snr=30, bias_percent=30, seed=1)
+    lattice = artefacts.ObliqueAcquisition(truth["ideal"].shape, truth["affine"], stored.shape[:3],
+                                           np.asarray(truth["world"]) @ stored.affine)
+
+    def upright(volume):                         # whatever the storage order of the scan: x to the right, z up
+        return nib.as_closest_canonical(nib.Nifti1Image(np.asarray(volume, dtype=np.float32), stored.affine))
+
+    scan = upright(np.asarray(stored.dataobj))
+    # the plane 8 mm beside the middle of the template, where it lies in the scan
+    there = np.linalg.solve(np.asarray(truth["world"]), [8.0, -20.0, 10.0, 1.0])
+    x = int(round(float(np.linalg.solve(scan.affine, there)[0])))
+    cut = lambda volume: np.asarray(upright(volume).dataobj)[x]
+    return {"nat_scan": np.asarray(scan.dataobj)[x], "nat_image": cut(acquired["image"]),
+            "nat_label": cut(acquired["label"]), "nat_inside": cut(lattice.coverage()),
+            "nat_voxel": np.sqrt((scan.affine[:3, :3] ** 2).sum(0)), "nat_shape": np.array(stored.shape[:3])}
 
 
 # ------------------------------------------------------------------ drawing
@@ -463,6 +487,51 @@ def figure_examples(d, path):
     plt.close(fig)
 
 
+def figure_scan_grid(d, path):
+    """The default output next to the scan it lies on: a sagittal slice of both, and of the ground truth."""
+    white = d["nat_label"] > 2.9
+    level = float(np.median(d["nat_image"][white]))
+    scan = d["nat_scan"] * level / float(np.median(d["nat_scan"][white]))
+    gray = {"cmap": "gray", "vmin": 0, "vmax": 1.3 * level}
+    voxel, shape = d["nat_voxel"], d["nat_shape"]
+    size = " x ".join(str(int(n)) for n in shape)
+    panels = [
+        ("The scan", f"denoised; {size} voxels of {voxel[0]:.2g} mm", scan, gray),
+        ("Simulated image", "SNR 30, bias field 30%, on the grid of the scan", d["nat_image"], gray),
+        ("Its ground truth", "label map: CSF 1, GM 2, WM 3, mixtures in between", d["nat_label"],
+         {"cmap": "gray", "vmin": 0, "vmax": 3}),
+    ]
+    ny, nz = scan.shape
+    aspect = nz * voxel[2] / (ny * voxel[1])
+    width = 4.6
+    fig, axes = plt.subplots(1, 3, figsize=(3 * width + 0.5, width * aspect + 1.75), facecolor=SURFACE,
+                             gridspec_kw={"wspace": 0.04})
+    fig.subplots_adjust(left=0.012, right=0.988, top=1 - 0.95 / (width * aspect + 1.75),
+                        bottom=0.62 / (width * aspect + 1.75))
+    for ax, (title, sub, image, style) in zip(axes, panels):
+        ax.imshow(image.T, origin="lower", aspect=voxel[2] / voxel[1], interpolation="nearest", **style)
+        if title == "Simulated image":
+            ax.contour(d["nat_inside"].T, levels=[0.5], colors=["#ffd23f"], linewidths=1.3)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#c8c8c8")
+        ax.text(0.5, 1.075, title, transform=ax.transAxes, ha="center", fontsize=12.5, weight="bold", color=INK)
+        ax.text(0.5, 1.02, sub, transform=ax.transAxes, ha="center", fontsize=10, color=INK_SOFT)
+    for x, side in ((0.03, "P"), (0.97, "A")):
+        axes[0].text(x, 0.025, side, transform=axes[0].transAxes, ha="center", va="bottom", fontsize=9,
+                     color="#ffffff", weight="bold")
+    fig.text(0.012, 0.012, "Inside the outline, the working grid, the brain is rendered from the tissue fractions "
+             "and the rest of the head is the bias-corrected scan. Beyond it the scan shows more than that grid\n"
+             "holds: there the image is the scan itself, with the bias field of the simulation. The ground truth "
+             "is the mean of the fractions over every voxel of the scan.",
+             fontsize=10, color=INK_SOFT, va="bottom", linespacing=1.4)
+    fig.suptitle("The default output of t1sim.simulate: on the grid of the scan", fontsize=15, color=INK,
+                 x=0.012, ha="left", y=0.985, weight="bold")
+    fig.savefig(path, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--scan", required=True, help="a T1w scan (NIfTI)")
@@ -480,7 +549,8 @@ def main(argv=None):
     figure_frontend(data, out / "t1sim-frontend.png")
     figure_scheme(data, out / "t1sim-scheme.png")
     figure_examples(data, out / "t1sim-examples.png")
-    print(f"wrote t1sim-frontend.png, t1sim-scheme.png and t1sim-examples.png to {out}")
+    figure_scan_grid(data, out / "t1sim-scan-grid.png")
+    print(f"wrote t1sim-frontend.png, t1sim-scheme.png, t1sim-examples.png and t1sim-scan-grid.png to {out}")
 
 
 if __name__ == "__main__":

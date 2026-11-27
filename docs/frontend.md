@@ -46,6 +46,7 @@ A dict. All volumes lie on the [working grid](#the-working-grid) and are indexed
 | `world` | 4 x 4 | The affine registration: scan millimetres to template millimetres |
 | `affine` | 4 x 4 | The same registration in the normalised coordinates T1Prep resamples with (`t1prep.unified_seg.grid_affine`) |
 | `native_mat`, `native_shape` | 4 x 4, tuple | Voxel-to-world matrix and shape of the scan in RAS order |
+| `scan` | nibabel image | The denoised scan on its own grid, in the storage order of the input: the grid `simulate.acquire` writes on by default, and what it takes from the scan beyond the working grid |
 | `params` | dict | Everything the segmentation estimated: the mixture of Gaussians, the bias field, volumes, timings |
 | `iy`, `template_mat` | (X, Y, Z, 3) float32, 4 x 4 | With `deformation=True`: for every voxel the voxel of the segmentation's templates it maps to, and the voxel-to-world matrix of those templates. `t1sim.atlas.to_grid` brings an atlas onto the grid with them |
 
@@ -101,7 +102,7 @@ The scan is resampled onto it once, after the denoising, and segmented there. Th
 | 0.75 mm MPRAGE | 1.12 / 1.01 / 1.12 times those of the scan | 1.26 times |
 | 0.7 mm scan | 1.15 / 1.02 / 1.20 times | 1.42 times |
 
-Everything `t1sim` is given or reports refers to the grid: a cortical thickness in mm, the voxel size of an acquisition, the 4 mm of the dura rule, the amplitude of a movement, the ml of a sidecar. A cortex simulated with 2.5 mm is 2.5 mm thick in the images that are written; in the head of the first subject that would be 2.2 to 2.5 mm, depending on the direction. `seg["world"]` holds the registration, and its determinant, the factor of the volumes, is written to every sidecar (`AffineVolumeScaling`).
+An image is by default written in the size of the subject all the same: `simulate.acquire` acquires it on the grid of the scan unless it is asked for `grid="working"` ([Simulating images](simulation.md#the-grid-of-the-output)). The anatomy is made here, so everything that defines it refers to this grid: a cortical thickness in mm, the voxel size of an acquisition, the 4 mm of the dura rule, the amplitude of a movement, the ml of a sidecar. A cortex simulated with 2.5 mm is 2.5 mm thick in the images that are written; in the head of the first subject that would be 2.2 to 2.5 mm, depending on the direction. `seg["world"]` holds the registration, and its determinant, the factor of the volumes, is written to every sidecar (`AffineVolumeScaling`).
 
 ## What comes after it
 
