@@ -21,21 +21,32 @@ vessel stays bright in the image and is CSF in the ground truth, as in
 ``matlab/mri_simulate.m``.  Without a cleanup the two are one array.  A
 change of the anatomy changes both.
 
-**The grid.**  The anatomy is made on the working grid of the front end, which
-is affinely registered to MNI152NLin2009cAsym at 0.5 mm.  The registration
-scales the head to the template, so every length and volume that defines the
-anatomy (a thickness in mm, the ml of a sidecar) is one of that space and
-not of the scan; the factor between the two volumes is in the sidecar
-(``AffineVolumeScaling``).  An image is acquired on one of three grids:
+**The grids.**  The anatomy is made on the grid of the front end
+(:func:`t1sim.frontend.segment`).  By default (``space="scan"``) that is the
+scan itself at 0.5 mm, along its own axes: every length that defines the
+anatomy (a thickness, the reach of an atrophy, the 4 mm of the dura rule) is
+one of the subject, and so are the volumes in the sidecars.
+``space="template"`` makes the anatomy on T1Prep's working grid instead,
+which is affinely registered to MNI152NLin2009cAsym and scales the head to the
+template; the factor between the volumes of the two is in the sidecar
+(``AffineVolumeScaling``).
+
+An image of the anatomy is acquired on one of four grids:
 
 - ``grid="scan"``, the default: the grid of the scan itself, with its
   voxels, its orientation and its field of view, in the world of the scan.
-  The head has the size of the subject, the image lies on the scan voxel by
-  voxel, and the ground truth is the mean of the fractions over every voxel
-  of the scan.  What the scan shows beyond the working grid, the neck
-  mostly, is taken from the scan.
-- ``grid="working"``: the working grid, or one of another voxel size inside
-  it (``resolution``).  The ground truth is the anatomy as it was made, with
+  The image lies on the scan voxel by voxel, and the ground truth is the mean
+  of the fractions over every voxel of the scan.  From an anatomy made on
+  the scan this is a resampling along the axes of the scan, where a scan
+  voxel whose size is a multiple of 0.5 mm is a whole number of voxels of
+  the anatomy.  What the scan shows beyond the grid of the anatomy, the
+  neck mostly, is taken from the scan.
+- ``grid="anatomy"``: the 0.5 mm grid the anatomy is made on, in its space,
+  or one of another voxel size inside it (``resolution``).  The ground truth
+  is the anatomy as it was made, with nothing averaged.
+- ``grid="working"``: T1Prep's working grid in template space, or one of
+  another voxel size inside it (``resolution``).  From an anatomy made in
+  template space the ground truth is the anatomy as it was made, with
   nothing averaged.
 - ``grid="deepmriprep"``: the 336 x 384 x 336 voxels of the working grid the
   deepmriprep networks are trained on, so the output is training data as it
@@ -43,7 +54,9 @@ not of the scan; the factor between the two volumes is in the sidecar
   scan and brought back onto the 0.5 mm grid (``resolution=1,
   upsample=True``): the ground truth keeps its 0.5 mm, and the image has the
   resolution and the correlated noise of a 1 mm scan that was resampled,
-  which is what most real data on that grid is.
+  which is what most real data on that grid is.  Training data are best
+  made in template space (``space="template"``), where the ground truth is
+  not averaged once more.
 
 Wherever an image is resampled, it is by its k-space and a cubic B-spline,
 and what swings below 0 next to an edge is set to 0; a ground truth is never
@@ -63,6 +76,9 @@ from scipy import ndimage
 
 from . import __version__, anatomy, artefacts, atlas, bids, cleanup, frontend, synthesis
 from ._volume import grid_voxel_size
+
+#: The grids an image can be acquired on (see the module notes).
+GRIDS = ("scan", "anatomy", "working", "deepmriprep")
 
 #: The part of the working grid (339 x 411 x 339) that deepmriprep's training
 #: scripts use: 336 x 384 x 336 voxels.
@@ -169,14 +185,15 @@ def _deform(atrophies: list, seg: dict, affine: np.ndarray, fractions: np.ndarra
 
 
 def ground_truth(scan, thickness=0, atrophy=None, clean=True, template_dir=None,
-                 verbose: bool = False, seg: dict = None) -> dict:
+                 verbose: bool = False, seg: dict = None, space: str = "scan") -> dict:
     """The anatomy of a simulation.
 
     Args:
         scan: The T1w scan, a file.
-        thickness: Give the cortex this thickness in mm; one value, or three
-            for the mainly occipital parcels, the rest and the mainly frontal
-            parcels.  0: keep the cortex.
+        thickness: Give the cortex this thickness in mm, millimetres of the
+            *space* the anatomy is made in: by default those of the scan.
+            One value, or three for the mainly occipital parcels, the rest
+            and the mainly frontal parcels.  0: keep the cortex.
         atrophy: A dict, or a list of dicts, each with ``regions`` (numbers
             of the atlas) and ``change`` (relative volume change of their
             grey matter, e.g. -0.1; one value or one per region), and
@@ -193,7 +210,11 @@ def ground_truth(scan, thickness=0, atrophy=None, clean=True, template_dir=None,
         template_dir: Folder with the templates of the segmentation.
         verbose: Print the steps.
         seg: A result of ``frontend.segment(scan, deformation=True)`` to
-            start from instead of running the front end.
+            start from instead of running the front end.  Its space is the
+            space of the anatomy, and *space* is not used.
+        space: Where the anatomy is made (:func:`t1sim.frontend.segment`):
+            ``"scan"``, on the scan at 0.5 mm, or ``"template"``, on T1Prep's
+            working grid in template space.
 
     Returns:
         A dict:
@@ -204,9 +225,13 @@ def ground_truth(scan, thickness=0, atrophy=None, clean=True, template_dir=None,
           truth before the cleanup (the same array without one);
         - ``corrected`` and ``ideal``: the bias-corrected scan and the image
           without artefacts, both with the changed anatomy;
-        - ``means``: the tissue intensities; ``affine``: voxel-to-world
-          matrix of the grid; ``iy`` and ``template_mat``: the deformation
-          to the templates, of the anatomy before an atrophy;
+        - ``means``: the tissue intensities; ``space`` and ``affine``: where
+          the anatomy is made, and the voxel-to-world matrix of its grid in
+          the millimetres of that space; ``to_scan`` and
+          ``template_affine``: the same matrix in the millimetres of the scan
+          and of the template; ``template_grid``: T1Prep's working grid;
+          ``iy`` and ``template_mat``: the deformation to the templates, of
+          the anatomy before an atrophy;
         - ``jacobian``, with an atrophy: its Jacobian determinant, on the
           anatomy before the atrophy (see :func:`t1sim.anatomy.atrophy`);
         - ``scan``, ``tags`` (of the anatomy, for the file names),
@@ -225,14 +250,25 @@ def ground_truth(scan, thickness=0, atrophy=None, clean=True, template_dir=None,
     if seg is None:
         if verbose:
             print("Ground truth: segmentation of the scan", flush=True)
-        seg = frontend.segment(scan, template_dir=template_dir, verbose=False, deformation=True)
+        seg = frontend.segment(scan, template_dir=template_dir, verbose=False, deformation=True, space=space)
+    space = seg.get("space", "template")                # a result without it is one of the working grid
     affine = np.asarray(seg["grid"].affine, dtype=np.float64)
+    world = seg.get("world")
+    if space == "scan":
+        to_scan, template_affine = affine, np.asarray(seg["template_affine"], dtype=np.float64)
+    else:
+        to_scan = None if world is None else np.linalg.inv(np.asarray(world, dtype=np.float64)) @ affine
+        template_affine = affine
+    template_grid = seg.get("template_grid")
+    if template_grid is None and space == "template":
+        template_grid = {"shape": tuple(seg["label"].shape), "affine": affine}     # the grid of the anatomy itself
     image_fractions, label, corrected = seg["fractions"], seg["label"], seg["corrected"]
     means = dict(seg["means"])
     voxel_ml = float(np.prod(grid_voxel_size(affine))) / 1000
-    parameters, tags = {}, ""
+    parameters, tags = {"AnatomySpace": space}, ""
     if "world" in seg:
-        # the affine registration scales the head: volumes here, over volumes in the scan
+        # the affine registration scales the head: volumes in template space over those in the scan,
+        # whichever space the anatomy is made in
         parameters["AffineVolumeScaling"] = round(float(abs(np.linalg.det(np.asarray(seg["world"])[:3, :3]))), 4)
     regions = None
     if thick.any() or clean:
@@ -251,7 +287,7 @@ def ground_truth(scan, thickness=0, atrophy=None, clean=True, template_dir=None,
     if clean:
         if verbose:
             print("Ground truth: cleanup", flush=True)
-        masks = cleanup.detect(label, seg["normalised"], affine, regions, **clean)
+        masks = cleanup.detect(label, seg["normalised"], affine, regions, template_affine=template_affine, **clean)
         if rebuilt is not None:
             # The rebuilt cortex holds no vessel and no dura, its mixtures
             # are those of its two neighbours, and it does not follow the
@@ -282,13 +318,15 @@ def ground_truth(scan, thickness=0, atrophy=None, clean=True, template_dir=None,
         parameters["Atrophy"] = done
 
     parameters["TissueIntensities"] = {k: round(float(v), 3) for k, v in means.items()}
-    settings = {"Thickness": thick.tolist() if thick.any() else None,
+    settings = {"Space": space, "Thickness": thick.tolist() if thick.any() else None,
                 "Atrophy": [{**item, "atlas": str(item["atlas"])} for item in atrophies],
                 "Cleanup": clean}
     out = {
         "fractions": fractions, "label": label, "image_fractions": image_fractions,
         "corrected": corrected, "ideal": synthesis.render(image_fractions, means, corrected),
-        "means": means, "affine": affine, "iy": seg["iy"], "template_mat": seg["template_mat"],
+        "means": means, "space": space, "affine": affine, "to_scan": to_scan,
+        "template_affine": template_affine, "template_grid": template_grid,
+        "iy": seg["iy"], "template_mat": seg["template_mat"],
         "scan": str(scan) if scan is not None else "", "tags": bids.label(tags),
         "settings": settings, "cleaned": bool(clean), "parameters": parameters,
         "scan_image": seg.get("scan"), "world": seg.get("world"),
@@ -385,26 +423,26 @@ def _local_gain(reference: np.ndarray, raw: np.ndarray, valid: np.ndarray, voxel
                                     order=1, mode="nearest")
 
 
-def _on_the_scan(truth: dict, image: np.ndarray, affine: np.ndarray, resolution, contrast: float,
-                 white: float, bias) -> tuple:
-    """Acquire an image of the working grid on the grid of the scan.
+def _onto_scan(truth: dict, image: np.ndarray, resolution, contrast: float, white: float, bias) -> tuple:
+    """Acquire an image of the anatomy on the grid of the scan.
 
-    Inside the working grid the image is acquired as on any other grid: its
-    k-space is cut to that of the scan, and it is read at the voxel centres
-    of the scan.  A scan usually shows more than the working grid holds, the
+    Inside the grid of the anatomy the image is acquired as on any other
+    grid: its k-space is cut to that of the scan, and it is read at the voxel
+    centres of the scan.  A scan usually shows more than that grid holds, the
     neck and more air.  There the image is the denoised scan itself, brought
     to the intensities of the bias-corrected scan next to it and given the
     contrast and the bias field of the simulation; the two are blended over
-    3 mm at the border of the working grid.
+    3 mm at the faces of the grid of the anatomy that the scan reaches
+    beyond, and nowhere else.
 
     Returns:
         ``(image, acquisition, bias)``: the image on the grid of the scan,
-        the :class:`t1sim.artefacts.ObliqueAcquisition` that made it, with
-        the affine of the scan in its own world as ``scan_affine``, and the
-        bias field on that grid (or None).
+        the :class:`t1sim.artefacts.ObliqueAcquisition` that made it, whose
+        ``affine`` is that of the grid of the scan in its millimetres, and
+        the bias field on that grid (or None).
     """
     scan = truth.get("scan_image")
-    if scan is None or truth.get("world") is None:
+    if scan is None or truth.get("to_scan") is None:
         raise ValueError("the grid of the scan needs the scan: make the ground truth from a result of "
                          "frontend.segment that holds 'scan' and 'world', or ask for grid='working'")
     shape, scan_affine = tuple(scan.shape[:3]), np.asarray(scan.affine, dtype=np.float64)
@@ -413,12 +451,11 @@ def _on_the_scan(truth: dict, image: np.ndarray, affine: np.ndarray, resolution,
         # another voxel size on the axes and in the field of view of the scan
         coarser = artefacts.Acquisition(shape, scan_affine, resolution)
         shape, scan_affine, rest = coarser.shape, coarser.affine, np.maximum(coarser.acquire(rest), 0)
-    acquisition = artefacts.ObliqueAcquisition(image.shape, affine, shape, np.asarray(truth["world"]) @ scan_affine)
-    acquisition.scan_affine = scan_affine
+    acquisition = artefacts.ObliqueAcquisition(image.shape, truth["to_scan"], shape, scan_affine)
     # the cut of k-space and the spline both swing below 0 next to an edge: a magnitude image does not
     image = np.maximum(acquisition.acquire(image), 0)
     if bias is not None:
-        bias = acquisition.sample(bias, extend=True)        # beyond the working grid: its nearest value
+        bias = acquisition.sample(bias, extend=True)        # beyond the grid of the anatomy: its nearest value
 
     weight = acquisition.coverage(ramp=6.0)
     if float(weight.min()) < 1:
@@ -431,6 +468,28 @@ def _on_the_scan(truth: dict, image: np.ndarray, affine: np.ndarray, resolution,
             rest *= bias
         image = weight * image + (1 - weight) * rest
     return image, acquisition, bias
+
+
+def _averaged(truth: dict, acquisition, fractions: np.ndarray, jacobian) -> tuple:
+    """The ground truth on the grid of an acquisition: its fractions averaged over every voxel of it.
+
+    The same for every image on that grid, and the most expensive part of an
+    acquisition there: it is kept with the ground truth, under the geometry
+    of both grids, and as long as it is still made from these arrays.  A
+    copy of the dict shares what is kept, so neither may be left out.
+
+    Returns:
+        ``(fractions, label, jacobian)`` on the grid of *acquisition*.
+    """
+    key = (acquisition.fine_shape, np.round(acquisition.fine_affine, 9).tobytes(), acquisition.shape,
+           np.round(acquisition.affine, 9).tobytes())
+    kept = truth.setdefault("_averaged", {})
+    if key not in kept or kept[key][0] is not fractions or kept[key][1] is not jacobian:
+        averaged = acquisition.average(fractions)
+        kept[key] = (fractions, jacobian, averaged, frontend.label_from_fractions(averaged),
+                     # nothing is deformed beyond the grid of the anatomy
+                     None if jacobian is None else acquisition.average(jacobian - 1) + 1)
+    return kept[key][2:]
 
 
 def acquire(truth: dict, snr: float = 40.0, noise_percent: float = 0.0, bias_percent: float = 30.0,
@@ -469,13 +528,16 @@ def acquire(truth: dict, snr: float = 40.0, noise_percent: float = 0.0, bias_per
             (:func:`t1sim.artefacts.change_contrast`): white matter keeps
             its intensity, and the ratio of two tissue intensities is raised
             to it.  1 leaves the contrast.
-        resolution: Voxel size of the acquisition in mm, one value or three.
-            None: that of the grid.  With ``grid="scan"`` the millimetres
-            are those of the scan, along its axes and in its field of view.
-        upsample: Bring the acquired image back onto the grid, so the image
-            and the ground truth both have the voxel size of the grid.
-            False: the ground truth is averaged to the voxels of the
-            acquisition.  Not with ``grid="scan"``.
+        resolution: Voxel size of the acquisition in mm, one value or three,
+            along the axes of the grid the image is written on: with
+            ``grid="scan"`` the axes of the scan in the order it is stored
+            in, in its millimetres and its field of view; on the other grids
+            their axes in RAS order.  None: that of the grid.
+        upsample: With a *resolution* on a grid other than that of the scan:
+            bring the acquired image back onto the 0.5 mm grid, where the
+            ground truth stays.  False: the ground truth is averaged to the
+            voxels of the acquisition.  Without a *resolution* it does
+            nothing.  Not with ``grid="scan"``.
         motion, ringing: Movement artefacts and ringing: a severity or a
             dict (:mod:`t1sim.kspace`); 0 for none.
         seed: Seed of the noise and of the movement.  None: derived from
@@ -484,10 +546,10 @@ def acquire(truth: dict, snr: float = 40.0, noise_percent: float = 0.0, bias_per
             run.  A number gives every scan the same noise pattern, which is
             useful for a comparison and harmful in training data.
         grid: ``"scan"`` for the grid of the scan, in the world of the scan
-            (the default); ``"working"`` for the 0.5 mm grid in template
-            space the anatomy is made on; or ``"deepmriprep"`` for the 336 x
-            384 x 336 voxels of that grid its networks are trained on (see
-            the module notes).
+            (the default); ``"anatomy"`` for the 0.5 mm grid the anatomy is
+            made on; ``"working"`` for T1Prep's 0.5 mm grid in template space;
+            or ``"deepmriprep"`` for the 336 x 384 x 336 voxels of that grid
+            its networks are trained on (see the module notes).
 
     Returns:
         A dict: ``image``; ``label`` and ``fractions`` ((X, Y, Z, 3): CSF,
@@ -496,31 +558,49 @@ def acquire(truth: dict, snr: float = 40.0, noise_percent: float = 0.0, bias_per
         atrophy, on that grid, or None); ``tags`` (of the acquisition) and
         ``parameters`` (for the sidecar).
     """
-    if grid not in ("working", "deepmriprep", "scan"):
-        raise ValueError("grid is 'working', 'deepmriprep' or 'scan'")
+    if grid not in GRIDS:
+        raise ValueError(f"grid is one of {', '.join(map(repr, GRIDS))}")
     if grid == "scan" and upsample:
         raise ValueError("upsample brings the image back onto the 0.5 mm grid of the ground truth; "
                          "on the grid of the scan the ground truth has the voxels of the image")
+    # without another voxel size there is nothing to bring back, and the name and the noise stay those without it
+    upsample = bool(upsample) and resolution is not None
     if snr < 0 or noise_percent < 0:
         raise ValueError("snr and noise_percent cannot be negative")
     if not contrast > 0:
         raise ValueError("contrast is the exponent of a power law and has to be positive")
+    space = truth.get("space", "template")
     affine = truth["affine"]
     image, label, fractions = truth["ideal"], truth["label"], truth["fractions"]
     image_fractions, corrected = truth["image_fractions"], truth["corrected"]
     iy, jacobian = truth["iy"], truth.get("jacobian")
-    if grid == "deepmriprep":
-        if image.shape != (339, 411, 339):
-            raise ValueError(f"the deepmriprep grid is cut from the 339 x 411 x 339 grid, not {image.shape}")
-        crop = DEEPMRIPREP_CROP
-        image, label, fractions, iy = image[crop], label[crop], fractions[crop], iy[crop]
-        image_fractions, corrected = image_fractions[crop], corrected[crop]
-        jacobian = None if jacobian is None else jacobian[crop]
-        affine = _crop_affine(affine, crop)
+    target = None                                       # a grid in template space the anatomy is not made on
+    if grid == "anatomy" or (grid != "scan" and space == "template"):
+        if grid == "deepmriprep":
+            if image.shape != (339, 411, 339):
+                raise ValueError(f"the deepmriprep grid is cut from the 339 x 411 x 339 grid, not {image.shape}")
+            crop = DEEPMRIPREP_CROP
+            image, label, fractions, iy = image[crop], label[crop], fractions[crop], iy[crop]
+            image_fractions, corrected = image_fractions[crop], corrected[crop]
+            jacobian = None if jacobian is None else jacobian[crop]
+            affine = _crop_affine(affine, crop)
+    elif grid != "scan":
+        working = truth.get("template_grid")
+        if working is None:
+            raise ValueError("an image in template space of an anatomy made on the scan needs T1Prep's working "
+                             "grid: make the ground truth from a result of frontend.segment that holds "
+                             "'template_grid'")
+        target = (tuple(working["shape"]), np.asarray(working["affine"], dtype=np.float64))
+        if grid == "deepmriprep":
+            if target[0] != (339, 411, 339):
+                raise ValueError(f"the deepmriprep grid is cut from the 339 x 411 x 339 grid, not {target[0]}")
+            target = (tuple(len(range(*c.indices(n))) for c, n in zip(DEEPMRIPREP_CROP, target[0])),
+                      _crop_affine(target[1], DEEPMRIPREP_CROP))
     voxel = grid_voxel_size(affine)
     scan_id = _scan_id(truth["scan"])
     white = float(truth["means"]["WM"])
-    parameters = {"Grid": grid, "Space": "scan" if grid == "scan" else bids.SPACE}
+    in_scan = grid == "scan" or (grid == "anatomy" and space == "scan")
+    parameters = {"Grid": grid, "Space": "scan" if in_scan else bids.SPACE, "AnatomySpace": space}
     # The parts of the desc label.  They are joined in the order of
     # mri_simulate.m, which is not the order of the steps.
     tag = dict.fromkeys(("noise", "bias", "acquisition", "contrast", "kspace", "seed"), "")
@@ -548,22 +628,32 @@ def acquire(truth: dict, snr: float = 40.0, noise_percent: float = 0.0, bias_per
         parameters.update(described)
         image = image * bias                            # the field has a mean of 1
 
-    acquisition = None
+    acquisition = fine = back = None             # back: what brings the image onto the 0.5 mm grid again
     if grid == "scan":
-        image, acquisition, bias = _on_the_scan(truth, image, affine, resolution, contrast, white, bias)
-        # The ground truth on that grid is the same for every image of it, and
-        # the most expensive part: it is kept with the ground truth
-        kept = truth.setdefault("_on_the_scan", {})
-        key = None if resolution is None else tuple(np.atleast_1d(resolution).astype(float).tolist())
-        # ... as long as it is still made from these arrays: a copy of the dict shares what is kept
-        if key not in kept or kept[key][0] is not fractions or kept[key][1] is not jacobian:
-            averaged = acquisition.average(fractions)
-            kept[key] = (fractions, jacobian, averaged, frontend.label_from_fractions(averaged),
-                         # nothing is deformed beyond the working grid
-                         None if jacobian is None else acquisition.average(jacobian - 1) + 1)
-        fractions, label, jacobian = kept[key][2:]
+        image, acquisition, bias = _onto_scan(truth, image, resolution, contrast, white, bias)
+        fractions, label, jacobian = _averaged(truth, acquisition, fractions, jacobian)
         if resolution is not None:
-            parameters["AcquisitionVoxelSize"] = grid_voxel_size(acquisition.scan_affine).tolist()
+            parameters["AcquisitionVoxelSize"] = grid_voxel_size(acquisition.affine).tolist()
+    elif target is not None:
+        # An anatomy made on the scan, an image in template space: every
+        # voxel of it is a parallelepiped in the grid of the anatomy
+        fine = artefacts.ObliqueAcquisition(image.shape, truth["template_affine"], *target)
+        lattice = target
+        if resolution is not None:
+            coarser = artefacts.Acquisition(*target, resolution)
+            lattice = (coarser.shape, coarser.affine)
+            parameters["AcquisitionVoxelSize"] = coarser.voxel.tolist()
+            if upsample:
+                sizes = coarser.voxel if np.ptp(coarser.voxel) > 1e-6 else coarser.voxel[:1]
+                tag["acquisition"] = "Acq" + "x".join(bids.number(round(v, 2)) for v in sizes) + "mm"
+        acquisition = artefacts.ObliqueAcquisition(image.shape, truth["template_affine"], *lattice)
+        image = np.maximum(acquisition.acquire(image), 0)
+        truth_on = fine if upsample else acquisition
+        fractions, label, jacobian = _averaged(truth, truth_on, fractions, jacobian)
+        if bias is not None:
+            bias = truth_on.sample(bias, extend=True)
+        if upsample:
+            back = coarser.to_fine
     elif resolution is not None:
         acquisition = artefacts.Acquisition(image.shape, affine, resolution)
         image = np.maximum(acquisition.acquire(image), 0)     # as on the grid of the scan: nothing below 0
@@ -571,16 +661,14 @@ def acquire(truth: dict, snr: float = 40.0, noise_percent: float = 0.0, bias_per
         if upsample:
             sizes = acquisition.voxel if np.ptp(acquisition.voxel) > 1e-6 else acquisition.voxel[:1]
             tag["acquisition"] = "Acq" + "x".join(bids.number(round(v, 2)) for v in sizes) + "mm"
+            back = acquisition.to_fine
         else:
             label, fractions = acquisition.average(label), acquisition.average(fractions)
             if bias is not None:
                 bias = acquisition.average(bias)
             if jacobian is not None:
                 jacobian = acquisition.average(jacobian)
-    if grid == "scan":
-        acquired_affine = acquisition.scan_affine           # from here on in the millimetres of the scan
-    else:
-        acquired_affine = acquisition.affine if acquisition is not None else affine
+    acquired_affine = acquisition.affine if acquisition is not None else affine
 
     derived = seed is None
     if derived:
@@ -610,9 +698,9 @@ def acquire(truth: dict, snr: float = 40.0, noise_percent: float = 0.0, bias_per
     image = artefacts.add_noise(image, sigma, rician=snr > 0, seed=np.random.default_rng(noise_seed))
 
     out_affine = acquired_affine
-    if acquisition is not None and upsample:
-        image = np.maximum(acquisition.to_fine(image), 0)
-        out_affine = affine
+    if back is not None:
+        image = np.maximum(back(image), 0)
+        out_affine = target[1] if target is not None else affine
     parameters["VoxelSize"] = [round(float(v), 4) for v in grid_voxel_size(out_affine)]
     return {"image": image.astype(np.float32, copy=False), "label": label, "fractions": fractions,
             "affine": out_affine, "bias": bias, "jacobian": jacobian,
@@ -673,14 +761,15 @@ def write(truth: dict, acquired: dict, out_dir=None, derivatives: bool = True,
         folder, pipeline, source = Path(out_dir), None, ""
     ext = ".nii.gz" if compress else ".nii"
     affine = acquired["affine"]
-    on_scan = acquired["parameters"]["Grid"] == "scan"
+    on_scan = acquired["parameters"].get("Space", "scan" if acquired["parameters"]["Grid"] == "scan"
+                                          else bids.SPACE) == "scan"
     if on_scan:
-        # as mri_simulate.m names what stays on the grid of the scan: no space, and a
+        # as mri_simulate.m names what stays in the space of the scan: no space, and a
         # resolution only if it is not that of the scan
         base = bids.prefix(scan)
-        if "AcquisitionVoxelSize" in acquired["parameters"]:
+        if "AcquisitionVoxelSize" in acquired["parameters"] or acquired["parameters"]["Grid"] != "scan":
             base += f"_{bids.resolution_entity(grid_voxel_size(affine))}"
-        code = 1 if truth.get("scan_image") is None else int(truth["scan_image"].header["sform_code"]) or 1
+        code = 1 if truth.get("scan_image") is None else frontend.world_code(truth["scan_image"])
     else:
         base = f"{bids.prefix(scan)}_space-{bids.SPACE}_{bids.resolution_entity(grid_voxel_size(affine))}"
         code = bids.TEMPLATE_CODE
@@ -735,14 +824,14 @@ def write(truth: dict, acquired: dict, out_dir=None, derivatives: bool = True,
 
 def simulate(scan, out_dir=None, derivatives: bool = True, thickness=0, atrophy=None, clean=True,
              template_dir=None, truth: dict = None, save_bias: bool = False, save_jacobian: bool = True,
-             compress: bool = True, verbose: bool = False, **acquisition) -> dict:
+             compress: bool = True, verbose: bool = False, space: str = "scan", **acquisition) -> dict:
     """Simulate one image of a scan and write it with its ground truth.
 
     Args:
         scan: The T1w scan, a file.
         out_dir, derivatives, save_bias, save_jacobian, compress: See
             :func:`write`.
-        thickness, atrophy, clean, template_dir: See :func:`ground_truth`.
+        thickness, atrophy, clean, template_dir, space: See :func:`ground_truth`.
         truth: A result of :func:`ground_truth` for this scan, to make
             another acquisition of the same anatomy without running the
             front end again.  *thickness*, *atrophy* and *clean* are then
@@ -756,7 +845,7 @@ def simulate(scan, out_dir=None, derivatives: bool = True, thickness=0, atrophy=
     """
     if truth is None:
         truth = ground_truth(scan, thickness=thickness, atrophy=atrophy, clean=clean,
-                             template_dir=template_dir, verbose=verbose)
+                             template_dir=template_dir, verbose=verbose, space=space)
     if verbose:
         print("Acquisition", flush=True)
     acquired = acquire(truth, **acquisition)
@@ -791,13 +880,16 @@ def main(argv=None) -> int:
     out = parser.add_argument_group("output")
     out.add_argument("--out-dir", help="folder of the outputs (default: derivatives/t1sim-<version>)")
     out.add_argument("--no-derivatives", action="store_true", help="write next to the scan")
-    out.add_argument("--grid", choices=("scan", "working", "deepmriprep"), default="scan",
-                     help="output grid: that of the scan (default); the 0.5 mm working grid in template "
-                          "space; or the 336x384x336 part of it deepmriprep trains on")
+    out.add_argument("--grid", choices=GRIDS, default="scan",
+                     help="output grid: that of the scan (default); the 0.5 mm grid of the anatomy; the 0.5 mm "
+                          "working grid in template space; or the 336x384x336 part of it deepmriprep trains on")
     out.add_argument("--save-bias", action="store_true", help="also write the bias field")
     anat = parser.add_argument_group("anatomy")
+    anat.add_argument("--space", choices=("scan", "template"), default="scan",
+                      help="where the anatomy is made and its millimetres are measured: on the scan at 0.5 mm "
+                           "(default), or on the 0.5 mm grid in template space")
     anat.add_argument("--thickness", type=float, nargs="+", default=[0],
-                      help="cortical thickness in mm: one value, or three (occipital, rest, frontal)")
+                      help="cortical thickness in mm of the --space: one value, or three (occipital, rest, frontal)")
     anat.add_argument("--atrophy", nargs=3, action="append", metavar=("ATLAS", "REGION", "CHANGE"),
                       help="atrophy of a region, e.g. Hammers 28 -0.1; can be given several times")
     anat.add_argument("--atrophy-mode", choices=("thinning", "volume"), default="thinning")
@@ -831,7 +923,7 @@ def main(argv=None) -> int:
     thickness = args.thickness[0] if len(args.thickness) == 1 else tuple(args.thickness)
     for scan in args.scans:
         truth = ground_truth(scan, thickness=thickness, atrophy=atrophy, clean=not args.no_clean,
-                             verbose=args.verbose)
+                             verbose=args.verbose, space=args.space)
         for snr in args.snr:
             for seed in args.seed:
                 result = simulate(scan, out_dir=args.out_dir, derivatives=not args.no_derivatives,

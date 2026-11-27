@@ -404,6 +404,33 @@ class Acquisition:
                                         output_shape=self.fine_shape, order=3, mode="nearest")
 
 
+def _box_counts(linear: np.ndarray) -> np.ndarray:
+    """Into how many slices a new voxel is cut along each of its axes, for :meth:`ObliqueAcquisition.average`.
+
+    One box on a grid along the axes of the fine one, where it is exact;
+    otherwise 2 or 3 slices along every axis, the more the further the
+    grids are turned against each other, and along a longer axis of the
+    voxel as many more as it is longer, so that the slices stay near cubes.
+
+    Args:
+        linear: (3, 3) the new grid in the fine one: column j is axis j of
+            a new voxel, in fine voxels.
+    """
+    rows = np.sqrt((linear ** 2).sum(1))
+    # how far a fine axis is from the new axis next to it: 0 on a grid along the axes
+    turned = float(1 - (np.abs(linear).max(1) / rows).min())
+    if turned < 1e-9:
+        return np.ones(3, dtype=int)
+    per_axis = 2 if turned < 0.06 else 3
+    lengths = np.sqrt((linear ** 2).sum(0))
+    return per_axis * np.maximum(1, np.round(lengths / lengths.min())).astype(int)
+
+
+#: How far, in fine voxels, a new voxel centre may lie beyond a face of the
+#: fine grid and still count as inside: the rounding of two affines.
+FACE_TOLERANCE = 1e-3
+
+
 class ObliqueAcquisition:
     """The grid of an acquisition that lies anywhere in the world of the image.
 
@@ -452,8 +479,9 @@ class ObliqueAcquisition:
         f`` cycles per new voxel.  What exceeds half a cycle along one of the
         three axes of the new lattice lies outside its k-space and is
         removed; the band-limited image is then read at the new voxel centres
-        by cubic B-spline interpolation.  Beyond the fine grid the image is
-        0; within :meth:`coverage` of its border it is not to be trusted.
+        by cubic B-spline interpolation.  A new voxel whose centre lies
+        beyond a face of the fine grid is 0; within :meth:`coverage` of such a
+        face the image is not to be trusted.
         """
         image = self._check(image)
         if image.ndim != 3:
@@ -495,28 +523,40 @@ class ObliqueAcquisition:
         :meth:`Acquisition.average`: the map is taken as constant within a
         fine voxel, which is what a fraction of that voxel is.
 
-        The parallelepiped is covered with small boxes along the axes of the
-        fine grid, 1, 8 or 27 of them, the more the further the two grids are
-        turned against each other, and the mean over each box is exact: the
+        The parallelepiped is cut into slices along its own axes, and every
+        slice is covered with a box along the axes of the fine grid that has
+        its spread along each of them; the mean over a box is exact: the
         integral of a map that is constant within its voxels is the linear
-        interpolation of its running sums.  On a grid along the axes the
-        boxes are the new voxel and the result is that of
-        :meth:`Acquisition.average`.  Otherwise the boxes fit the voxel only
-        roughly, which was measured on a ball whose boundaries are one fine
-        voxel wide, with new voxels of 1.7 fine voxels:
+        interpolation of its running sums.  On a grid along the axes the one
+        box is the new voxel and the result is that of
+        :meth:`Acquisition.average`.  Otherwise there are 2 or 3 slices along
+        every axis, the more the further the grids are turned against each
+        other, and along a longer axis of the voxel as many more as it is
+        longer (:func:`_box_counts`).  The boxes fit the slices only roughly,
+        which was measured on a shell whose boundaries are one fine voxel
+        wide, against the same boxes with 16 to 20 slices along every axis,
+        which have converged to 0.0005 (6 to 8 slices for the long voxels,
+        to 0.0015):
 
-        ================  =====  ====================  ====================
-        Grids turned by   Boxes  Largest error         RMS at the boundary
-        ================  =====  ====================  ====================
-        1 degree          8      0.0006 (to 27 boxes)  -
-        6 to 11 degrees   8      0.005                 0.0015
-        17 to 29 degrees  27     0.006                 0.0012
-        ================  =====  ====================  ====================
+        =======================  =========  =====  =============  =======
+        New voxels               Turned by  Boxes  Largest error  RMS at
+                                                                  boundary
+        =======================  =========  =====  =============  =======
+        1.7 fine voxels          1 degree   8      0.0004         0.0001
+        1.7 fine voxels          6          8      0.003          0.0006
+        1.7 fine voxels          11         8      0.005          0.0011
+        1.7 fine voxels          17         8      0.009          0.0021
+        1.7 fine voxels          25 to 29   27     0.010          0.0024
+        2 x 2 x 6 fine voxels    25         81     0.002          0.0007
+        1 x 1 x 4 fine voxels    25 and 15  108    0.001          0.0003
+        =======================  =========  =====  =============  =======
 
-        Counting the fine voxel at points inside the new voxel, the obvious
-        way, needs 40 points per axis to come as close for the grid turned by
-        1 degree: the points fall in step with the fine grid.  A last axis
-        of classes is kept; beyond the fine grid the map is 0.
+        With the same number of slices along every axis, the last two were
+        0.019 and 0.037 off.  Counting the fine voxel at points inside the
+        new voxel, the obvious way, needs 40 points per axis to come as close
+        for the grid turned by 1 degree: the points fall in step with the
+        fine grid.  A last axis of classes is kept; beyond the fine grid the
+        map is 0.
         """
         volume = self._check(volume)
         classes = volume.ndim == 4
@@ -537,15 +577,14 @@ class ObliqueAcquisition:
             return np.ascontiguousarray(np.moveaxis(out, 0, -1)) if classes else out[0]
         box = (slice(None),) + tuple(slice(a, b) for a, b in zip(low, high))
 
-        # how far a fine axis is from the new axis next to it: 0 on a grid along the axes
-        rows = np.sqrt((self.linear ** 2).sum(1))
-        turned = float(1 - (np.abs(self.linear).max(1) / rows).min())
-        per_axis = 1 if turned < 1e-9 else (2 if turned < 0.06 else 3)
-        half = rows / (2 * per_axis)                                  # of a small box, in fine voxels
-        steps = (np.arange(per_axis) + 0.5) / per_axis - 0.5
+        # the new voxel cut into counts[j] slices along its axis j, each covered by a box along the
+        # fine axes with the spread of the slice along every fine axis (half-widths in fine voxels)
+        counts = _box_counts(self.linear)
+        half = 0.5 * np.sqrt(((self.linear / counts) ** 2).sum(1))
+        steps = [(np.arange(n) + 0.5) / n - 0.5 for n in counts]
         calls = [(self.offset + self.linear @ (low + np.array(step)) - first + 0.5 + np.array(signs) * half,
                   float(np.prod(signs)))
-                 for step in itertools.product(steps, repeat=3) for signs in itertools.product((-1, 1), repeat=3)]
+                 for step in itertools.product(*steps) for signs in itertools.product((-1, 1), repeat=3)]
 
         for channel, values in enumerate(stack):
             # running sums along the three axes, at the corners of the fine voxels
@@ -566,7 +605,7 @@ class ObliqueAcquisition:
             with ThreadPoolExecutor(workers) as pool:
                 for result in pool.map(part, [calls[n::workers] for n in range(workers)]):
                     total += result
-            mean = total / (per_axis ** 3 * np.prod(2 * half))
+            mean = total / (np.prod(counts) * np.prod(2 * half))
             mean[np.abs(mean) < 1e-7] = 0.0             # what the rounding of the sums leaves of nothing
             out[(channel,) + box[1:]] = mean
         return np.ascontiguousarray(np.moveaxis(out, 0, -1)) if classes else out[0]
@@ -574,13 +613,21 @@ class ObliqueAcquisition:
     def coverage(self, ramp: float = 6.0) -> np.ndarray:
         """How far every new voxel lies inside the fine grid.
 
+        It falls only towards the faces of the fine grid that the centre of
+        a new voxel lies beyond, by more than a thousandth of a fine voxel:
+        where the new grid ends at a face of the fine one or before it, as at
+        the faces of the field of view of a scan that the grid of the
+        anatomy reaches, there is nothing to make room for.  A face is the
+        outer face of the outermost fine voxels, half a voxel beyond their
+        centres.
+
         Args:
             ramp: Width in fine voxels of the border in which the result
                 falls from 1 to 0.
 
         Returns:
             (X, Y, Z) float32 on the grid of the acquisition: 1 inside the
-            fine grid, 0 at its border and beyond.
+            fine grid, 0 at a face with new voxels beyond it, and beyond.
         """
         index = [np.arange(n, dtype=np.float32).reshape([-1 if a == axis else 1 for a in range(3)])
                  for axis, n in enumerate(self.shape)]
@@ -588,6 +635,10 @@ class ObliqueAcquisition:
         for axis, size in enumerate(self.fine_shape):
             position = sum(np.float32(self.linear[axis, new]) * index[new] for new in range(3))
             position = position + np.float32(self.offset[axis])
-            inside = np.minimum(position, np.float32(size - 1) - position) / np.float32(ramp)
+            # the faces of the fine grid; a face is only a border where new voxels lie beyond it
+            lower, upper = np.float32(-0.5), np.float32(size - 0.5)
+            below = position - lower if float(position.min()) < lower - FACE_TOLERANCE else np.float32(np.inf)
+            above = upper - position if float(position.max()) > upper + FACE_TOLERANCE else np.float32(np.inf)
+            inside = np.minimum(below, above) / np.float32(ramp)
             np.minimum(weight, np.clip(inside, 0, 1), out=weight)
         return weight

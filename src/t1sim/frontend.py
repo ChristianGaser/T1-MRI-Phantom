@@ -7,16 +7,26 @@ unified segmentation in place of SPM's:
 2. unified segmentation with the six-class shooting templates
    (``t1prep.unified_seg.segment``, i.e. ``cat_surf.vol_unified_seg``), which
    gives the affine to the template, the bias-corrected image, the brain mask
-   and a first label map on T1Prep's 0.5 mm working grid;
+   and a first label map on a grid of 0.5 mm voxels;
 3. LAS, the local intensity normalisation (``t1prep.apply_LAS``), which maps
    the corrected brain onto the scale CSF = 1, GM = 2, WM = 3.
+
+**The grid.**  By default (``space="scan"``) that grid is the scan itself,
+cut into voxels of 0.5 mm along its own axes: the anatomy keeps the size and
+the orientation of the subject, every length t1sim is given (a cortical
+thickness, the reach of an atrophy) is one of the scan, and an image is
+brought back onto the grid of the scan by a resampling along its own axes.
+The grid covers the part of the scan T1Prep's working grid covers, where the
+templates of the segmentation are.  ``space="template"`` makes the anatomy on
+T1Prep's working grid instead, which is affinely registered to
+MNI152NLin2009cAsym and scales the head to the template.
 
 The label map is that normalised image, and the tissue fractions are its
 triangular decomposition, as in the MATLAB version: the ground truth is a
 function of the image it was made from and of nothing else.  No second
 segmentation (AMAP, a network) takes part.
 
-Everything is returned on the RAS-ordered working grid.  The intensities of
+Everything is returned on that grid, in RAS order.  The intensities of
 the three tissues, which the synthesis needs, are those of the mixture of
 Gaussians the segmentation estimated; they are not fitted a second time.
 
@@ -36,6 +46,7 @@ pull that anchor down.
 from __future__ import annotations
 
 import inspect
+import itertools
 import os
 
 import nibabel as nib
@@ -49,6 +60,68 @@ TISSUES = ("CSF", "GM", "WM")
 #: Lowest value of the normalised image inside the brain.  0 is what lies
 #: outside of it, and has no fractions.
 DARKEST = 0.01
+
+#: Voxel size in mm of the grid the anatomy is made on.
+VOXEL = 0.5
+
+#: Voxels of that grid kept beyond the part of the scan the working grid covers.
+MARGIN = 4
+
+#: The spaces the anatomy can be made in.
+SPACES = ("scan", "template")
+
+
+def scan_grid(image_affine, image_shape, cover_affine, cover_shape, world, voxel: float = VOXEL) -> tuple:
+    """The grid of the scan at *voxel* mm, along its own axes and in its own millimetres.
+
+    The fine voxels start at the first face of the field of view of the
+    scan, so a scan voxel whose size is a whole multiple of *voxel* is a
+    whole number of fine voxels.  They cover the part of the scan that the
+    working grid of T1Prep covers, and :data:`MARGIN` voxels more: beyond it
+    the segmentation has no templates.  A header whose axes are not at right
+    angles gets a grid that is, through the same first fine voxel; its
+    extent is measured along its own axes, so it still holds all that the
+    working grid covers of the field of view.
+
+    Args:
+        image_affine, image_shape: The scan in RAS order.
+        cover_affine, cover_shape: The working grid, in template millimetres.
+        world: Scan millimetres to template millimetres.
+        voxel: Voxel size of the grid in mm.
+
+    Returns:
+        ``(affine, shape)``: the voxel-to-world matrix of the grid, in the
+        millimetres of the scan, and its shape.
+    """
+    mat = np.asarray(image_affine, dtype=np.float64)
+    zooms = np.sqrt((mat[:3, :3] ** 2).sum(0))
+    step = voxel / zooms                                  # scan voxels per fine voxel
+    linear = mat[:3, :3] @ np.diag(step)                  # a fine voxel along the axes of the scan, in mm
+    u, _, vt = np.linalg.svd(linear / voxel)
+    if not np.allclose(u @ vt, linear / voxel, atol=1e-6):
+        linear = (u @ vt) * voxel                         # sheared: at right angles
+    base = np.eye(4)                                      # the first fine voxel at the first corner of the scan
+    base[:3, :3] = linear
+    base[:3, 3] = (mat @ np.append(-0.5 + 0.5 * step, 1.0))[:3]
+    to_base = np.linalg.inv(base)
+
+    def faces(to_mm, shape):
+        """The corners of a grid, as faces of the fine voxels: 0 is the first face, n the face after voxel n-1."""
+        corners = np.array(list(itertools.product(*[(-0.5, n - 0.5) for n in shape[:3]])))
+        return (to_base @ to_mm @ np.c_[corners, np.ones(len(corners))].T).T[:, :3] + 0.5
+
+    view = faces(mat, image_shape)
+    covered = faces(np.linalg.inv(np.asarray(world, dtype=np.float64)) @ np.asarray(cover_affine, dtype=np.float64),
+                    cover_shape)
+    low = np.maximum(covered.min(0), view.min(0))
+    high = np.minimum(covered.max(0), view.max(0))
+    if np.any(high <= low):
+        raise ValueError("the scan does not overlap the working grid: is the registration right?")
+    first = np.maximum(np.floor(low).astype(int) - MARGIN, np.floor(view.min(0) + 1e-6).astype(int))
+    last = np.minimum(np.ceil(high).astype(int) + MARGIN, np.ceil(view.max(0) - 1e-6).astype(int))
+    affine = base.copy()
+    affine[:3, 3] = base[:3, 3] + linear @ first
+    return affine, tuple(int(n) for n in last - first)
 
 
 def _t1prep():
@@ -80,12 +153,33 @@ def _in_storage_order(data: np.ndarray, affine: np.ndarray, stored) -> nib.Nifti
             taken.
 
     Returns:
-        The volume with the axes and directions of *stored*.
+        The volume with the axes and directions of *stored*, and the NIfTI
+        code of the world its affine maps to (:func:`world_code`).
     """
     there = nib.orientations.io_orientation(stored.affine)
     here = nib.orientations.io_orientation(affine)
     data = nib.orientations.apply_orientation(data, nib.orientations.ornt_transform(here, there))
-    return nib.Nifti1Image(np.ascontiguousarray(data), stored.affine)
+    image = nib.Nifti1Image(np.ascontiguousarray(data), stored.affine)
+    image.set_sform(stored.affine, code=world_code(stored))
+    return image
+
+
+def world_code(stored) -> int:
+    """The NIfTI code of the world the affine of an image maps to.
+
+    That of the sform if it has one, else that of the qform, which is the
+    order in which nibabel takes the affine from them; 1 (scanner) for an
+    image that has neither, or no NIfTI header.
+    """
+    header = getattr(stored, "header", None)
+    for field in ("sform_code", "qform_code"):
+        try:
+            code = int(header[field])
+        except (TypeError, KeyError, ValueError):
+            continue
+        if code > 0:
+            return code
+    return 1
 
 
 def fractions_from_label(label: np.ndarray) -> np.ndarray:
@@ -154,7 +248,8 @@ def tissue_means(params: dict) -> dict:
     return means
 
 
-def segment(t1, template_dir=None, verbose: bool = False, deformation: bool = False) -> dict:
+def segment(t1, template_dir=None, verbose: bool = False, deformation: bool = False,
+            space: str = "scan") -> dict:
     """Label map, tissue fractions and corrected image of a real T1w scan.
 
     Args:
@@ -163,10 +258,18 @@ def segment(t1, template_dir=None, verbose: bool = False, deformation: bool = Fa
             :func:`t1sim.models.ensure_models`, which downloads them once.
         verbose: Print the stages of the segmentation.
         deformation: Also return the deformation to the templates, which
-            :mod:`t1sim.atlas` needs to bring an atlas onto the working grid.
+            :mod:`t1sim.atlas` needs to bring an atlas onto the grid.
+        space: ``"scan"``: the anatomy is made on the scan at 0.5 mm, along
+            its own axes and in its millimetres (:func:`scan_grid`).
+            ``"template"``: on T1Prep's working grid, affinely registered to
+            MNI152NLin2009cAsym.  On the grid of the scan the affine
+            registration runs before the segmentation, which needs the grid
+            in template millimetres; a T1Prep whose ``segment`` takes the
+            registration (``world``) is handed it, an older one runs it a
+            second time.
 
     Returns:
-        A dict, all volumes on the RAS-ordered working grid (``grid``):
+        A dict, all volumes on the RAS-ordered grid of the anatomy (``grid``):
 
         - ``label``: (X, Y, Z) float32, 0 outside the brain, CSF = 1, GM = 2,
           WM = 3 with partial volumes in between;
@@ -180,9 +283,17 @@ def segment(t1, template_dir=None, verbose: bool = False, deformation: bool = Fa
         - ``corrected``: the denoised and bias-corrected scan, whole head;
         - ``mask``: the brain mask, boolean;
         - ``means``: :func:`tissue_means`, on the scale of ``corrected``;
-        - ``grid``: the working grid as an image; ``affine``, ``world``,
-          ``native_mat`` and ``native_shape``: how it relates to the scan
-          (see ``t1prep.unified_seg.segment``);
+        - ``grid``: the grid of the anatomy as an image, its matrix in the
+          millimetres of its *space*: those of the scan, or of the template;
+          ``space``: which;
+        - ``template_affine``: the voxel-to-world matrix of the grid in
+          template millimetres; ``template_grid``: ``{"shape", "affine"}``
+          of T1Prep's working grid, on which images in template space are
+          written;
+        - ``affine``, ``world``, ``native_mat`` and ``native_shape``: how the
+          grid relates to the scan (see ``t1prep.unified_seg.segment``);
+          ``world`` maps the millimetres of the scan to those of the
+          template;
         - ``scan``: the denoised scan as an image on its own grid, in the
           storage order of the input.  ``simulate.acquire(grid="scan")``
           writes onto that grid and takes from it what the scan shows beyond
@@ -192,6 +303,8 @@ def segment(t1, template_dir=None, verbose: bool = False, deformation: bool = Fa
           the template voxel it maps to (0-based, NaN where undefined), and
           ``template_mat``, the voxel-to-world matrix of the templates.
     """
+    if space not in SPACES:
+        raise ValueError(f"space is 'scan' or 'template', not {space!r}")
     cat_surf, apply_LAS, unified_seg = _t1prep()
     if template_dir is None:
         template_dir = models.ensure_models(verbose=verbose)
@@ -214,9 +327,41 @@ def segment(t1, template_dir=None, verbose: bool = False, deformation: bool = Fa
                 "The deformation needs a T1Prep whose unified_seg.segment takes "
                 "deformation=True (newer than 0.9.2, or a source checkout).")
         extra["deformation"] = True
+    working, template_grid = None, None
+    if space == "scan":
+        # The grid of the scan has to be handed to T1Prep in template
+        # millimetres, which needs the registration before the segmentation
+        templates, template_mat = unified_seg.unified_templates(template_dir)
+        world, _ = unified_seg.affine_registration(data, image.affine, templates, template_mat, verbose=verbose)
+        del templates
+        cover = nib.as_closest_canonical(unified_seg.default_working_grid())
+        template_grid = {"shape": tuple(int(n) for n in cover.shape[:3]),
+                         "affine": np.asarray(cover.affine, dtype=np.float64)}
+        planned, shape = scan_grid(image.affine, data.shape, cover.affine, cover.shape, world)
+        working = nib.Nifti1Image(np.zeros(shape, dtype=np.uint8), np.asarray(world) @ planned)
+        del cover
+        if "world" in inspect.signature(unified_seg.segment).parameters:
+            extra["world"] = world
+    if working is not None:
+        extra["working_grid"] = working
     seg = unified_seg.segment(denoised, raw, template_dir=template_dir, verbose=verbose, **extra)
+    template_affine = np.asarray(seg["grid"].affine, dtype=np.float64)
+    if space == "scan":
+        # where T1Prep put the grid: where it was asked to, unless an older
+        # T1Prep registered the scan a second time and came out elsewhere
+        affine = np.linalg.inv(np.asarray(seg["world"], dtype=np.float64)) @ template_affine
+        if np.allclose(affine, planned, atol=1e-6):
+            affine = planned
+    else:
+        affine = template_affine
+        template_grid = {"shape": tuple(int(n) for n in seg["grid"].shape[:3]), "affine": template_affine}
+    grid_shape = tuple(int(n) for n in seg["grid"].shape[:3])
     mask = unified_seg.brain_mask(seg.pop("prob"))
     _, brain, first_label = unified_seg.working_grid_maps(seg, mask)
+    if space == "scan":
+        # LAS takes its voxel size from the header: that of the scan
+        brain = nib.Nifti1Image(np.asarray(brain.dataobj), affine)
+        first_label = nib.Nifti1Image(np.asarray(first_label.dataobj), affine)
     means = tissue_means(seg["params"])
     # Pure GM is where the mixture has it; CSF and WM are left to LAS
     las = apply_LAS(brain, first_label, verbose=verbose, peaks=(None, means["GM"], None))
@@ -235,7 +380,10 @@ def segment(t1, template_dir=None, verbose: bool = False, deformation: bool = Fa
         "corrected": np.nan_to_num(seg["corrected"]).astype(np.float32, copy=False),
         "mask": mask,
         "means": means,
-        "grid": seg["grid"],
+        "grid": nib.Nifti1Image(np.broadcast_to(np.uint8(0), grid_shape), affine),
+        "space": space,
+        "template_affine": template_affine,
+        "template_grid": template_grid,
         "affine": seg["affine"],
         "world": seg["world"],
         "native_mat": seg["native_mat"],

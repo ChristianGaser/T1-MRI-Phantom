@@ -74,7 +74,7 @@ def _in(regions_on_grid: np.ndarray, numbers) -> np.ndarray:
 
 def detect(label: np.ndarray, normalised: np.ndarray, grid_affine: np.ndarray,
            regions_on_grid: np.ndarray, vessels: float = 0.5, dura: float = 4.0,
-           pve: bool = True) -> dict:
+           pve: bool = True, template_affine: np.ndarray = None) -> dict:
     """Find vessels, dura and periventricular partial volume in a label map.
 
     Args:
@@ -82,7 +82,8 @@ def detect(label: np.ndarray, normalised: np.ndarray, grid_affine: np.ndarray,
         normalised: (X, Y, Z) LAS-normalised image on the scale of the label
             and 0 outside the brain (``frontend.segment(...)["normalised"]``);
             the vessel detection reads the intensities from it.
-        grid_affine: Voxel-to-world matrix of the working grid.
+        grid_affine: Voxel-to-world matrix of the grid of the anatomy; its
+            millimetres are those of the lengths below.
         regions_on_grid: (X, Y, Z) Neuromorphometrics atlas on the grid
             (``atlas.to_grid("Neuromorphometrics", iy, template_mat)``).
         vessels: Strength of the vessel detection in 0..1; 0 switches it off.
@@ -92,6 +93,10 @@ def detect(label: np.ndarray, normalised: np.ndarray, grid_affine: np.ndarray,
         dura: Length in mm of the path through the tissue beyond which grey
             matter is dura; 0 switches it off.  Lower removes more.
         pve: Detect the periventricular partial volume.
+        template_affine: Voxel-to-world matrix of the grid in template
+            millimetres, through which T1Prep's priors of the vessel
+            detection are brought onto it; default: *grid_affine*, for a grid
+            in template space.
 
     Returns:
         ``{"vessels": ..., "dura": ..., "pve": ...}``, boolean masks.
@@ -101,6 +106,7 @@ def detect(label: np.ndarray, normalised: np.ndarray, grid_affine: np.ndarray,
     if dura < 0:
         raise ValueError("dura is a length in mm and cannot be negative")
     vx = grid_voxel_size(grid_affine)
+    priors_affine = grid_affine if template_affine is None else template_affine
     shape = label.shape
     found = {name: np.zeros(shape, dtype=bool) for name in ("vessels", "dura", "pve")}
     box = bounding_box(label > 0.5, int(np.ceil(4 / vx.min())))
@@ -113,8 +119,8 @@ def detect(label: np.ndarray, normalised: np.ndarray, grid_affine: np.ndarray,
         weight = t1prep_vessels.vessel_weight(
             np.ascontiguousarray(normalised, dtype=np.float32) / 3.0,
             np.ascontiguousarray(label, dtype=np.float32), tuple(float(v) for v in vx),
-            bv_prior=t1prep_vessels.blood_vessel_prior(grid_affine, shape),
-            protect=t1prep_vessels.protected_regions(grid_affine, shape))
+            bv_prior=t1prep_vessels.blood_vessel_prior(priors_affine, shape),
+            protect=t1prep_vessels.protected_regions(priors_affine, shape))
         import cat_surf
 
         norm = normalised[box]
@@ -208,7 +214,7 @@ def clean(seg: dict, vessels: float = 0.5, dura: float = 4.0, pve: bool = True,
     Returns:
         A dict with the cleaned ``fractions`` and ``label``, the ``masks`` of
         :func:`detect` and ``volumes_ml``, the volume of each mask in ml of
-        the working grid.
+        the grid of the anatomy.
     """
     for key in ("iy", "template_mat"):
         if key not in seg:
@@ -217,7 +223,8 @@ def clean(seg: dict, vessels: float = 0.5, dura: float = 4.0, pve: bool = True,
     label = seg["label"] if label is None else label
     affine = seg["grid"].affine
     regions_on_grid = atlas.to_grid("Neuromorphometrics", seg["iy"], seg["template_mat"])
-    masks = detect(label, seg["normalised"], affine, regions_on_grid, vessels, dura, pve)
+    masks = detect(label, seg["normalised"], affine, regions_on_grid, vessels, dura, pve,
+                   template_affine=seg.get("template_affine"))
     new_fractions, new_label = apply(fractions, label, masks["vessels"] | masks["dura"], masks["pve"],
                                      means=seg["means"])
     voxel_ml = float(np.prod(grid_voxel_size(affine))) / 1000
