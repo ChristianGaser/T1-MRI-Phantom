@@ -218,11 +218,20 @@ class TestTheAcquisition(unittest.TestCase):
         slow = np.cos(2 * np.pi * x / 20).astype(np.float32)             # 10 mm period
         fast = np.cos(2 * np.pi * x / 2.5).astype(np.float32)            # 1.25 mm period
         acq = artefacts.Acquisition(self.shape, self.affine, (1.0, 0.5, 0.5))
-        self.assertLess(float(np.abs(acq.acquire(fast)).max()), 1e-3)
+        # gone, but for what the end of the volume leaves of it next to a face
+        self.assertLess(float(np.abs(acq.acquire(fast))[:-4].max()), 0.05)
         got = acq.acquire(slow)
         expected = np.cos(2 * np.pi * (acq.first[0] + 2 * np.arange(acq.shape[0])) / 20)
-        # the first and the last voxel see the border of the volume
-        np.testing.assert_allclose(got[1:-1, 5, 5], expected[1:-1], atol=1e-3)
+        # a slow wave stays, to the little its mirror image at the end of the volume adds
+        np.testing.assert_allclose(got[:, 5, 5], expected, atol=0.015)
+
+    def test_what_touches_one_end_of_the_volume_does_not_ring_into_the_other(self):
+        # a Fourier transform takes the volume as periodic: the neck would show up above the head
+        image = np.zeros((96, 32, 32), np.float32)
+        image[:10] = 400.0
+        acq = artefacts.Acquisition(image.shape, np.diag([0.5, 0.5, 0.5, 1.0]), (1.0, 0.5, 0.5))
+        far_end = acq.acquire(image)[-4:]
+        self.assertLess(float(np.abs(far_end).max()), 0.01 * 400)
 
     def test_a_smooth_image_survives_the_way_there_and_back(self):
         x, y, z = np.meshgrid(*[np.linspace(-1, 1, n) for n in self.shape], indexing="ij")
@@ -242,6 +251,109 @@ class TestTheAcquisition(unittest.TestCase):
         acq = artefacts.Acquisition(self.shape, self.affine, 1.0)
         with self.assertRaises(ValueError):
             acq.acquire(np.zeros((4, 4, 4), np.float32))
+
+
+class TestTheObliqueAcquisition(unittest.TestCase):
+    """A grid of other voxels, another orientation and a larger field of view than that of the image."""
+
+    @classmethod
+    def setUpClass(cls):
+        n = 64
+        axis = np.arange(n) - (n - 1) / 2
+        x, y, z = np.meshgrid(axis, axis, axis, indexing="ij")
+        r = np.sqrt(x ** 2 + y ** 2 + (1.2 * z) ** 2) * 0.5              # mm, 0.5 mm voxels
+        ramp = lambda radius: np.clip((radius - r) / 0.5 + 0.5, 0, 1)
+        gm, wm = ramp(11.0) - ramp(8.0), ramp(8.0)
+        cls.fractions = np.stack([ramp(14.0) - ramp(11.0), gm, wm], -1).astype(np.float32)
+        cls.image = (cls.fractions @ np.float32([100, 300, 400])).astype(np.float32)
+        cls.affine = np.diag([0.5, 0.5, 0.5, 1.0])
+        cls.affine[:3, 3] = -0.5 * (n - 1) / 2
+        # 0.8 x 0.85 x 0.9 mm, turned about all three axes, shifted, and larger than the image
+        a, b, c = 0.2, -0.1, 0.15
+        turn = (np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])
+                @ np.array([[np.cos(b), 0, np.sin(b)], [0, 1, 0], [-np.sin(b), 0, np.cos(b)]])
+                @ np.array([[np.cos(c), -np.sin(c), 0], [np.sin(c), np.cos(c), 0], [0, 0, 1]]))
+        cls.shape = (56, 60, 52)
+        cls.target = np.eye(4)
+        cls.target[:3, :3] = turn @ np.diag([0.8, 0.85, 0.9])
+        cls.target[:3, 3] = -cls.target[:3, :3] @ ((np.array(cls.shape) - 1) / 2) + [1.3, -0.7, 0.4]
+        cls.oblique = artefacts.ObliqueAcquisition(cls.image.shape, cls.affine, cls.shape, cls.target)
+
+    def test_on_a_grid_along_the_axes_it_is_the_acquisition_of_that_grid(self):
+        straight = artefacts.Acquisition(self.image.shape, self.affine, 1.0)
+        oblique = artefacts.ObliqueAcquisition(self.image.shape, self.affine, straight.shape, straight.affine)
+        inner = (slice(2, -2),) * 3                                  # the two treat the border differently
+        np.testing.assert_allclose(oblique.acquire(self.image)[inner], straight.acquire(self.image)[inner], atol=0.01)
+        np.testing.assert_allclose(oblique.average(self.fractions), straight.average(self.fractions), atol=1e-5)
+        np.testing.assert_allclose(oblique.voxel, 1.0)
+
+    def test_the_average_keeps_the_volumes_and_the_fractions(self):
+        averaged = self.oblique.average(self.fractions)
+        self.assertEqual(averaged.shape, self.shape + (3,))
+        fine = self.fractions.sum((0, 1, 2), dtype=np.float64) * 0.5 ** 3
+        coarse = averaged.sum((0, 1, 2), dtype=np.float64) * abs(np.linalg.det(self.target[:3, :3]))
+        np.testing.assert_allclose(coarse, fine, rtol=2e-4)
+        self.assertGreaterEqual(float(averaged.min()), 0.0)
+        self.assertLessEqual(float(averaged.sum(-1).max()), 1.0 + 1e-5)
+        # one volume without classes is averaged the same way
+        np.testing.assert_allclose(self.oblique.average(self.fractions[..., 1]), averaged[..., 1], atol=1e-6)
+
+    def test_the_average_is_the_mean_over_the_voxel_and_not_its_centre(self):
+        from scipy import ndimage
+
+        def counted(points, linear=None, offset=None, shape=None):       # the fine voxel at points inside every voxel
+            linear = self.oblique.linear if linear is None else linear
+            offset = self.oblique.offset if offset is None else offset
+            shape = self.shape if shape is None else shape
+            total = np.zeros(shape)
+            steps = (np.arange(points) + 0.5) / points - 0.5
+            for a in steps:
+                for b in steps:
+                    for c in steps:
+                        total += ndimage.affine_transform(self.fractions[..., 1], linear, order=0, output_shape=shape,
+                                                          offset=offset + linear @ np.array([a, b, c]))
+            return total / points ** 3
+
+        exact = counted(16)                       # turned by 6 to 11 degrees the count converges quickly
+        averaged = self.oblique.average(self.fractions[..., 1])
+        boundary = (exact > 0.02) & (exact < 0.98)
+        self.assertLess(float(np.abs(averaged - exact).max()), 0.03)
+        self.assertLess(float(np.sqrt(np.mean((averaged - exact)[boundary] ** 2))), 0.005)
+        self.assertGreater(float(np.abs(counted(1) - exact).max()), 0.3)
+
+    def test_the_average_is_exact_on_any_grid_along_the_axes(self):
+        # 0.8 x 1 x 1.3 mm: no whole number of fine voxels, where counting at points is furthest off
+        straight = artefacts.Acquisition(self.image.shape, self.affine, (0.8, 1.0, 1.3))
+        oblique = artefacts.ObliqueAcquisition(self.image.shape, self.affine, straight.shape, straight.affine)
+        np.testing.assert_allclose(oblique.average(self.fractions), straight.average(self.fractions), atol=1e-5)
+
+    def test_the_image_is_the_mixture_of_the_averaged_fractions_away_from_the_boundaries(self):
+        image = self.oblique.acquire(self.image)
+        averaged = self.oblique.average(self.fractions)
+        white = averaged[..., 2] > 0.9999
+        self.assertGreater(int(white.sum()), 500)
+        np.testing.assert_allclose(image[white], 400.0, rtol=0.06)       # it rings, as an acquisition does
+        self.assertAlmostEqual(float(image[white].mean()), 400.0, delta=2.0)
+        # nothing of the image where the new grid lies beyond it
+        self.assertEqual(float(np.abs(image[self.oblique.coverage() == 0]).max()), 0.0)
+
+    def test_the_coverage_and_a_map_that_is_continued(self):
+        coverage = self.oblique.coverage(ramp=4.0)
+        self.assertEqual((float(coverage.min()), float(coverage.max())), (0.0, 1.0))
+        centre = tuple(n // 2 for n in self.shape)
+        self.assertEqual(float(coverage[centre]), 1.0)
+        self.assertEqual(float(coverage[0, 0, 0]), 0.0)
+        field = np.broadcast_to(np.linspace(0.8, 1.2, 64, dtype=np.float32)[:, None, None], self.image.shape)
+        cut, continued = self.oblique.sample(field), self.oblique.sample(field, extend=True)
+        self.assertEqual(float(cut[0, 0, 0]), 0.0)
+        self.assertGreaterEqual(float(continued.min()), 0.8 - 1e-6)
+        np.testing.assert_allclose(cut[coverage == 1], continued[coverage == 1], atol=1e-6)
+
+    def test_a_volume_of_another_size_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.oblique.acquire(np.zeros((10, 10, 10), np.float32))
+        with self.assertRaises(ValueError):
+            self.oblique.average(np.zeros((10, 10, 10, 3), np.float32))
 
 
 if __name__ == "__main__":

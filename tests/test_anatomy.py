@@ -98,7 +98,14 @@ class TestAtrophyByDeformation(unittest.TestCase):
         res = self.results["thinning"]
         again = anatomy.warp(self.fractions, res["displacement"])
         np.testing.assert_allclose(again, res["fractions"], atol=1e-5)
-        np.testing.assert_allclose(anatomy.warp(self.image, res["displacement"]), res["corrected"], atol=1e-3)
+        # the image follows by a cubic spline, which is sharper at a boundary than the linear interpolation
+        # of warp(): the same but for what a spline swings there, and never below 0
+        linear = anatomy.warp(self.image, res["displacement"])
+        np.testing.assert_allclose(res["corrected"], linear, atol=0.06 * 400)
+        flat = np.abs(np.gradient(linear)[0]) + np.abs(np.gradient(linear)[1]) + np.abs(np.gradient(linear)[2]) < 1e-3
+        np.testing.assert_allclose(res["corrected"][flat], linear[flat], atol=0.0125 * 400)
+        self.assertGreaterEqual(float(res["corrected"].min()), 0.0)
+        self.assertFalse(np.array_equal(res["corrected"], linear))
         np.testing.assert_allclose(res["label"], frontend.label_from_fractions(res["fractions"]), atol=1e-5)
 
     def test_forward_is_the_way_back_of_the_displacement(self):

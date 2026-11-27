@@ -122,6 +122,20 @@ class TestTheChain(unittest.TestCase):
         np.testing.assert_array_equal(denoised.get_fdata(), data[::-1] + 1)
         self.assertEqual(unified_seg.segment.call_args.kwargs["template_dir"], "/templates")
 
+    def test_the_denoised_scan_comes_back_on_the_grid_it_is_stored_on(self):
+        data = np.arange(np.prod(self.shape), dtype=np.float32).reshape(self.shape)
+        stored = nib.Nifti1Image(data, np.diag([-0.8, 0.9, 1.1, 1.0]))     # LAS storage, as many scans
+        out, _, _, _, _ = self.run_segment(stored)
+        self.assertEqual(out["scan"].shape, stored.shape)
+        np.testing.assert_allclose(out["scan"].affine, stored.affine)
+        np.testing.assert_array_equal(np.asarray(out["scan"].dataobj), data + 1)   # the stand-in filter adds 1
+        # the same for axes in another order
+        swapped = nib.Nifti1Image(np.transpose(data, (1, 2, 0)),
+                                  np.array([[0, 0, 0.8, 0], [0.9, 0, 0, 0], [0, 1.1, 0, 0], [0, 0, 0, 1.0]]))
+        out, _, _, _, _ = self.run_segment(swapped)
+        self.assertEqual(out["scan"].shape, swapped.shape)
+        np.testing.assert_array_equal(np.asarray(out["scan"].dataobj), np.asarray(swapped.dataobj) + 1)
+
     def test_the_deformation_is_handed_on_when_asked_for(self):
         scan = nib.Nifti1Image(np.ones(self.shape, np.float32), np.eye(4))
         grid = nib.Nifti1Image(np.zeros(self.shape, np.float32), np.eye(4))
