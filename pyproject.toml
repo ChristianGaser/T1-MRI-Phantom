@@ -20,14 +20,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# What turns a real scan into a ground truth and changes its anatomy: the
-# unified segmentation, LAS, SANLM, the atlases and the vessel detection.
-# T1Prep 0.9.3 is the first version with unified_seg.segment(deformation=True);
-# torch, which T1Prep needs as well, runs the movement artefacts and the
-# deformations.
 frontend = [
     "cat-surf>=1.2.0",
-    "T1Prep>=0.9.3",
+    "T1Prep>=0.9.4",
     "torch",
 ]
 
