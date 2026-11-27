@@ -70,6 +70,24 @@ def _t1prep():
     return cat_surf, apply_LAS, unified_seg
 
 
+def _in_storage_order(data: np.ndarray, affine: np.ndarray, stored) -> nib.Nifti1Image:
+    """A volume in RAS order as an image on the grid the scan is stored on.
+
+    Args:
+        data: (X, Y, Z) volume in the order of ``nib.as_closest_canonical``.
+        affine: Its voxel-to-world matrix.
+        stored: The image as it was loaded; its storage order and affine are
+            taken.
+
+    Returns:
+        The volume with the axes and directions of *stored*.
+    """
+    there = nib.orientations.io_orientation(stored.affine)
+    here = nib.orientations.io_orientation(affine)
+    data = nib.orientations.apply_orientation(data, nib.orientations.ornt_transform(here, there))
+    return nib.Nifti1Image(np.ascontiguousarray(data), stored.affine)
+
+
 def fractions_from_label(label: np.ndarray) -> np.ndarray:
     """Triangular decomposition of a label map into CSF, GM and WM.
 
@@ -165,6 +183,10 @@ def segment(t1, template_dir=None, verbose: bool = False, deformation: bool = Fa
         - ``grid``: the working grid as an image; ``affine``, ``world``,
           ``native_mat`` and ``native_shape``: how it relates to the scan
           (see ``t1prep.unified_seg.segment``);
+        - ``scan``: the denoised scan as an image on its own grid, in the
+          storage order of the input.  ``simulate.acquire(grid="scan")``
+          writes onto that grid and takes from it what the scan shows beyond
+          the working grid;
         - ``params``: the parameters the segmentation estimated;
         - with *deformation*: ``iy``, (X, Y, Z, 3) float32, for every voxel
           the template voxel it maps to (0-based, NaN where undefined), and
@@ -174,15 +196,16 @@ def segment(t1, template_dir=None, verbose: bool = False, deformation: bool = Fa
     if template_dir is None:
         template_dir = models.ensure_models(verbose=verbose)
 
-    image = nib.load(os.fspath(t1)) if isinstance(t1, (str, os.PathLike)) else t1
+    stored = nib.load(os.fspath(t1)) if isinstance(t1, (str, os.PathLike)) else t1
     # RAS storage order: SANLM and the estimation follow the stored lattice
-    image = nib.as_closest_canonical(image)
+    image = nib.as_closest_canonical(stored)
     data = np.nan_to_num(np.squeeze(image.get_fdata(dtype=np.float32)))
     if data.ndim != 3:
         raise ValueError(f"the scan must be a single 3-D volume, not {data.shape}")
     raw = nib.Nifti1Image(data, image.affine)
     denoised = nib.Nifti1Image(
         np.asarray(cat_surf.vol_sanlm(data), dtype=np.float32), image.affine)
+    scan = _in_storage_order(np.asarray(denoised.dataobj), image.affine, stored)
 
     extra = {}
     if deformation:
@@ -217,5 +240,6 @@ def segment(t1, template_dir=None, verbose: bool = False, deformation: bool = Fa
         "world": seg["world"],
         "native_mat": seg["native_mat"],
         "native_shape": seg["native_shape"],
+        "scan": scan,
         "params": seg["params"],
     }

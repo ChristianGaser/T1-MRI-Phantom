@@ -406,7 +406,9 @@ def atrophy(fractions: np.ndarray, corrected: np.ndarray, grid_affine: np.ndarra
     Args:
         fractions: (X, Y, Z, 3) fractions of CSF, GM and WM.
         corrected: (X, Y, Z) bias-corrected scan; it is deformed with the
-            fractions, because it carries everything that is not brain.
+            fractions, because it carries everything that is not brain.  The
+            fractions are interpolated linearly, the image by a cubic
+            B-spline.
         grid_affine: Voxel-to-world matrix of the grid.
         roi: (X, Y, Z) region, boolean or a weight in 0..1.
         change: Relative change, e.g. -0.1 for a loss of 10%.  Between -0.5
@@ -458,16 +460,22 @@ def atrophy(fractions: np.ndarray, corrected: np.ndarray, grid_affine: np.ndarra
         raise ValueError("the deformation moves nothing by more than 0.01 voxels: the region is too "
                          "small for this change")
     moved = bounding_box(moving, 2)
-    stack = np.concatenate([np.moveaxis(fractions, -1, 0), np.asarray(corrected, np.float32)[None]])
+    stack = np.moveaxis(fractions, -1, 0)
     sub = (slice(None),) + moved
     grid = _identity([s.stop - s.start for s in moved])
+    # The fractions by linear interpolation: they stay between 0 and 1 and
+    # keep their sum, which a spline does not grant
     warped = stack.copy()
     warped[sub] = _sample(stack[sub], grid + disp[sub])
-    new_fractions = np.ascontiguousarray(np.moveaxis(warped[:3], 0, -1))
+    new_fractions = np.ascontiguousarray(np.moveaxis(warped, 0, -1))
+    # The image by a cubic B-spline, which blurs less; what it swings below 0 is set to 0
+    new_corrected = np.array(corrected, dtype=np.float32)
+    new_corrected[moved] = np.maximum(ndimage.map_coordinates(
+        new_corrected[moved], grid + disp[sub], order=3, mode="nearest"), 0)
     return {
         "fractions": new_fractions,
         "label": new_fractions[..., 0] + 2 * new_fractions[..., 1] + 3 * new_fractions[..., 2],
-        "corrected": warped[3],
+        "corrected": new_corrected,
         "jacobian": jac,
         "displacement": disp,
         "forward": forward,

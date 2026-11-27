@@ -37,6 +37,8 @@ from . import __version__
 
 GENERATED_BY = {"Name": "t1sim", "Version": __version__}
 SPACE = "MNI152NLin2009cAsym"
+#: NIfTI code of the coordinates of an image in that space (MNI152).
+TEMPLATE_CODE = 4
 
 
 def label(text) -> str:
@@ -168,7 +170,8 @@ def write_sidecar(image_path, content: dict) -> Path:
     return path
 
 
-def save(volume: np.ndarray, affine: np.ndarray, path, scale: float = None, dtype=np.float32) -> Path:
+def save(volume: np.ndarray, affine: np.ndarray, path, scale: float = None, dtype=np.float32,
+         code: int = TEMPLATE_CODE) -> Path:
     """Write a volume as NIfTI.
 
     Args:
@@ -179,6 +182,9 @@ def save(volume: np.ndarray, affine: np.ndarray, path, scale: float = None, dtyp
             *scale* when read: 1/255 with uint8 for a fraction, as CAT12
             stores its tissue maps.  None: as *dtype* itself.
         dtype: Type on disk.
+        code: NIfTI code of the world the matrix maps to: 4 for the
+            template (MNI152), 1 for the scanner, which an image on the grid
+            of a scan takes from the scan.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -192,7 +198,7 @@ def save(volume: np.ndarray, affine: np.ndarray, path, scale: float = None, dtyp
     if scale is not None:
         image.header.set_slope_inter(scale, 0.0)
     image.header.set_xyzt_units("mm")
-    image.set_qform(affine, code=4)          # MNI152
-    image.set_sform(affine, code=4)
+    image.set_qform(affine, code=int(code))
+    image.set_sform(affine, code=int(code))
     nib.save(image, str(path))
     return path

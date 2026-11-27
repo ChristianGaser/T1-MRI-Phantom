@@ -24,6 +24,9 @@ What is and is not a port of ``matlab/mri_simulate.m``:
 
 from __future__ import annotations
 
+import itertools
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -267,6 +270,50 @@ def add_noise(image: np.ndarray, sigma: float, rician: bool = True, seed=0,
 
 
 # ------------------------------------------------------------------ resolution
+#: Voxels by which an image is continued beyond every face before its k-space is cut.
+MIRROR = 16
+
+
+def _low_pass(image: np.ndarray, keep, axes=(0, 1, 2)) -> np.ndarray:
+    """Remove the waves of an image that an acquisition does not hold.
+
+    The Fourier transform takes the image as periodic: what touches one end
+    of the grid, as the neck does, would ring into the other end.  The image
+    is therefore continued with its mirror image for :data:`MIRROR` voxels
+    beyond the faces of *axes* first, which keeps the two ends apart and
+    leaves no step at a face.
+
+    Args:
+        image: (X, Y, Z) float32.
+        keep: Function of the three frequency axes (cycles per voxel, each
+            with a length of 1 along the other two axes) that returns the
+            waves that stay, as a boolean array.
+        axes: The axes along which waves are removed.
+
+    Returns:
+        The image without the other waves, float32; the image itself if all
+        stay.
+    """
+    pad = []
+    for axis, n in enumerate(image.shape):
+        if axis in axes and n > 2:
+            total = sp_fft.next_fast_len(n + 2 * min(MIRROR, n - 1), real=True) - n
+            total = min(total, 2 * (n - 1))
+            pad.append((total // 2, total - total // 2))
+        else:
+            pad.append((0, 0))
+    size = [n + before + after for n, (before, after) in zip(image.shape, pad)]
+    freq = [(sp_fft.rfftfreq(n) if axis == 2 else sp_fft.fftfreq(n)).astype(np.float32)
+            .reshape([-1 if a == axis else 1 for a in range(3)]) for axis, n in enumerate(size)]
+    mask = keep(freq)
+    if mask.all():
+        return image
+    spectrum = sp_fft.rfftn(np.pad(image, pad, mode="reflect"), workers=-1)
+    spectrum *= mask
+    inner = tuple(slice(before, before + n) for n, (before, _) in zip(image.shape, pad))
+    return sp_fft.irfftn(spectrum, s=size, workers=-1)[inner].astype(np.float32)
+
+
 class Acquisition:
     """The grid of an acquisition at another voxel size, inside the same field of view.
 
@@ -319,15 +366,15 @@ class Acquisition:
         image = np.asarray(image, dtype=np.float32)
         if image.shape != self.fine_shape:
             raise ValueError(f"the image must be {self.fine_shape}, not {image.shape}")
-        coarser = self.ratio > 1 + 1e-6
-        if coarser.any():
-            spectrum = sp_fft.rfftn(image, workers=-1)
-            for axis in np.where(coarser)[0]:
-                n = self.fine_shape[axis]
-                freq = sp_fft.rfftfreq(n) if axis == 2 else sp_fft.fftfreq(n)   # cycles per fine voxel
-                keep = np.abs(freq) <= 0.5 / self.ratio[axis] + 1e-9
-                spectrum *= keep.reshape([-1 if a == axis else 1 for a in range(3)])
-            image = sp_fft.irfftn(spectrum, s=image.shape, workers=-1).astype(np.float32)
+        coarser = [int(axis) for axis in np.where(self.ratio > 1 + 1e-6)[0]]
+        if coarser:
+            def keep(freq):                             # in cycles per fine voxel
+                mask = np.ones((), dtype=bool)
+                for axis in coarser:
+                    mask = mask & (np.abs(freq[axis]) <= 0.5 / self.ratio[axis] + 1e-6)
+                return mask
+
+            image = _low_pass(image, keep, axes=coarser)
         if np.allclose(self.ratio, 1) and np.allclose(self.first, 0):
             return image
         return ndimage.affine_transform(image, self.ratio, offset=self.first,
@@ -355,3 +402,192 @@ class Acquisition:
             raise ValueError(f"the image must be {self.shape}, not {image.shape}")
         return ndimage.affine_transform(image, 1 / self.ratio, offset=-self.first / self.ratio,
                                         output_shape=self.fine_shape, order=3, mode="nearest")
+
+
+class ObliqueAcquisition:
+    """The grid of an acquisition that lies anywhere in the world of the image.
+
+    Other voxel sizes, another orientation and another field of view: the
+    grid of the scan the working grid was made from.  It does what
+    :class:`Acquisition` does for a grid along the axes of the image: the
+    image is acquired (its k-space cut at the Nyquist frequencies of the new
+    lattice, then read at the new voxel centres), and a map of fractions is
+    averaged over the box of every new voxel.  The new voxels are
+    parallelepipeds in the image, so neither is separable here.
+
+    Args:
+        shape: Size of the fine grid the image lies on.
+        affine: Its voxel-to-world matrix.
+        target_shape: Size of the grid of the acquisition.
+        target_affine: Its voxel-to-world matrix, into the same world.
+
+    Attributes:
+        shape, affine: The grid of the acquisition.
+        voxel: Its voxel size, in mm of that world.
+        linear, offset: Where a voxel of the acquisition lies in the fine
+            grid: ``linear @ index + offset``, in fine voxels.
+    """
+
+    def __init__(self, shape, affine, target_shape, target_affine):
+        self.fine_shape = tuple(int(n) for n in shape)
+        self.fine_affine = np.asarray(affine, dtype=np.float64)
+        self.shape = tuple(int(n) for n in target_shape)
+        self.affine = np.asarray(target_affine, dtype=np.float64)
+        if len(self.shape) != 3 or len(self.fine_shape) != 3:
+            raise ValueError("both grids have three dimensions")
+        self.voxel = np.sqrt((self.affine[:3, :3] ** 2).sum(0))
+        to_fine = np.linalg.solve(self.fine_affine, self.affine)
+        self.linear, self.offset = to_fine[:3, :3].copy(), to_fine[:3, 3].copy()
+
+    def _check(self, volume: np.ndarray) -> np.ndarray:
+        volume = np.asarray(volume, dtype=np.float32)
+        if volume.shape[:3] != self.fine_shape:
+            raise ValueError(f"the volume must be {self.fine_shape}, not {volume.shape[:3]}")
+        return volume
+
+    def acquire(self, image: np.ndarray) -> np.ndarray:
+        """The image on the grid of the acquisition.
+
+        A wave of the image with ``f`` cycles per fine voxel has ``linear.T @
+        f`` cycles per new voxel.  What exceeds half a cycle along one of the
+        three axes of the new lattice lies outside its k-space and is
+        removed; the band-limited image is then read at the new voxel centres
+        by cubic B-spline interpolation.  Beyond the fine grid the image is
+        0; within :meth:`coverage` of its border it is not to be trusted.
+        """
+        image = self._check(image)
+        if image.ndim != 3:
+            raise ValueError("the image is one volume")
+
+        def keep(freq):
+            mask = np.ones((), dtype=bool)
+            for new_axis in range(3):
+                cycles = sum(np.float32(self.linear[axis, new_axis]) * freq[axis] for axis in range(3))
+                mask = mask & (np.abs(cycles) <= 0.5 + 1e-6)
+            return mask
+
+        image = ndimage.affine_transform(_low_pass(image, keep), self.linear, offset=self.offset,
+                                         output_shape=self.shape, order=3, mode="nearest")
+        image[self.coverage(ramp=1.0) <= 0] = 0.0
+        return image
+
+    def sample(self, volume: np.ndarray, extend: bool = False) -> np.ndarray:
+        """A smooth map at the centres of the new voxels, by linear interpolation.
+
+        For a map that changes little within a voxel, a bias field, where an
+        average over the voxel would be the same.
+
+        Args:
+            volume: (X, Y, Z) map on the fine grid.
+            extend: Continue the map beyond the fine grid with its nearest
+                value; False: 0 there.
+        """
+        return ndimage.affine_transform(self._check(volume), self.linear, offset=self.offset,
+                                        output_shape=self.shape, order=1,
+                                        mode="nearest" if extend else "constant", cval=0.0)
+
+    def average(self, volume: np.ndarray) -> np.ndarray:
+        """A map of fractions on the grid of the acquisition.
+
+        Every new voxel is the mean over the parallelepiped it covers in the
+        fine grid, which is the partial volume of that voxel.  A fine voxel
+        counts with the share of it that lies inside, as in
+        :meth:`Acquisition.average`: the map is taken as constant within a
+        fine voxel, which is what a fraction of that voxel is.
+
+        The parallelepiped is covered with small boxes along the axes of the
+        fine grid, 1, 8 or 27 of them, the more the further the two grids are
+        turned against each other, and the mean over each box is exact: the
+        integral of a map that is constant within its voxels is the linear
+        interpolation of its running sums.  On a grid along the axes the
+        boxes are the new voxel and the result is that of
+        :meth:`Acquisition.average`.  Otherwise the boxes fit the voxel only
+        roughly, which was measured on a ball whose boundaries are one fine
+        voxel wide, with new voxels of 1.7 fine voxels:
+
+        ================  =====  ====================  ====================
+        Grids turned by   Boxes  Largest error         RMS at the boundary
+        ================  =====  ====================  ====================
+        1 degree          8      0.0006 (to 27 boxes)  -
+        6 to 11 degrees   8      0.005                 0.0015
+        17 to 29 degrees  27     0.006                 0.0012
+        ================  =====  ====================  ====================
+
+        Counting the fine voxel at points inside the new voxel, the obvious
+        way, needs 40 points per axis to come as close for the grid turned by
+        1 degree: the points fall in step with the fine grid.  A last axis
+        of classes is kept; beyond the fine grid the map is 0.
+        """
+        volume = self._check(volume)
+        classes = volume.ndim == 4
+        stack = np.moveaxis(volume, -1, 0) if classes else volume[None]
+        out = np.zeros((stack.shape[0],) + self.shape, dtype=np.float32)
+        filled = np.argwhere(stack.any(0))
+        if not filled.size:
+            return np.ascontiguousarray(np.moveaxis(out, 0, -1)) if classes else out[0]
+
+        # the part of the fine grid that is not 0, and the new voxels that reach it
+        first, last = filled.min(0), filled.max(0) + 1
+        corners = np.array(list(itertools.product(*zip(first - 1.0, last + 0.0))))
+        index = np.linalg.solve(self.linear, (corners - self.offset).T).T
+        low = np.clip(np.floor(index.min(0)).astype(int) - 1, 0, self.shape)
+        high = np.clip(np.ceil(index.max(0)).astype(int) + 2, 0, self.shape)
+        size = tuple(int(b - a) for a, b in zip(low, high))
+        if min(size) < 1:
+            return np.ascontiguousarray(np.moveaxis(out, 0, -1)) if classes else out[0]
+        box = (slice(None),) + tuple(slice(a, b) for a, b in zip(low, high))
+
+        # how far a fine axis is from the new axis next to it: 0 on a grid along the axes
+        rows = np.sqrt((self.linear ** 2).sum(1))
+        turned = float(1 - (np.abs(self.linear).max(1) / rows).min())
+        per_axis = 1 if turned < 1e-9 else (2 if turned < 0.06 else 3)
+        half = rows / (2 * per_axis)                                  # of a small box, in fine voxels
+        steps = (np.arange(per_axis) + 0.5) / per_axis - 0.5
+        calls = [(self.offset + self.linear @ (low + np.array(step)) - first + 0.5 + np.array(signs) * half,
+                  float(np.prod(signs)))
+                 for step in itertools.product(steps, repeat=3) for signs in itertools.product((-1, 1), repeat=3)]
+
+        for channel, values in enumerate(stack):
+            # running sums along the three axes, at the corners of the fine voxels
+            table = np.zeros(tuple(int(n) + 1 for n in last - first), dtype=np.float64)
+            table[1:, 1:, 1:] = values[tuple(slice(a, b) for a, b in zip(first, last))]
+            for axis in range(3):
+                np.cumsum(table, axis=axis, out=table)
+
+            def part(some, table=table):
+                total = np.zeros(size, dtype=np.float64)
+                for corner, sign in some:
+                    total += sign * ndimage.affine_transform(table, self.linear, offset=corner, output_shape=size,
+                                                             order=1, mode="nearest", output=np.float64)
+                return total
+
+            workers = max(1, min(len(calls), os.cpu_count() or 1, 16))
+            total = np.zeros(size, dtype=np.float64)
+            with ThreadPoolExecutor(workers) as pool:
+                for result in pool.map(part, [calls[n::workers] for n in range(workers)]):
+                    total += result
+            mean = total / (per_axis ** 3 * np.prod(2 * half))
+            mean[np.abs(mean) < 1e-7] = 0.0             # what the rounding of the sums leaves of nothing
+            out[(channel,) + box[1:]] = mean
+        return np.ascontiguousarray(np.moveaxis(out, 0, -1)) if classes else out[0]
+
+    def coverage(self, ramp: float = 6.0) -> np.ndarray:
+        """How far every new voxel lies inside the fine grid.
+
+        Args:
+            ramp: Width in fine voxels of the border in which the result
+                falls from 1 to 0.
+
+        Returns:
+            (X, Y, Z) float32 on the grid of the acquisition: 1 inside the
+            fine grid, 0 at its border and beyond.
+        """
+        index = [np.arange(n, dtype=np.float32).reshape([-1 if a == axis else 1 for a in range(3)])
+                 for axis, n in enumerate(self.shape)]
+        weight = np.ones(self.shape, dtype=np.float32)
+        for axis, size in enumerate(self.fine_shape):
+            position = sum(np.float32(self.linear[axis, new]) * index[new] for new in range(3))
+            position = position + np.float32(self.offset[axis])
+            inside = np.minimum(position, np.float32(size - 1) - position) / np.float32(ramp)
+            np.minimum(weight, np.clip(inside, 0, 1), out=weight)
+        return weight
