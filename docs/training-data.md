@@ -7,7 +7,7 @@ Part of the [documentation of t1sim](../README.md#documentation).
 ## A set of training pairs
 
 ```bash
-t1sim sub-*_T1w.nii.gz --grid deepmriprep \
+t1sim sub-*_T1w.nii.gz --space template --grid deepmriprep \
       --snr 15 30 60 --bias 30 --bias-type 2 scan \
       --resolution 1 --upsample
 ```
@@ -18,7 +18,7 @@ or, with full control:
 from t1sim import simulate
 
 for scan in scans:
-    truth = simulate.ground_truth(scan)                      # once per subject
+    truth = simulate.ground_truth(scan, space="template")    # once per subject, in template space
     for snr in (15, 30, 60):
         acquired = simulate.acquire(truth, snr=snr, bias_type=(2, None),
                                     resolution=1.0, upsample=True, grid="deepmriprep")
@@ -27,12 +27,13 @@ for scan in scans:
 
 Then point `simu_path` of `2b_prep_simulate.py` at the folder.
 
-Keep the training data in a folder of its own. A validation set of the same scans on the full working grid has the same file names, and `simulate.write` refuses to put a ground truth of one grid over that of the other.
+Keep the training data in a folder of its own. A validation set of the same scans has the same file names, and `simulate.write` refuses to put a ground truth of one grid or space over that of another.
 
 ## What matters for training
 
 | Point | Setting | Why |
 | --- | --- | --- |
+| Space | `space="template"` | The anatomy is made on the working grid itself, so the ground truth on the deepmriprep grid is the anatomy as it was made. Made on the scan (the default), it would be averaged onto that grid once more, which widens its partial volume by about a voxel |
 | Grid | `grid="deepmriprep"` | The 336 x 384 x 336 part of the working grid that `2_prep_segment.py` cuts out; `2b_prep_simulate.py` refuses another shape |
 | Resolution | `resolution=1, upsample=True` | Most real data on that grid is a 1 mm scan that was resampled. The image is acquired at 1 mm, with noise that is white there, and brought back to 0.5 mm, where the noise is correlated (0.69 between neighbours) as in such a scan. The ground truth keeps its 0.5 mm |
 | Noise | `seed=None` (the default) | Every output file gets noise of its own, derived from the folder and the name of the scan and from the settings. A fixed seed gives every subject the same noise pattern, which a network can learn |

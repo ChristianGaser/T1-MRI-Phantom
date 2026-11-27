@@ -58,16 +58,21 @@ The two are not the same filter, as they are not in a scanner: next to a sharp b
 
 A Fourier transform takes the image as periodic, so what touches one end of the field of view, as the neck does, would ring into the other end: a slab of 400 at one end left 33 in the last plane of the other. The image is therefore continued with its mirror image for 16 voxels beyond every face before its k-space is cut, which leaves 1.
 
-**On the grid of the scan** (`grid="scan"`) the new voxels are turned against the working grid. The k-space of the scan is then a box that lies obliquely in that of the image, and the cut removes every wave with more than half a cycle per voxel of the scan along one of its three axes. A voxel of the scan is a parallelepiped in the working grid, and the ground truth is the mean of the fractions over it, each fine voxel counting with the share of it that lies inside. That mean is computed over 1, 8 or 27 small boxes along the axes of the working grid that cover the voxel, each of them integrated exactly:
+**From an anatomy made on the scan** onto the grid of the scan, the default, the two grids share their axes: the cut of k-space is one per axis, and the mean of the fractions over a voxel of the scan is exact, each fine voxel counting with the share of it that lies inside.
 
-| Grids turned by | Boxes | Largest error of a fraction | RMS in the voxels of a boundary |
-| --- | --- | --- | --- |
-| 0 (along the axes) | 1 | 0: the result of the grid along the axes | 0 |
-| 1 degree | 8 | 0.0006, against 27 boxes | - |
-| 6 to 11 degrees | 8 | 0.005 | 0.0015 |
-| 17 to 29 degrees | 27 | 0.006 | 0.0012 |
+**Between grids that are turned against each other**, an anatomy made in template space written on the grid of the scan, or one made on the scan written in template space, the k-space of the new grid is a box that lies obliquely in that of the image, and the cut removes every wave with more than half a cycle per new voxel along one of its three axes. A new voxel is a parallelepiped in the grid of the anatomy, and the ground truth is the mean of the fractions over it, each fine voxel counting with the share of it that lies inside. The voxel is cut into 2 or 3 slices along each of its axes, the more the further the grids are turned, and along a longer axis into as many more as it is longer; every slice is covered by a box along the axes of the fine grid with the same spread, and the mean over each box is exact:
 
-(A ball whose boundaries are one fine voxel wide, new voxels of 1.7 fine voxels; a scan has softer boundaries.) Reading the fine voxel at points inside the new voxel, the obvious way, needed 40 points per axis to come that close on the grid turned by 1 degree, because the points fall in step with the fine grid; and the mean of the linearly interpolated fractions is another quantity, smoother by one fine voxel, that differed by up to 0.065.
+| New voxels | Grids turned by | Boxes | Largest error of a fraction | RMS in the voxels of a boundary |
+| --- | --- | --- | --- | --- |
+| any | 0 (along the axes) | 1 | 0: the result of the grid along the axes | 0 |
+| 0.85 mm | 1 degree | 8 | 0.0004 | 0.0001 |
+| 0.85 mm | 6 to 11 degrees | 8 | 0.003 to 0.005 | 0.0006 to 0.0011 |
+| 0.85 mm | 17 degrees | 8 | 0.009 | 0.0021 |
+| 0.85 mm | 25 to 29 degrees | 27 | 0.010 | 0.0024 |
+| 1 x 1 x 3 mm | 25 degrees | 81 | 0.002 | 0.0007 |
+| 0.5 x 0.5 x 2 mm | 25 and 15 degrees | 108 | 0.001 | 0.0003 |
+
+(A shell whose boundaries are one fine voxel of 0.5 mm wide; a scan has softer boundaries. The reference is the same method with 16 to 20 slices along every axis, which has converged to 0.0005, for the last two rows 6 to 8, to 0.0015.) With the same number of slices along every axis the last two rows were 0.019 and 0.037 off. The volumes agree to 5e-5. Reading the fine voxel at points inside the new voxel, the obvious way, needed 40 points per axis to come that close on the grid turned by 1 degree, because the points fall in step with the fine grid; and the mean of the linearly interpolated fractions is another quantity, smoother by one fine voxel, that differed by up to 0.065.
 
 With `upsample=True` the acquired image is brought back onto the 0.5 mm grid by cubic B-spline interpolation, and the ground truth keeps its 0.5 mm voxels. This is a scan of that voxel size after resampling, the form in which most real data reaches a network that works at 0.5 mm.
 

@@ -8,7 +8,7 @@ Part of the [documentation of t1sim](../README.md#documentation).
 - [What is returned](#what-is-returned)
 - [How the fractions are made](#how-the-fractions-are-made)
 - [Where the intensities come from](#where-the-intensities-come-from)
-- [The working grid](#the-working-grid)
+- [The grid of the anatomy](#the-grid-of-the-anatomy)
 - [What comes after it](#what-comes-after-it)
 
 ## Usage
@@ -25,12 +25,13 @@ seg = frontend.segment("sub-01_T1w.nii.gz")
 | `template_dir` | Folder with the six-class shooting templates (the [model files](installation.md#model-files), downloaded on the first run) |
 | `verbose` | Print the stages of the segmentation (`False`) |
 | `deformation` | Also return the deformation to the templates, which the atlases need (`False`) |
+| `space` | Where the anatomy is made: `"scan"`, on the scan at 0.5 mm along its own axes, or `"template"`, on T1Prep's working grid in template space; see [below](#the-grid-of-the-anatomy) (`"scan"`) |
 
-A run takes about 90 s on an M2 MacBook Air for a 0.75 mm scan: 21 s for the denoising, 59 s for the segmentation and 8 s for LAS. The deformation costs no extra time.
+A run takes about 90 s on an M2 MacBook Air for a 0.75 mm scan, in either space: 21 s for the denoising, 59 s for the segmentation and 8 s for LAS on the working grid. On the grid of the scan the affine registration has to run before the segmentation, which is handed the grid in template millimetres; a T1Prep whose `unified_seg.segment` takes the registration (`world`, newer than 0.9.3) runs it once, an older one twice, which costs 20 s more. Both give the same result to the last bit. The deformation costs no extra time.
 
 ## What is returned
 
-A dict. All volumes lie on the [working grid](#the-working-grid) and are indexed `[x, y, z]` in RAS order.
+A dict. All volumes lie on the [grid of the anatomy](#the-grid-of-the-anatomy) and are indexed `[x, y, z]` in RAS order.
 
 ![What the front end returns](t1sim-frontend.png)
 
@@ -42,21 +43,25 @@ A dict. All volumes lie on the [working grid](#the-working-grid) and are indexed
 | `mask` | (X, Y, Z) bool | The brain mask |
 | `means` | dict | Intensity of pure CSF, GM and WM on the scale of `corrected` |
 | `normalised` | (X, Y, Z) float32 | The LAS-normalised brain the label was made from, on the scale of the label: at least 0.01 inside the brain, up to 5 for what is brighter than WM, and 0 outside |
-| `grid` | nibabel image | The working grid; its affine maps the voxels to template millimetres |
+| `grid` | nibabel image | The grid of the anatomy; its affine maps the voxels to the millimetres of its `space`: those of the scan by default |
+| `space` | str | `"scan"` or `"template"`: where the anatomy is made |
+| `template_affine` | 4 x 4 | The voxel-to-world matrix of the grid in template millimetres, through which priors and atlases of the template space are placed |
+| `template_grid` | dict | `shape` and `affine` of T1Prep's working grid in template space, onto which `simulate.acquire(grid="working")` writes |
 | `world` | 4 x 4 | The affine registration: scan millimetres to template millimetres |
 | `affine` | 4 x 4 | The same registration in the normalised coordinates T1Prep resamples with (`t1prep.unified_seg.grid_affine`) |
 | `native_mat`, `native_shape` | 4 x 4, tuple | Voxel-to-world matrix and shape of the scan in RAS order |
-| `scan` | nibabel image | The denoised scan on its own grid, in the storage order of the input: the grid `simulate.acquire` writes on by default, and what it takes from the scan beyond the working grid |
+| `scan` | nibabel image | The denoised scan on its own grid, in the storage order of the input: the grid `simulate.acquire` writes on by default, and what it takes from the scan beyond the grid of the anatomy |
 | `params` | dict | Everything the segmentation estimated: the mixture of Gaussians, the bias field, volumes, timings |
 | `iy`, `template_mat` | (X, Y, Z, 3) float32, 4 x 4 | With `deformation=True`: for every voxel the voxel of the segmentation's templates it maps to, and the voxel-to-world matrix of those templates. `t1sim.atlas.to_grid` brings an atlas onto the grid with them |
 
-A voxel of the working grid lies in the scan at
+A voxel of the grid of the anatomy lies in the scan at
 
 ```python
 import numpy as np
 
-to_scan = np.linalg.inv(seg["native_mat"]) @ np.linalg.inv(seg["world"]) @ seg["grid"].affine
-i, j, k, _ = to_scan @ [x, y, z, 1]      # voxel of the scan in RAS order
+in_scan_mm = seg["grid"].affine                                    # space "scan"
+# in_scan_mm = np.linalg.inv(seg["world"]) @ seg["grid"].affine    # space "template"
+i, j, k, _ = np.linalg.inv(seg["native_mat"]) @ in_scan_mm @ [x, y, z, 1]   # voxel of the scan in RAS order
 ```
 
 `docs/make_figures.py` samples the scan this way for the first panel of the figure above.
@@ -64,7 +69,7 @@ i, j, k, _ = to_scan @ [x, y, z, 1]      # voxel of the scan in RAS order
 ## How the fractions are made
 
 1. **Denoising.** The scan is filtered with SANLM (`cat_surf.vol_sanlm`) at its own resolution, before anything is resampled. After resampling the noise is no longer white, and the filter removes little of it.
-2. **Unified segmentation.** `t1prep.unified_seg.segment` runs CAT-Surface's implementation of SPM's unified segmentation (`cat_surf.vol_unified_seg`). It registers the scan affinely to the template, estimates the bias field and describes the intensities by a mixture of Gaussians. Its tissue priors are shooting templates with six classes (GM, WM, CSF, bone, soft tissue, air), deformed onto the scan by geodesic shooting. It gives the bias-corrected scan on the working grid, a first label map and the posteriors of the classes.
+2. **Unified segmentation.** `t1prep.unified_seg.segment` runs CAT-Surface's implementation of SPM's unified segmentation (`cat_surf.vol_unified_seg`). It registers the scan affinely to the template, estimates the bias field and describes the intensities by a mixture of Gaussians. Its tissue priors are shooting templates with six classes (GM, WM, CSF, bone, soft tissue, air), deformed onto the scan by geodesic shooting. It gives the bias-corrected scan on the [grid of the anatomy](#the-grid-of-the-anatomy), a first label map and the posteriors of the classes.
 3. **Brain mask.** The brain is where the posteriors of GM, WM and CSF together reach 0.5: the largest connected component, with its cavities filled.
 4. **LAS.** `t1prep.apply_LAS`, the local adaptive segmentation known from CAT12, maps the brain onto the scale CSF = 1, GM = 2, WM = 3. A global step puts the tissues at these values; a local step follows each tissue with a smooth field of its own and removes what is left of intensity differences within it. The result is the label map.
 5. **Decomposition.** `frontend.fractions_from_label` reads a label between two tissues as their linear mixture: 2.5 is half GM and half WM. A brain voxel darker than CSF is CSF, and one brighter than WM is WM, up to a third brighter. From 4 on, a voxel has no fractions and no label: it is no brain tissue, and the simulated image keeps the scan there. These are the cores of the brightest vessels, 0.0 ml on a scan with few vessels and 3.3 ml on one with many; the [cleanup](cleanup.md) makes them CSF in the ground truth.
@@ -81,29 +86,31 @@ Two intensities decide what the simulated image will look like. Both are read fr
 
 Left to its own estimate, LAS put pure GM lower: at 358 instead of 380 on the scan of the [comparison with the MATLAB tools](matlab-agreement.md#the-intensity-of-pure-gm), which is 6%. That moved the GM/WM boundary of the label by 0.14 mm and made WM 7% larger.
 
-## The working grid
+## The grid of the anatomy
 
-All results lie on T1Prep's working grid (`t1prep.unified_seg.default_working_grid()`):
+The anatomy, everything `t1sim` makes and changes, lies on a grid of 0.5 mm voxels. `space` decides which:
 
-| Property | Value |
-| --- | --- |
-| Size | 339 x 411 x 339 voxels |
-| Voxel size | 0.497 x 0.498 x 0.497 mm |
-| Space | MNI152NLin2009cAsym, reached by an affine registration only |
-| Storage order | RAS |
-| First voxel | (-84, -120, -72) mm |
+| | `space="scan"` (default) | `space="template"` |
+| --- | --- | --- |
+| Grid | The scan, cut into voxels of 0.5 mm along its own axes | T1Prep's working grid (`t1prep.unified_seg.default_working_grid()`) |
+| Millimetres | Those of the scan: the head has the size of the subject | Those of MNI152NLin2009cAsym, reached by an affine registration: the head has the size of the template |
+| Extent | The part of the field of view of the scan that the working grid covers, 2 mm more at every side; on a 0.75 mm scan 312 x 428 x 420 voxels | 339 x 411 x 339 voxels from (-84, -120, -72) mm |
+| Back onto the grid of the scan | Along its own axes: a scan voxel of 1 mm is two by two by two voxels of the anatomy | Through the registration, at an angle |
+| Use | Validation in the space of the subject, the default | Training data for networks that work in template space ([Training data](training-data.md)) |
 
-The scan is resampled onto it once, after the denoising, and segmented there. The 336 x 384 x 336 grid on which the deepmriprep networks are trained is a crop of it.
+The fine voxels start at the outer face of the first voxel of the scan, so every voxel of the scan whose size is a multiple of 0.5 mm is a whole number of them. The scan is resampled onto the grid once, after the denoising; on the grid of the scan that is a mere upsampling, with no rotation. The extent stays that of the working grid because the templates of the segmentation end there; what a scan shows beyond it, the neck mostly, is taken from the scan when an image is written on its grid ([Simulating images](simulation.md#on-the-grid-of-the-scan)).
 
-**Sizes are those of the template.** The registration is a full affine one, so on this grid the head has the size and the proportions of the template, not of the subject. For the two scans this was measured on:
+**Lengths and volumes are those of the space.** Everything `t1sim` is given or reports about the anatomy refers to the grid it is made on: a cortical thickness in mm, the reach of an atrophy, the 4 mm of the dura rule, the ml of a sidecar. By default these are millimetres of the subject. In template space they are not: the registration is a full affine one, which scales the head, and a cortex of 2.5 mm there is 2.2 to 2.5 mm thick in the head of the first subject below, depending on the direction:
 
-| Scan | Lengths along x / y / z | Volumes |
+| Scan | Lengths in template space along x / y / z | Volumes |
 | --- | --- | --- |
 | 0.75 mm MPRAGE | 1.12 / 1.01 / 1.12 times those of the scan | 1.26 times |
 | 0.7 mm scan | 1.15 / 1.02 / 1.20 times | 1.42 times |
 
-An image is by default written in the size of the subject all the same: `simulate.acquire` acquires it on the grid of the scan unless it is asked for `grid="working"` ([Simulating images](simulation.md#the-grid-of-the-output)). The anatomy is made here, so everything that defines it refers to this grid: a cortical thickness in mm, the voxel size of an acquisition, the 4 mm of the dura rule, the amplitude of a movement, the ml of a sidecar. A cortex simulated with 2.5 mm is 2.5 mm thick in the images that are written; in the head of the first subject that would be 2.2 to 2.5 mm, depending on the direction. `seg["world"]` holds the registration, and its determinant, the factor of the volumes, is written to every sidecar (`AffineVolumeScaling`).
+`seg["world"]` holds the registration, and its determinant, the factor of the volumes, is written to every sidecar (`AffineVolumeScaling`).
+
+**The two grids give slightly different anatomies.** The segmentation and LAS run on the grid they are given. On the 0.75 mm MPRAGE the scan's own grid gave 348 / 687 / 588 ml of CSF / GM / WM; the working grid gave 351 / 674 / 594 ml, its sums divided by the factor of the registration. `mri_simulate.m`, which segments on the grid of the scan as well, gave 348 / 708 / 577 ml. So the anatomy made on the scan is 2% richer in grey matter, and closer to that of `mri_simulate.m`.
 
 ## What comes after it
 
-The front end returns the fractions as segmented and writes nothing. [Cleaning the ground truth](cleanup.md), [changing the anatomy](anatomy.md), the synthesis, the [artefacts](artefacts.md) and the files are the steps of [`t1sim.simulate`](simulation.md). Everything stays on the working grid; an output on the grid of the scan does not exist yet.
+The front end returns the fractions as segmented and writes nothing. [Cleaning the ground truth](cleanup.md), [changing the anatomy](anatomy.md), the synthesis, the [artefacts](artefacts.md) and the files are the steps of [`t1sim.simulate`](simulation.md).

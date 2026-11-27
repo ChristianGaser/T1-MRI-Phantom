@@ -8,7 +8,7 @@ Part of the [documentation of t1sim](../README.md#documentation).
 - For the package itself: numpy, scipy, nibabel and requests, which pip installs with it. This is enough for the geometric phantom, the image-domain artefacts and the model download.
 - For everything that starts from a real scan (the extra `frontend`):
   - [cat-surf](https://pypi.org/project/cat-surf/) 1.2.0 or newer, for the unified segmentation, the SANLM filter and the growth through the tissue.
-  - [T1Prep](https://github.com/ChristianGaser/T1Prep) 0.9.3 or newer. It provides the segmentation on the working grid with its deformation (`t1prep.unified_seg.segment(..., deformation=True)`), LAS with given tissue intensities (`t1prep.apply_LAS(..., peaks=...)`), the atlases and the vessel detection.
+  - [T1Prep](https://github.com/ChristianGaser/T1Prep) 0.9.3 or newer. It provides the segmentation on a given grid with its deformation (`t1prep.unified_seg.segment(..., deformation=True)`), LAS with given tissue intensities (`t1prep.apply_LAS(..., peaks=...)`), the atlases and the vessel detection. A T1Prep whose `segment` also takes the affine registration (`world`, newer than 0.9.3) saves 20 s per scan on the grid of the scan.
   - torch, which T1Prep needs as well; it runs the movement artefacts and the deformations.
 
 Without them `t1sim` can be imported, but `frontend.segment` stops with an error that names what is missing. `t1sim` checks T1Prep by what it can do (the two functions above), not by its version number.

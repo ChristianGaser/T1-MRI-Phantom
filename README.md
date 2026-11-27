@@ -21,7 +21,7 @@ A real scan is turned into tissue fractions of CSF, GM and WM. The simulated ima
 | Synthesis of the T1w image from the fractions | yes | yes |
 | Artefacts: contrast, bias field, voxel size, movement, ringing, noise | yes | yes |
 | BIDS output with JSON sidecars | yes | yes |
-| Output on the grid of the scan | yes, the default; template space with `grid="working"` | yes, the default |
+| Anatomy and output in the space of the scan | yes, the default; template space as an option | yes, the default |
 | Geometric thickness phantom and its evaluation | yes | yes |
 
 [Agreement with the MATLAB tools](docs/matlab-agreement.md) lists where the two give the same result and where `t1sim` differs on purpose.
@@ -59,7 +59,7 @@ Every run writes the simulated image, the label map of its ground truth, the thr
 - **It is the fractions the image was mixed from.** Inside the brain every voxel of the image is the sum of the three tissue intensities weighted by its fractions. Contrast, bias field and noise do not change that; a coarser voxel size averages the fractions over the new voxels.
 - **It is defined by intensity, not by anatomy.** The fractions come from the intensities of the scan. The deep grey nuclei, which are brighter than cortex, are mixtures of GM and WM in it, as they are for any method that reads intensities.
 - **The cleanup makes it differ from the image on purpose.** Blood vessels, dura and the rims of the ventricles look like grey matter. They are corrected in the ground truth and stay in the image, 29 ml on one scan and 23 ml on another. This is the part a method has to get right without reading it off the intensity.
-- **The anatomy is made in template space.** It is made on a 0.5 mm grid that is affinely registered to MNI152NLin2009cAsym, which scales the head: on one scan volumes are 1.26 times those of the subject, and a thickness or a region is defined there. By default the image and its ground truth are then written on the grid of the scan, in the size of the subject, where the ground truth is the mean of the fractions over every voxel of the scan. `grid="working"` writes the anatomy as it was made.
+- **It is made in the space of the subject.** The anatomy is made on the scan itself at 0.5 mm, so a thickness of 2.5 mm is 2.5 mm of the subject, and the image and its ground truth are written on the grid of the scan, where the ground truth is the mean of the fractions over every voxel of the scan. `space="template"` makes the anatomy on a 0.5 mm grid affinely registered to MNI152NLin2009cAsym instead, as training data for networks in that space need it; there the head is scaled, on one scan to 1.26 times its volume.
 - **Movement leaves a small offset.** After a simulated movement the image lies 0.1 to 0.5 mm from its ground truth, and a rotation of the apparent object is not removed.
 - **Most of this was measured on one or two scans.** The numbers in this documentation say how the tool behaves there, not how it varies between scanners.
 

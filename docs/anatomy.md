@@ -9,13 +9,14 @@ Part of the [documentation of t1sim](../README.md#documentation).
 - [What `change` means](#what-change-means)
 - [Which kind of atrophy](#which-kind-of-atrophy)
 
-All lengths and volumes on this page are those of the working grid, on which the anatomy is made and the head has the size of the template ([The working grid](frontend.md#the-working-grid)). An image on the grid of the scan, the default of `simulate.acquire`, shows the same anatomy in the size of the subject; the measurements below were made with `grid="working"`.
+Lengths and volumes are those of the grid the anatomy is made on ([The grid of the anatomy](frontend.md#the-grid-of-the-anatomy)): by default the scan at 0.5 mm, so a thickness of 2.5 mm is 2.5 mm of the subject. With `space="template"` they are millimetres of the template, in which the head is larger. The measurements of atrophy below were made in template space, before the anatomy was made on the scan by default; how far they carry over is said where it matters.
 
 ## Cortical thickness
 
 ```python
-truth = simulate.ground_truth(scan, thickness=2.5)               # 2.5 mm everywhere
+truth = simulate.ground_truth(scan, thickness=2.5)               # 2.5 mm of the subject everywhere
 truth = simulate.ground_truth(scan, thickness=(1.5, 2.0, 2.5))   # occipital, rest, frontal
+truth = simulate.ground_truth(scan, thickness=2.5, space="template")   # 2.5 mm of the template
 ```
 
 The cortex is rebuilt as a band of the chosen thickness around the white matter. This is a port of `simulate_thickness` of `matlab/mri_simulate.m`:
@@ -35,17 +36,24 @@ Measured:
 | The same, from the volumes of GM and WM | 1.5 / 2.5 / 3.5 mm | 1.46 / 2.47 / 3.47 mm |
 | A larger sphere (white matter radius 22 mm), projection-based thickness of cat-surf without its correction, median | 1.5 / 2.5 / 3.5 mm | 1.41 / 2.40 / 3.40 mm |
 | Spheres of that size written down analytically, the same measure | 1.5 / 2.5 / 3.5 mm | 1.47 / 2.43 / 3.42 mm |
-| Real brain (0.75 mm MPRAGE), the same measure with its default correction, median and 10 to 90% | 2.5 mm | 2.66 mm, 2.55 to 2.71 |
+| Real brain (0.75 mm MPRAGE), anatomy made on the scan: distance from the pial to the white matter surface on the grid of the anatomy, in mm of the subject, median and 10 to 90% | 2.5 mm | 2.49 mm, 2.44 to 2.54 |
+| The same on the grid of the scan, 0.75 mm | 2.5 mm | 2.54 mm, 2.45 to 2.69 |
+| The same, projection-based thickness without its correction | 2.5 mm | 2.52 mm, 2.42 to 2.64 |
+| Anatomy made in template space, distance as above in mm of the template | 2.5 mm | 2.49 mm, 2.44 to 2.54 |
+| The same in mm of the subject, on the grid of the anatomy | 2.5 mm | 2.29 mm, 2.19 to 2.47 |
+| The same on the grid of the scan, projection-based thickness without its correction | 2.5 mm | 2.35 mm, 2.22 to 2.48 |
+| Template space, projection-based thickness with its default correction, on the working grid | 2.5 mm | 2.66 mm, 2.55 to 2.71 |
 | The same | 1.5 mm | 1.66 mm, 1.62 to 1.73 |
 | The same, before the simulation | - | 2.89 mm, 2.27 to 3.48 |
 
 What this shows:
 
-- **The band has the thickness asked for**, to 0.01 mm along rays on a sphere.
+- **The band has the thickness asked for**, to 0.01 mm along rays on a sphere, and to 0.015 mm in the median on a real brain, in the millimetres of the space it is made in.
+- **In template space that is not the thickness of the subject.** Asked for 2.5 mm, the cortex made in template space is 2.29 mm thick in the head of the subject, because the registration enlarged that head, by 12% along two axes and 1% along the third. Made on the scan, the default, it is 2.49 mm of the subject. The distance is measured from every point of the pial surface to the nearest point of the white matter surface, both read from the label map where it crosses 1.5 and 2.5.
 - **Its boundaries are soft.** The partial volume at both boundaries is 1.15 mm wide on the 0.5 mm grid, because the label map is smoothed first. The ground truth of a simulated thickness is smoother than its grid.
 - **The projection-based thickness reads less than the truth on a ball, simulated or not.** By default it adds 0.25 mm (`correct_thickness`), a correction for the label maps of cat-surf's own pipeline; with it the real brain reads 2.66 mm for 2.5. Without it, it reads 0.03 to 0.09 mm too little on analytic spheres, whatever the width of their partial volume (0.5 to 1.5 mm were tried), and 0.02 to 0.06 mm less again on the simulated ones. On the folded [geometric phantom](phantom.md) the same measure is within 0.02 mm. So most of the offset is the measure on a convex ball; the last 0.02 to 0.06 mm are not explained.
 
-A run takes 7 to 8 minutes on the 0.5 mm grid, most of it in 75 distance transforms. For a thickness that is known by construction, without a real brain, see the [geometric phantom](phantom.md).
+A run takes 4 minutes on the grid of a 0.75 mm scan and 5 to 8 minutes on the working grid, most of it in 75 distance transforms. For a thickness that is known by construction, without a real brain, see the [geometric phantom](phantom.md).
 
 ## Atrophy
 

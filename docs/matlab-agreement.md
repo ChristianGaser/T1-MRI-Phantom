@@ -87,6 +87,7 @@ For the peak to hold, it has to be used twice in LAS: the global mapping runs th
 - **No truth.** The MATLAB label is a second implementation. Where the two agree, both may be wrong in the same way.
 - **Before the cleanup.** The labels were compared before the cleanup of either tool; the two cleanups are compared in [Cleaning the ground truth](cleanup.md#measured).
 - **Volumes are those of the scan.** Everything on this page was measured on the grid of the scan, onto which the label of the working grid was resampled by linear interpolation; that comparison is older than `grid="scan"`, which averages instead.
+- **Made in template space.** The `t1sim` label of this page was made on the working grid in template space. By default `t1sim` now makes the anatomy on the scan itself at 0.5 mm, as `mri_simulate.m` makes it on the scan; its volumes are 348 / 687 / 588 ml of CSF / GM / WM, closer to MATLAB's 348 / 708 / 577 ml in GM and WM than the 340 / 695 / 587 ml of the table. The soft Dice of that label against MATLAB's was not measured.
 - **Not reproducible from the repository.** The scan and the scripts of this comparison are not part of it.
 
 ## Geometric phantom
@@ -127,5 +128,5 @@ The MATLAB code was left as it is. Images made with it carry these properties, a
 | --- | --- | --- | --- |
 | Atrophy | CSF fraction scaled inside the region | A deformation: thinning, or a change of volume | See [Which kind of atrophy](anatomy.md#which-kind-of-atrophy) |
 | Vessels | CAT12's atlas partitioning | T1Prep's detection and voxels brighter than white matter | The partitioning is not available in Python |
-| Output grid | The anatomy is made on the grid of the scan; the output stays there (default) or is affinely registered | The anatomy is made on the affinely registered 0.5 mm grid; the output is acquired on the grid of the scan (default) or stays on that grid (`grid="working"`) | The segmentation of the front end works on the registered grid |
+| Grid of the anatomy | The grid of the scan, at its voxel size; resampled for a thickness | The scan at 0.5 mm along its own axes (default), or the affinely registered 0.5 mm grid (`space="template"`) | One grid for every change of the anatomy, fine enough for partial volumes; the registered grid for training data in template space |
 | Names | The seed of a simulated bias field is not in the name | `Rf20T2S7` for a seed of 7; a gain of tissue is `...Plus10` | Different settings gave the same file name |

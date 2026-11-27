@@ -10,7 +10,8 @@
 - ``t1sim-scan-grid.png``: the default output, on the grid of the scan, next
   to the scan.
 
-Every image is one axial slice of the working grid, and everything shown is
+Every image is one axial slice of the grid the anatomy is made on, by
+default the scan at 0.5 mm, and everything shown is
 made by t1sim from the scan.  ``--cache`` keeps the slices, so that a change
 of the layout does not run the simulation again (about four minutes).
 """
@@ -44,25 +45,34 @@ INK, INK_SOFT, SURFACE = "#191919", "#666666", "#ffffff"
 DONE, DONE_EDGE = "#e3effc", "#257de0"       # a step t1sim takes
 OPEN, OPEN_EDGE = "#f3f3f3", "#9c9c9c"       # a step that is MATLAB only
 
-#: Height in mm of the slice above the origin of the template (MNI), and the
-#: corner and size in mm of the enlarged detail.
-SLICE_MM = 18.0
-ZOOM_MM = (-52.0, 4.0, 44.0, 44.0)
+#: The centre of the enlarged detail in template mm, height above the origin
+#: of the template and position in the slice, through which the slice is
+#: taken, and its width in mm of the grid of the anatomy.
+SLICE_MM = 12.0
+ZOOM_CENTRE = (-33.5, 45.0)
+ZOOM_MM = 44.0
 
 #: Region of the Hammers atlas whose cortex is thinned for the examples (the
 #: left middle frontal gyrus, in which the detail lies), and by how much.
 ATROPHY = ("Hammers", 28, -0.25)
 
 
+def _in_scan_mm(seg):
+    """Voxel-to-world matrix of the grid of the anatomy in the millimetres of the scan."""
+    affine = np.asarray(seg["grid"].affine, dtype=np.float64)
+    if seg.get("space", "template") == "scan":
+        return affine
+    return np.linalg.inv(np.asarray(seg["world"], dtype=np.float64)) @ affine
+
+
 def _slice_from_scan(volume, mat, seg, k):
-    """Slice *k* of the working grid, sampled from a volume on the grid of the scan."""
+    """Slice *k* of the grid of the anatomy, sampled from a volume on the grid of the scan."""
     grid = seg["grid"]
     nx, ny = grid.shape[:2]
     i, j = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
     voxels = np.stack([i, j, np.full_like(i, k), np.ones_like(i)]).reshape(4, -1)
-    # grid voxel -> template mm -> scan mm -> voxel of the scan
-    to_scan = np.linalg.inv(mat) @ np.linalg.inv(seg["world"]) @ grid.affine
-    coords = (to_scan @ voxels)[:3]
+    # grid voxel -> scan mm -> voxel of the scan
+    coords = (np.linalg.inv(mat) @ _in_scan_mm(seg) @ voxels)[:3]
     return map_coordinates(volume, coords, order=1, mode="constant").reshape(nx, ny)
 
 
@@ -71,7 +81,14 @@ def collect(scan):
     seg = frontend.segment(scan, verbose=False, deformation=True)
     grid = seg["grid"]
     zooms = np.sqrt((grid.affine[:3, :3] ** 2).sum(0))
-    k = int(round((SLICE_MM - grid.affine[2, 3]) / zooms[2]))
+    # The slice through the centre of the detail, a point of the template.  A
+    # grid along the axes of the scan is tilted against the template, so a
+    # slice through another point of the same height would miss the detail.
+    to_voxel = np.linalg.inv(np.asarray(seg["template_affine"], dtype=np.float64))
+    centre = to_voxel @ [ZOOM_CENTRE[0], ZOOM_CENTRE[1], SLICE_MM, 1.0]
+    k = int(round(float(centre[2])))
+    half = np.round(ZOOM_MM / 2 / zooms[:2]).astype(int)
+    first = np.round(centre[:2]).astype(int) - half
 
     raw = nib.as_closest_canonical(nib.load(scan))
     if not np.allclose(raw.affine, seg["native_mat"], atol=1e-4):
@@ -84,14 +101,14 @@ def collect(scan):
         "fractions": seg["fractions"][:, :, k],
         "means": np.array([seg["means"][t] for t in frontend.TISSUES]),
         "zooms": zooms,
-        "origin": grid.affine[:3, 3],
+        "zoom": np.concatenate([first, first + 2 * half]),
     }
 
     truth = simulate.ground_truth(scan, seg=seg)
     out["sim_fractions"] = truth["fractions"][:, :, k]
     out["sim_ideal"] = truth["ideal"][:, :, k]
-    # every figure shows a slice of the working grid, on which the anatomy is made
-    plain = dict(snr=0, bias_percent=0, seed=1, grid="working")
+    # every figure but the last shows a slice of the grid the anatomy is made on
+    plain = dict(snr=0, bias_percent=0, seed=1, grid="anatomy")
     coarse = dict(plain, resolution=1.0, upsample=True)
     examples = {
         "sim_image": dict(plain, snr=30, bias_percent=30),
@@ -120,8 +137,7 @@ def _on_the_scan(seg, truth):
     """Sagittal slices of the default output, which lies on the grid of the scan, and of the scan."""
     stored = seg["scan"]
     acquired = simulate.acquire(truth, snr=30, bias_percent=30, seed=1)
-    lattice = artefacts.ObliqueAcquisition(truth["ideal"].shape, truth["affine"], stored.shape[:3],
-                                           np.asarray(truth["world"]) @ stored.affine)
+    lattice = artefacts.ObliqueAcquisition(truth["ideal"].shape, truth["to_scan"], stored.shape[:3], stored.affine)
 
     def upright(volume):                         # whatever the storage order of the scan: x to the right, z up
         return nib.as_closest_canonical(nib.Nifti1Image(np.asarray(volume, dtype=np.float32), stored.affine))
@@ -147,11 +163,8 @@ def _box(d):
 
 def _zoom(d):
     """The enlarged detail, as slices."""
-    x0, y0, w, h = ZOOM_MM
-    i0 = int(round((x0 - d["origin"][0]) / d["zooms"][0]))
-    j0 = int(round((y0 - d["origin"][1]) / d["zooms"][1]))
-    return (slice(i0, i0 + int(round(w / d["zooms"][0]))),
-            slice(j0, j0 + int(round(h / d["zooms"][1]))))
+    i0, j0, i1, j1 = (int(v) for v in d["zoom"])
+    return slice(i0, i1), slice(j0, j1)
 
 
 def _show(ax, image, box, extent=None, **kwargs):
@@ -191,7 +204,7 @@ def figure_frontend(d, path):
     box, zoom = _box(d), _zoom(d)
     scan_range = {"cmap": "gray", "vmin": 0, "vmax": 1.25 * np.median(d["scan"][d["label"] > 2.9])}
     panels = [
-        ("T1w scan", "the input, shown on the working grid", d["scan"], scan_range),
+        ("T1w scan", "the input, at 0.5 mm", d["scan"], scan_range),
         ('seg["corrected"]', "denoised and bias-corrected", d["corrected"], _gray(d["corrected"], d)),
         ('seg["label"]', "the label map", d["label"], {"cmap": "gray", "vmin": 0, "vmax": 3}),
     ] + [
@@ -228,7 +241,7 @@ def figure_frontend(d, path):
                 spine.set_linewidth(0.8)
     _sides(axes[0, 0])
     axes[0, 0].set_ylabel("axial slice", fontsize=10.5, color=INK_SOFT)
-    axes[1, 0].set_ylabel(f"detail, {ZOOM_MM[2]:.0f} mm wide", fontsize=10.5, color=INK_SOFT)
+    axes[1, 0].set_ylabel(f"detail, {ZOOM_MM:.0f} mm wide", fontsize=10.5, color=INK_SOFT)
 
     def bar(col, ticks, labels, text):
         pos = axes[1, col].get_position()
@@ -478,7 +491,7 @@ def figure_examples(d, path):
                 bar.set_ticklabels([f"{t:g}" if style["vmin"] == 0 else f"{t:+g}" if t else "0" for t in ticks])
                 bar.ax.tick_params(labelsize=8.5, colors=INK_SOFT, length=2.5)
                 bar.outline.set_edgecolor("#c8c8c8")
-    fig.text(0.012, 0.878 - 2 * tall - 0.105, f"The detail is {ZOOM_MM[2]:.0f} mm wide.\nAll images share one grey scale,\n"
+    fig.text(0.012, 0.878 - 2 * tall - 0.105, f"The detail is {ZOOM_MM:.0f} mm wide.\nAll images share one grey scale,\n"
              "from 0 to 1.25 times the intensity\nof white matter.", fontsize=10, color=INK_SOFT, va="top",
              linespacing=1.4)
     fig.suptitle("What t1sim.simulate.acquire() and a change of the anatomy do", fontsize=15,
@@ -521,7 +534,7 @@ def figure_scan_grid(d, path):
     for x, side in ((0.03, "P"), (0.97, "A")):
         axes[0].text(x, 0.025, side, transform=axes[0].transAxes, ha="center", va="bottom", fontsize=9,
                      color="#ffffff", weight="bold")
-    fig.text(0.012, 0.012, "Inside the outline, the working grid, the brain is rendered from the tissue fractions "
+    fig.text(0.012, 0.012, "Inside the outline, the grid of the anatomy, the brain is rendered from the tissue fractions "
              "and the rest of the head is the bias-corrected scan. Beyond it the scan shows more than that grid\n"
              "holds: there the image is the scan itself, with the bias field of the simulation. The ground truth "
              "is the mean of the fractions over every voxel of the scan.",

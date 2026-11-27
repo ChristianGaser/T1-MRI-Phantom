@@ -23,7 +23,7 @@ truth = simulate.ground_truth(scan, clean=False)                      # as segme
 | `dura` | Length in mm of the path through the tissue beyond which grey matter is dura; 0 switches it off, lower removes more (`4.0`) |
 | `pve` | Correct the partial volume of CSF and WM around the ventricles (`True`) |
 
-`truth["fractions"]` and `truth["label"]` are the cleaned ground truth, and `truth["image_fractions"]` is what the image is rendered from. The sidecar lists the volume of each of the three corrections (`LabelCleanup`, in ml of the working grid).
+`truth["fractions"]` and `truth["label"]` are the cleaned ground truth, and `truth["image_fractions"]` is what the image is rendered from. The sidecar lists the volume of each of the three corrections (`LabelCleanup`, in ml of the grid of the anatomy: of the subject by default). The 4 mm of the dura rule are millimetres of that grid as well.
 
 After a simulated [cortical thickness](anatomy.md#cortical-thickness) the cleanup leaves the rebuilt cortex alone: it holds no vessel and no dura, and its label no longer follows the intensities the detection reads. Only the structures that keep their labels are cleaned.
 
@@ -40,12 +40,13 @@ After a simulated [cortical thickness](anatomy.md#cortical-thickness) the cleanu
 
 ## Measured
 
-Volumes that were corrected, converted to ml of the scan (the sidecar gives ml of the working grid, 1.26 and 1.42 times as much for these two scans):
+Volumes that were corrected, in ml of the subject. For an anatomy made in template space they are converted from the ml of the template the sidecar gives there, 1.26 and 1.42 times as much for these two scans:
 
 | Scan | Vessels | Dura | Periventricular |
 | --- | --- | --- | --- |
-| 0.75 mm MPRAGE with few visible vessels | 0.4 | 15.4 | 13.3 |
-| 0.7 mm scan with many bright vessels | 8.9 | 3.9 | 10.4 |
+| 0.75 mm MPRAGE with few visible vessels, anatomy made on the scan (default) | 0.4 | 13.1 | 15.0 |
+| The same, anatomy made in template space | 0.4 | 15.4 | 13.3 |
+| 0.7 mm scan with many bright vessels, anatomy made in template space | 8.9 | 3.9 | 10.4 |
 
 - **Vessels.** On the second scan 8.4 ml of the brain are brighter than 3.3. T1Prep's detection alone took 19% of them (2.0 ml), nearly all of it real: 99% within 1 mm of such a voxel. With the bright voxels added, 92% are taken, among them all 3.3 ml that had no fractions. On the first scan the voxels above 3.5 are 0.05 ml, against 6.3 ml on the second.
 - **Against `mri_simulate.m`** on the first scan, on the working grid. MATLAB relabelled 16.0 ml as CSF, of which 4.8 ml are CSF or outside the brain for `t1sim` anyway. (The 19.7 ml in [Agreement with the MATLAB tools](matlab-agreement.md#the-ground-truth-of-one-scan) are another count: every voxel whose label its cleanup changed by more than 0.1, on the grid of the scan.) Inside MATLAB's brain mask the voxels the two relabel as CSF agree with a Dice of 0.47. Much of what only `t1sim` relabels lies at the rim that MATLAB's skull-stripping had already removed; much of what only MATLAB relabels is as dark as grey matter (median label 1.8).

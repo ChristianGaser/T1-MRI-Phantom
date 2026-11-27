@@ -8,7 +8,7 @@ Part of the [documentation of t1sim](../README.md#documentation).
 | --- | --- |
 | `src/t1sim/simulate.py` | The pipeline (`ground_truth`, `acquire`, `write`) and the command line |
 | `src/t1sim/frontend.py` | The front end: a scan becomes a label map and tissue fractions |
-| `src/t1sim/atlas.py` | Atlases and other maps of the template space on the working grid |
+| `src/t1sim/atlas.py` | Atlases and other maps of the template space on the grid of the anatomy |
 | `src/t1sim/cleanup.py` | Vessels, dura and periventricular partial volume in the ground truth |
 | `src/t1sim/anatomy.py` | Cortical thickness and atrophy |
 | `src/t1sim/synthesis.py` | The image of tissue fractions |
@@ -31,7 +31,7 @@ Part of the [documentation of t1sim](../README.md#documentation).
 | Function | Package | Used in | For |
 | --- | --- | --- | --- |
 | `cat_surf.vol_sanlm` | cat-surf | `frontend` | Denoising |
-| `t1prep.unified_seg` (`segment`, `brain_mask`, `working_grid_maps`) | T1Prep | `frontend` | Unified segmentation on the working grid, brain mask, deformation |
+| `t1prep.unified_seg` (`segment`, `affine_registration`, `unified_templates`, `default_working_grid`, `brain_mask`, `working_grid_maps`) | T1Prep | `frontend` | Unified segmentation on the grid of the anatomy, its affine registration beforehand, brain mask, deformation |
 | `t1prep.apply_LAS` | T1Prep | `frontend` | Local intensity normalisation |
 | `t1prep.vessels` (`vessel_weight`, `blood_vessel_prior`, `protected_regions`) | T1Prep | `cleanup` | Vessel detection |
 | `t1prep.utils.TEMPLATE_PATH_T1PREP` | T1Prep | `atlas` | The folder of the atlases |
