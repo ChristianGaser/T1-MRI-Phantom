@@ -21,7 +21,7 @@ A real scan is turned into tissue fractions of CSF, GM and WM. The simulated ima
 | Synthesis of the T1w image from the fractions | yes | yes |
 | Artefacts: contrast, bias field, voxel size, movement, ringing, noise | yes | yes |
 | BIDS output with JSON sidecars | yes | yes |
-| Output on the grid of the scan | not yet: always in the space of the template | yes |
+| Output on the grid of the scan | yes, the default; template space with `grid="working"` | yes, the default |
 | Geometric thickness phantom and its evaluation | yes | yes |
 
 [Agreement with the MATLAB tools](docs/matlab-agreement.md) lists where the two give the same result and where `t1sim` differs on purpose.
@@ -37,7 +37,8 @@ pip install -e ".[frontend]"
 If pip stops at T1Prep, see [Installation](docs/installation.md): the version it asks for may not be released yet.
 
 ```bash
-t1sim sub-01_T1w.nii.gz --snr 30 --bias 20
+t1sim sub-01_T1w.nii.gz --snr 30 --bias 20                   # on the grid of the scan
+t1sim sub-01_T1w.nii.gz --snr 30 --bias 20 --grid working    # in template space, 0.5 mm
 ```
 
 ```python
@@ -49,7 +50,7 @@ for snr in (20, 40):
     simulate.write(truth, acquired)
 ```
 
-Every run writes the simulated image, the label map of its ground truth, the three tissue fractions and JSON sidecars. They go to `derivatives/t1sim-<version>/` of a BIDS dataset, or to a `derivatives` folder next to the folder of the scan; the command prints the name of every image it writes. The first run downloads the model files (44 MB).
+Every run writes the simulated image, the label map of its ground truth, the three tissue fractions and JSON sidecars, by default on the grid of the scan: the image lies on the scan voxel by voxel. They go to `derivatives/t1sim-<version>/` of a BIDS dataset, or to a `derivatives` folder next to the folder of the scan; the command prints the name of every image it writes. The first run downloads the model files (44 MB).
 
 ![What the acquisition and a change of the anatomy do](docs/t1sim-examples.png)
 
@@ -58,7 +59,7 @@ Every run writes the simulated image, the label map of its ground truth, the thr
 - **It is the fractions the image was mixed from.** Inside the brain every voxel of the image is the sum of the three tissue intensities weighted by its fractions. Contrast, bias field and noise do not change that; a coarser voxel size averages the fractions over the new voxels.
 - **It is defined by intensity, not by anatomy.** The fractions come from the intensities of the scan. The deep grey nuclei, which are brighter than cortex, are mixtures of GM and WM in it, as they are for any method that reads intensities.
 - **The cleanup makes it differ from the image on purpose.** Blood vessels, dura and the rims of the ventricles look like grey matter. They are corrected in the ground truth and stay in the image, 29 ml on one scan and 23 ml on another. This is the part a method has to get right without reading it off the intensity.
-- **It lives in the space of the template.** All output is affinely registered to MNI152NLin2009cAsym, which scales the head: on one scan volumes are 1.26 times those of the subject. Every mm and ml of `t1sim` is one of that space.
+- **The anatomy is made in template space.** It is made on a 0.5 mm grid that is affinely registered to MNI152NLin2009cAsym, which scales the head: on one scan volumes are 1.26 times those of the subject, and a thickness or a region is defined there. By default the image and its ground truth are then written on the grid of the scan, in the size of the subject, where the ground truth is the mean of the fractions over every voxel of the scan. `grid="working"` writes the anatomy as it was made.
 - **Movement leaves a small offset.** After a simulated movement the image lies 0.1 to 0.5 mm from its ground truth, and a rotation of the apparent object is not removed.
 - **Most of this was measured on one or two scans.** The numbers in this documentation say how the tool behaves there, not how it varies between scanners.
 
